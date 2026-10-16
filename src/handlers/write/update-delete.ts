@@ -1,0 +1,311 @@
+/**
+ * SAPWrite actions — update + delete.
+ */
+
+import {
+  isTextElementObjectType,
+  TEXT_ELEMENT_OBJECT_TYPES,
+  TEXT_ELEMENT_PARTS,
+  type TextElementPart,
+} from '../../adt/client.js';
+import { deleteObject, lockObject, safeUpdateClassInclude, safeUpdateSource, unlockObject } from '../../adt/crud.js';
+import { AdtApiError } from '../../adt/errors.js';
+import { type FmParameter, spliceFmSignature } from '../../adt/fm-signature.js';
+import type { AdtHttpClient } from '../../adt/http.js';
+import {
+  buildCdsDeleteDependencyHint,
+  buildCdsUpdateCrudHint,
+  CDS_DEPENDENCY_SENSITIVE_TYPES,
+  guardCdsSyntax,
+} from '../cds-hints.js';
+import { getCachedFeatures } from '../feature-cache.js';
+import { CLASS_WRITE_INCLUDES, canonicalTablType, classIncludeUrl } from '../object-types.js';
+import { errorResult, type ToolResult, textResult } from '../shared.js';
+import {
+  isMetadataWriteType,
+  mergePreWriteWarnings,
+  runPreWriteLint,
+  runPreWriteSyntaxCheck,
+  runRapPreflightValidation,
+  stripFmParamCommentBlock,
+} from '../write-helpers.js';
+import type { SapWriteContext } from './context.js';
+import { writeMetadataUpdate } from './metadata-update.js';
+
+function isDeleteDependencyError(err: AdtApiError): boolean {
+  const clean = AdtApiError.extractCleanMessage(err.responseBody ?? err.message).toLowerCase();
+  const body = (err.responseBody ?? '').toLowerCase();
+  const diagnostics = err.responseBody ? AdtApiError.extractDdicDiagnostics(err.responseBody) : [];
+
+  if (diagnostics.some((diag) => diag.messageNumber === '039')) return true;
+
+  return /could not be deleted|cannot be deleted|still in use|used by|dependent object|existing reference/.test(
+    `${clean}\n${body}`,
+  );
+}
+
+export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResult> {
+  const {
+    client,
+    args,
+    config,
+    type,
+    name,
+    source,
+    hasSource,
+    include,
+    transport,
+    lintOverride,
+    preflightOverride,
+    checkOverride,
+    objectUrl,
+    srcUrl,
+    invalidateWrittenObject,
+    enforcePackageForExistingObject,
+  } = ctx;
+  const existingPackage = await enforcePackageForExistingObject();
+
+  // Keep CLAS local include writes ahead of the generic /source/main fallthrough.
+  // If CLAS ever gains separate metadata-update handling, this branch must still
+  // win whenever callers pass include=definitions|implementations|macros|testclasses.
+  if (args.include !== undefined) {
+    if (!include) {
+      return errorResult(
+        `Invalid CLAS include "${String(args.include)}". Valid values: ${CLASS_WRITE_INCLUDES.join(', ')}.`,
+      );
+    }
+    if (type !== 'CLAS') {
+      return errorResult('SAPWrite include is only supported for action="update" with type="CLAS".');
+    }
+    if (!hasSource) {
+      return errorResult('"source" is required when updating a CLAS include.');
+    }
+
+    // Auto-initialise the include if it doesn't exist yet. On a fresh class
+    // the testclasses (CCAU) include is absent — a content PUT alone fails
+    // with HTTP 500 "…CCAU does not have any inactive version". safeUpdateClassInclude
+    // probes the include and POST-creates it (under the same lock) before the PUT.
+    const { initialized } = await safeUpdateClassInclude(
+      client.http,
+      client.safety,
+      objectUrl,
+      classIncludeUrl(name, include),
+      source,
+      transport,
+      getCachedFeatures()?.abapRelease,
+      args.expectedSourceHash as string | undefined,
+    );
+    invalidateWrittenObject(type, name);
+    const initNote = initialized ? ` (initialised the ${include} include first)` : '';
+    return textResult(
+      `Successfully updated ${type} ${name} include ${include}${initNote}. Active version remains unchanged until activation; read with SAPRead(version="inactive") to verify the draft.`,
+    );
+  }
+
+  if (type === 'SKTD' || isMetadataWriteType(type)) {
+    return writeMetadataUpdate(ctx, existingPackage);
+  }
+
+  // RAP deterministic preflight validation
+  const preflightWarnings = runRapPreflightValidation(
+    source,
+    type,
+    name,
+    getCachedFeatures(),
+    config.systemType,
+    preflightOverride,
+  );
+  if (preflightWarnings.blocked) return preflightWarnings.result!;
+
+  // CDS pre-write validation: reject unsupported syntax early
+  const cdsGuardUpdate = guardCdsSyntax(type, source, getCachedFeatures());
+  if (cdsGuardUpdate) return cdsGuardUpdate;
+
+  // FUNC-source sanitization: strip SAPGUI-style parameter comment blocks.
+  // SAP rejects PUT-to-source/main with these blocks (HTTP 400 / FUNC_ADT028
+  // "Parameter comment blocks are not allowed" — verified live a4h S/4HANA 2023,
+  // issue #250). LLMs frequently emit them out of muscle memory because every
+  // released FM has one. Strip and warn rather than fail.
+  //
+  // Issue #252: when `parameters` is supplied as a structured array, splice
+  // it into the FM source as ABAP-source-based signature syntax. If `source`
+  // is omitted entirely, read the existing source under the lock to preserve the
+  // body. The structured clause replaces any existing signature region.
+  let effectiveSource = source;
+  let fmParamStripWarning: string | undefined;
+  const parameters = args.parameters as FmParameter[] | undefined;
+  const needsCurrentFunctionSource = type === 'FUNC' && parameters !== undefined && !source.trim();
+  const prepareFunctionSource = (baseSource: string): string => {
+    if (parameters !== undefined) baseSource = spliceFmSignature(baseSource, name, parameters);
+    const stripped = stripFmParamCommentBlock(baseSource);
+    if (stripped.wasStripped) {
+      fmParamStripWarning =
+        'Stripped *"…IMPORTING/EXPORTING…*" parameter comment blocks (SAP rejects them on PUT — pass `parameters` as a structured array instead).';
+    }
+    return stripped.source;
+  };
+  if (type === 'FUNC' && !needsCurrentFunctionSource) {
+    // Only caller-supplied body text may be wrapped. A fetched source must contain the real FUNCTION envelope.
+    const bodyOnly = parameters !== undefined && !/^\s*FUNCTION\s+/i.test(source);
+    effectiveSource = prepareFunctionSource(bodyOnly ? `FUNCTION ${name}.\n${source}\nENDFUNCTION.\n` : source);
+  }
+  if (!needsCurrentFunctionSource && !effectiveSource.trim()) {
+    return errorResult(`"source" is required for action="update" on ${type} ${name}; no write was made.`);
+  }
+
+  // Pre-write lint validation (uses sanitized source for FUNC)
+  const lintWarnings = runPreWriteLint(effectiveSource, type, name, config, lintOverride);
+  if (lintWarnings.blocked) return lintWarnings.result!;
+
+  // Pre-write server-side syntax check (opt-in; never blocks — warnings only).
+  let checkNotes = '';
+  const checkSource = async (candidate: string, http = client.http): Promise<string> => {
+    checkNotes = await runPreWriteSyntaxCheck(
+      { http, safety: client.safety },
+      type,
+      candidate,
+      objectUrl,
+      config,
+      checkOverride,
+    );
+    return candidate;
+  };
+  // A signature-only FUNC edit derives its replacement from fresh bytes under the lock.
+  // A failed read aborts; there is no empty-body fallback or unlocked source read.
+  const replacement = needsCurrentFunctionSource
+    ? (current: string, session: AdtHttpClient) => checkSource(prepareFunctionSource(current), session)
+    : await checkSource(effectiveSource);
+
+  // If safeUpdateSource throws (lock conflict, network error, etc.), checkNotes
+  // is intentionally discarded — pre-check warnings only matter when the write succeeded.
+  await safeUpdateSource(
+    client.http,
+    client.safety,
+    objectUrl,
+    srcUrl,
+    replacement,
+    transport,
+    getCachedFeatures()?.abapRelease,
+    args.expectedSourceHash as string | undefined,
+  );
+  invalidateWrittenObject(type, name);
+  const msg = `Successfully updated ${type} ${name}.`;
+  const cdsUpdateHint = type === 'DDLS' ? await buildCdsUpdateCrudHint(client, name, objectUrl) : undefined;
+  const warnings = mergePreWriteWarnings(
+    preflightWarnings.warnings,
+    lintWarnings.warnings,
+    checkNotes,
+    cdsUpdateHint,
+    fmParamStripWarning,
+  );
+  return warnings ? textResult(`${msg}\n\n${warnings}`) : textResult(msg);
+}
+
+export async function writeActionDelete(ctx: SapWriteContext): Promise<ToolResult> {
+  const { client, type, name, transport, objectUrl, invalidateWrittenObject, enforcePackageForExistingObject } = ctx;
+  await enforcePackageForExistingObject();
+  let lockSucceeded = false;
+
+  // Lock, delete, unlock pattern (works for all types including SKTD) — auto-propagate lock corrNr if no explicit transport
+  try {
+    await client.http.withStatefulSession(async (session) => {
+      const lock = await lockObject(session, client.safety, objectUrl, 'MODIFY', getCachedFeatures()?.abapRelease);
+      lockSucceeded = true;
+      const effectiveTransport = transport ?? (lock.corrNr || undefined);
+      try {
+        await deleteObject(session, client.safety, objectUrl, lock.lockHandle, effectiveTransport);
+      } finally {
+        try {
+          await unlockObject(session, objectUrl, lock.lockHandle);
+        } catch {
+          // Object may already be deleted — unlock failure is expected
+        }
+      }
+    });
+  } catch (err) {
+    // NW 7.50 can issue a lock handle for an absent DDLS, so LOCK alone is not
+    // proof of existence. Confirm with a metadata read after the failed DELETE
+    // before overriding generic 404 semantics. This also closes the race between
+    // the package-gate metadata read and the mutation sequence.
+    if (err instanceof AdtApiError && err.isNotFound && lockSucceeded) {
+      try {
+        await client.getObjectMetadata(objectUrl);
+        err.resourceExistenceAfterDelete = 'exists';
+      } catch (probeErr) {
+        // Only a 404 from the follow-up probe establishes absence. Authorization,
+        // transport, and server failures leave existence unknown and must not turn
+        // the original DELETE response into a definite "object not found" claim.
+        err.resourceExistenceAfterDelete =
+          probeErr instanceof AdtApiError && probeErr.isNotFound ? 'absent' : 'unknown';
+      }
+    }
+    if (err instanceof AdtApiError && CDS_DEPENDENCY_SENSITIVE_TYPES.has(canonicalTablType(type))) {
+      const confirmedPostLockNotFound = Boolean(err.isNotFound && err.resourceExistenceAfterDelete === 'exists');
+      const inconclusivePostLockNotFound = Boolean(err.isNotFound && err.resourceExistenceAfterDelete === 'unknown');
+      const detectedDependency =
+        isDeleteDependencyError(err) && (!err.isNotFound || confirmedPostLockNotFound || inconclusivePostLockNotFound);
+      const inferredDdlsDependency = canonicalTablType(type) === 'DDLS' && confirmedPostLockNotFound;
+      if (detectedDependency || inferredDdlsDependency) {
+        const hint = await buildCdsDeleteDependencyHint(client, type, name, objectUrl);
+        if (hint) {
+          // Attach via extraHint so the LLM-facing formatter renders it after
+          // DDIC diagnostics ("what happened → diagnostics → how to fix").
+          // Mutating err.message would surface the hint before diagnostics and
+          // leak into any other consumer of the same error instance.
+          err.extraHint = hint;
+        }
+      }
+    }
+    throw err;
+  }
+  invalidateWrittenObject();
+  return textResult(`Deleted ${type} ${name}.`);
+}
+
+/** Write one subobject of an object's textpool via the ADT textelements service (CLAS, PROG, FUGR).
+ *  `textPart` selects it: symbols (`@MaxLength:NN` then `NNN=text`), selections (a report's
+ *  selection texts, `P_PARAM=Label` per line), headings (`listHeader=`, `columnHeader_N=`).
+ *  ARC-1 supports only symbols for classes. Immediately active, no SAPActivate.
+ *  The client method locks the textelements object, PUTs, and unlocks; the package gate here checks
+ *  the owning object's real package (ctx.objectUrl). Not an ABAP-source write → no lint. */
+export async function writeActionEditTextSymbols(ctx: SapWriteContext): Promise<ToolResult> {
+  const {
+    args,
+    client,
+    type,
+    name,
+    source,
+    hasSource,
+    transport,
+    enforcePackageForExistingObject,
+    invalidateWrittenObject,
+  } = ctx;
+  if (!isTextElementObjectType(type)) {
+    return errorResult(
+      `action edit_text_symbols requires type=${TEXT_ELEMENT_OBJECT_TYPES.join('/')} — got "${type}".`,
+    );
+  }
+  const requestedPart = (args.textPart as string | undefined) ?? 'symbols';
+  if (!TEXT_ELEMENT_PARTS.includes(requestedPart as TextElementPart)) {
+    return errorResult(`Invalid textPart "${requestedPart}" — valid values: ${TEXT_ELEMENT_PARTS.join(', ')}.`);
+  }
+  const part = requestedPart as TextElementPart;
+  if (type === 'CLAS' && part !== 'symbols') {
+    return errorResult(`Only symbols can be written for CLAS; ${part} is read-only in ARC-1.`);
+  }
+  if (!hasSource) {
+    return errorResult(`source is required for edit_text_symbols — the ${part} body, e.g. ${TEXT_PART_EXAMPLE[part]}.`);
+  }
+  await enforcePackageForExistingObject();
+  await client.writeTextElementPart(type, name, part, source, transport);
+  invalidateWrittenObject();
+  return textResult(`Updated ${part} of ${type} ${name}.`);
+}
+
+/** One-line body example per subobject, used in the missing-source error so the caller can retry
+ *  without opening the docs. */
+const TEXT_PART_EXAMPLE: Record<TextElementPart, string> = {
+  symbols: '"@MaxLength:20\\n001=Label\\n" (one @MaxLength per symbol, blank-line separated)',
+  selections: '"P_LGNUM=Warehouse\\nP_WRKST=Work center" (one PARAMETER/SELECT-OPTION per line)',
+  headings: '"listHeader=My report\\ncolumnHeader_1=First column"',
+};

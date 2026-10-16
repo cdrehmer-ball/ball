@@ -1,0 +1,940 @@
+/**
+ * SAPRead handler — read ABAP source + DDIC metadata, version/draft resolution, grep, table
+ * preview. Exports version helpers shared with the write handler.
+ */
+
+import { resolveBspNameAndPath } from '../adt/bsp-path.js';
+import type { AdtClient, SourceReadResult, TextElementPart } from '../adt/client.js';
+import { DataSourcePolicyError } from '../adt/data-source-policy.js';
+import { decodeKtdText, formatKtdNodeIndex, formatKtdShortTexts, KTD_META_MARKER } from '../adt/ddic-xml.js';
+import { extractUnknownColumn, formatUnknownColumnHint, isNotFoundError } from '../adt/errors.js';
+import { mapSapReleaseToAbaplintVersion } from '../adt/features.js';
+import { type FmParameter, type FmParameterKind, parseFmSignature } from '../adt/fm-signature.js';
+import { internalOperationDenial, internalOperationWarning } from '../adt/internal-data-operations.js';
+import { getLockObject } from '../adt/lock-object.js';
+import { describePackageListing } from '../adt/package-contents.js';
+import { isOperationAllowed, OperationType } from '../adt/safety.js';
+import {
+  ensureServerDrivenSupport,
+  getServerDrivenObject,
+  isServerDrivenObjectType,
+  serverDrivenUnavailableMessage,
+} from '../adt/server-driven.js';
+import type { FunctionModuleProperties, InactiveObject } from '../adt/types.js';
+import { getAppInfo } from '../adt/ui5-repository.js';
+import { getVersionDiff } from '../adt/version-diff.js';
+import type { CachingLayer } from '../cache/caching-layer.js';
+import { extractCdsElements } from '../context/cds-deps.js';
+import { grepSource, grepSourceBlocks } from '../context/grep.js';
+import { extractMethod, formatMethodListing, listMethods } from '../context/method-surgery.js';
+import { logger } from '../server/logger.js';
+import { type CacheSecurityContext, inactiveListUserKey, invalidateInactiveList } from './cache-security.js';
+import { readEditableSource } from './editable-source.js';
+import { getCachedFeatures, isBtpSystem } from './feature-cache.js';
+import {
+  detectLocalHandlerInclude,
+  inferObjectType,
+  normalizeObjectType,
+  objectUrlForTypeRaw,
+} from './object-types.js';
+import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
+import { handleSyntaxCheck } from './syntax.js';
+
+const BTP_HINTS: Record<string, string> = {
+  PROG: 'Executable programs (reports) are not available on BTP ABAP Environment. Use CLAS with IF_OO_ADT_CLASSRUN for console applications.',
+  INCL: 'Includes are not available on BTP ABAP Environment. Use classes and interfaces instead — INCLUDE is forbidden in ABAP Cloud.',
+  VIEW: 'Classic DDIC views are not available on BTP ABAP Environment. Use DDLS (CDS views) instead.',
+  TEXT_ELEMENTS:
+    'Text elements are not available on BTP ABAP Environment (no classic programs). Use message classes or constant classes instead.',
+  VARIANTS: 'Variants are not available on BTP ABAP Environment (no classic programs).',
+  SOBJ: 'BOR business objects (SOBJ) are not available on BTP ABAP Environment. Use RAP behavior definitions (BDEF) instead.',
+  TRAN: 'Transaction codes (TRAN) are not available on BTP ABAP Environment. Use SAPSearch to find apps and services instead.',
+};
+
+export type SourceVersion = 'active' | 'inactive';
+type RequestedSourceVersion = SourceVersion | 'auto';
+
+const VERSIONED_SOURCE_READ_TYPES = new Set([
+  'PROG',
+  'CLAS',
+  'INTF',
+  'FUNC',
+  'INCL',
+  'DDLS',
+  'DCLS',
+  'BDEF',
+  'SRVD',
+  'DDLX',
+  'SRVB',
+  'SKTD',
+  'TABL',
+  'VIEW',
+]);
+
+function inactiveTypeMatches(readType: string, inactiveType: string): boolean {
+  // Includes are exposed as canonical INCL to callers but ADT reports them as
+  // PROG/I in the inactive worklist. Function-group structural includes use
+  // FUGR/I instead (live-verified on NW 7.50 and SAP_BASIS 7.58). Keep that
+  // alias local to draft resolution: globally normalizing FUGR/I to INCL would
+  // misroute search hits for a function group's main source when no group is
+  // available to build the structural-include URL.
+  if (normalizeObjectType(readType) === 'INCL' && inactiveType.trim().toUpperCase() === 'FUGR/I') return true;
+  // Normalize both sides instead of comparing only the slash prefix, which
+  // incorrectly classified standalone include drafts as PROG.
+  return normalizeObjectType(inactiveType) === normalizeObjectType(readType);
+}
+
+export async function resolveVersionAndDraftInfo(
+  client: AdtClient,
+  cachingLayer: CachingLayer | undefined,
+  type: string,
+  name: string,
+  requestedVersion: RequestedSourceVersion,
+  cacheSecurity: CacheSecurityContext,
+): Promise<{ effectiveVersion: SourceVersion; draft?: InactiveObject }> {
+  if (!VERSIONED_SOURCE_READ_TYPES.has(type)) {
+    return { effectiveVersion: requestedVersion === 'auto' ? 'active' : requestedVersion };
+  }
+
+  let draft: InactiveObject | undefined;
+  if (cachingLayer || requestedVersion !== 'active') {
+    try {
+      const inactiveObjects = cachingLayer
+        ? await cachingLayer.inactiveLists.getOrFetch(client, inactiveListUserKey(client, cacheSecurity))
+        : await client.getInactiveObjects();
+      const upperName = name.toUpperCase();
+      draft = inactiveObjects.find(
+        (object) => inactiveTypeMatches(type, object.type) && object.name.toUpperCase() === upperName,
+      );
+    } catch (err) {
+      logger.debug('Inactive object list unavailable while resolving source version', {
+        type,
+        name,
+        requestedVersion,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // A just-activated object can briefly still appear in the (eventually-consistent) inactive
+  // worklist; don't surface a stale "unactivated draft" note (or resolve 'auto' to the now-gone
+  // inactive version) for it. Cleared by any subsequent write/force_refresh. See ACTIVATION_FRESH_MS.
+  // Skipped for per-user (principal-propagation) clients: the freshness flag is object-keyed, so
+  // honoring it cross-user could hide another user's genuine draft (inactive list is per-user keyed).
+  if (draft && !cacheSecurity.isPerUserClient && cachingLayer?.wasRecentlyActivated(type, name)) {
+    draft = undefined;
+  }
+
+  if (requestedVersion === 'auto') {
+    return { effectiveVersion: draft ? 'inactive' : 'active', draft };
+  }
+  return { effectiveVersion: requestedVersion, draft };
+}
+
+function sourceVersionWarning(effectiveVersion: SourceVersion, draft?: InactiveObject): string | undefined {
+  if (effectiveVersion === 'active' && draft) {
+    const deletion = draft.deleted ? ' deletion' : '';
+    const transport = draft.transport ? ` (in transport ${draft.transport})` : '';
+    return `Note: You have an unactivated${deletion} draft of this object${transport}. The source below is the LAST ACTIVATED version. To work with your draft, activate it first via SAPActivate or re-run with version='inactive' to read it directly.`;
+  }
+  if (effectiveVersion === 'inactive' && !draft) {
+    return 'Note: No inactive draft exists for this object on the server. Returning the active version.';
+  }
+  return undefined;
+}
+
+/**
+ * SWOTLV is a declared internal source and BOR method resolution has no alternative in ARC-1, so a
+ * policy denial must name the affected feature rather than surfacing a bare policy error.
+ */
+async function swotlv<T>(minimalErrors: boolean, run: () => Promise<T>): Promise<T | { policyDenial: ToolResult }> {
+  try {
+    return await run();
+  } catch (error) {
+    if (error instanceof DataSourcePolicyError) {
+      return { policyDenial: errorResult(internalOperationDenial('bor_method_lookup', error, minimalErrors)) };
+    }
+    throw error;
+  }
+}
+
+export async function handleSAPRead(
+  client: AdtClient,
+  args: Record<string, unknown>,
+  cachingLayer: CachingLayer | undefined,
+  cacheSecurity: CacheSecurityContext,
+  minimalErrors: boolean,
+): Promise<ToolResult> {
+  const type = normalizeObjectType(String(args.type ?? ''));
+  const name = String(args.name ?? '');
+  const requestedVersion = (args.version ?? 'active') as RequestedSourceVersion;
+
+  if (type === 'SYNTAX')
+    return handleSyntaxCheck(client, { type: args.objectType, name, version: args.version, source: args.source });
+
+  // BTP: return helpful error for unavailable types
+  if (isBtpSystem() && BTP_HINTS[type]) {
+    return errorResult(BTP_HINTS[type]);
+  }
+
+  if (args.format === 'editable') return readEditableSource(client, args, type, name);
+
+  // action="diff": unified diff between two source versions (single system). Bypasses the
+  // cache/draft machinery below on purpose — both sides must be RAW source, or the no-draft
+  // banner (sourceVersionWarning) would surface as a spurious hunk.
+  // See docs/research/2026-06-15-version-diff-saved-read-action.md.
+  if (args.action === 'diff') {
+    if (!name) return errorResult('SAPRead action="diff" requires a "name".');
+    if (isServerDrivenObjectType(type)) {
+      return errorResult(
+        'SAPRead action="diff" does not support server-driven types; read version="active" and version="inactive" separately.',
+      );
+    }
+    const from = typeof args.from === 'string' && args.from ? args.from : 'active';
+    const to = typeof args.to === 'string' && args.to ? args.to : 'inactive';
+    const fromLabel = typeof args.fromLabel === 'string' && args.fromLabel ? args.fromLabel : undefined;
+    const toLabel = typeof args.toLabel === 'string' && args.toLabel ? args.toLabel : undefined;
+    const fromDisplay = fromLabel ?? from;
+    const toDisplay = toLabel ?? to;
+    try {
+      const r = await getVersionDiff(client, type, name, from, to, {
+        include: typeof args.include === 'string' ? args.include : undefined,
+        group: typeof args.group === 'string' ? args.group : undefined,
+        fromLabel,
+        toLabel,
+      });
+      if (args.format === 'structured') {
+        return textResult(
+          toolJson({
+            type,
+            name,
+            from,
+            to,
+            fromLabel: fromDisplay,
+            toLabel: toDisplay,
+            identical: r.identical,
+            hasDifferences: !r.identical,
+            added: r.added,
+            removed: r.removed,
+            diff: r.diff,
+          }),
+        );
+      }
+      if (r.identical) {
+        return textResult(`No differences between ${fromDisplay} and ${toDisplay} for ${type} ${name}.`);
+      }
+      return textResult(
+        `Diff ${type} ${name}: ${fromDisplay} → ${toDisplay}  (+${r.added} -${r.removed})\n\n${r.diff}`,
+      );
+    } catch (err) {
+      if (isNotFoundError(err)) {
+        return errorResult(
+          `Could not diff ${type} ${name}: object or revision not found.${err instanceof Error ? ` ${err.message}` : ''}`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  // Types in SDO_REGISTRY use the discovery-gated engine for metadata and JSON or DDL-text source.
+  // Preserve the unversioned developer view for omitted/auto; explicit selection is checked by SAP metadata.
+  if (isServerDrivenObjectType(type)) {
+    if (!name) return errorResult(`"name" is required for SAPRead type=${type}.`);
+    if (!(await ensureServerDrivenSupport(client.http, client.safety, type))) {
+      return errorResult(serverDrivenUnavailableMessage('SAPRead', type));
+    }
+    const version = args.version === 'active' || args.version === 'inactive' ? args.version : undefined;
+    const sdo = await getServerDrivenObject(client.http, client.safety, type, name, version);
+    return textResult(toolJson(sdo));
+  }
+
+  // Class text symbols (Textelemente): include=text_symbols reads a class's maintained text symbols
+  // via the top-level textelements service. Text symbols have no active/inactive version, so bypass
+  // the version/draft/cache machinery below (like server-driven objects do).
+  if (type === 'CLAS' && (args.include as string | undefined)?.toLowerCase() === 'text_symbols') {
+    if (!name) return errorResult('SAPRead type=CLAS include=text_symbols requires a "name".');
+    return textResult(await client.getClassTextSymbols(name));
+  }
+
+  if (args.force_refresh === true && cachingLayer && VERSIONED_SOURCE_READ_TYPES.has(type)) {
+    invalidateInactiveList(cachingLayer, client, cacheSecurity);
+    cachingLayer.invalidate(type, name, 'all');
+  }
+
+  const { effectiveVersion, draft } = await resolveVersionAndDraftInfo(
+    client,
+    cachingLayer,
+    type,
+    name,
+    requestedVersion,
+    cacheSecurity,
+  );
+  const versionWarning = sourceVersionWarning(effectiveVersion, draft);
+
+  // Helper: get source with cache support, returns cache hit status
+  const cachedGet = async (
+    objType: string,
+    objName: string,
+    version: SourceVersion,
+    fetcher: (ifNoneMatch?: string) => Promise<SourceReadResult>,
+  ): Promise<{ source: string; cacheHit: boolean; revalidated: boolean }> => {
+    if (!cachingLayer) {
+      const result = await fetcher(undefined);
+      return { source: result.source, cacheHit: false, revalidated: false };
+    }
+    const { source, hit, revalidated } = await cachingLayer.getSource(objType, objName, fetcher, { version });
+    return { source, cacheHit: hit, revalidated };
+  };
+
+  /** Prepend draft-awareness notes and cache indicator when the server revalidated a cached source. */
+  const cachedTextResult = (source: string, cacheHit: boolean, revalidated: boolean, warning?: string): ToolResult => {
+    const note = warning ? `${warning}\n\n` : '';
+    const indicator = cacheHit && revalidated ? '[cached:revalidated]\n' : '';
+    return textResult(`${note}${indicator}${source}`);
+  };
+
+  /** When args.grep is set, return only matching source lines (+context) instead of full source. */
+  const grepText = (source: string): ToolResult => {
+    const g = grepSource(source, String(args.grep));
+    return g.invalidPattern ? errorResult(g.output) : textResult(g.output);
+  };
+
+  // Structured ordinary reads: class metadata or a package listing envelope.
+  if (args.format === 'structured' && type !== 'CLAS' && type !== 'DEVC') {
+    return errorResult(
+      'For ordinary reads, format="structured" supports CLAS and DEVC. Retry this read with format="text" or omit format; DDIC metadata is returned by its normal reader.',
+    );
+  }
+
+  switch (type) {
+    case 'PROG': {
+      const { source, cacheHit, revalidated } = await cachedGet('PROG', name, effectiveVersion, (ifNoneMatch) =>
+        client.getProgram(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'CLAS': {
+      // grep: return only matching source lines (+context), annotated with the owning class/method.
+      if (args.grep) {
+        if (args.method) {
+          return errorResult(
+            'Do not combine grep with method. Use grep to find code, then method="<name>" to read the full method.',
+          );
+        }
+        const rawSection = args.include as string | undefined;
+        // 'main' (and the default) live at /source/main, not /includes/main — read via the
+        // cached main path; only real sub-includes go through the raw getClassInclude endpoint.
+        const section = rawSection && rawSection.toLowerCase() !== 'main' ? rawSection : undefined;
+        let clasSource: string;
+        if (section) {
+          try {
+            clasSource = (await client.getClassInclude(name, section, { version: effectiveVersion })).source;
+          } catch (err) {
+            if (isNotFoundError(err)) {
+              return textResult(
+                `Include "${section}" is not available for class ${name}. Run grep without include= to search the full class source.`,
+              );
+            }
+            throw err;
+          }
+        } else {
+          clasSource = (
+            await cachedGet('CLAS', name, effectiveVersion, (ifNoneMatch) =>
+              client.getClass(name, undefined, { ifNoneMatch, version: effectiveVersion }),
+            )
+          ).source;
+        }
+        const probedAbapRelease = getCachedFeatures()?.abapRelease;
+        const abaplintVer = probedAbapRelease ? mapSapReleaseToAbaplintVersion(probedAbapRelease) : undefined;
+        // MethodInfo is a structural superset of grepSource's MethodRange — pass through directly.
+        const listing = listMethods(clasSource, name, abaplintVer);
+        const g = grepSource(clasSource, String(args.grep), listing.success ? { methods: listing.methods } : undefined);
+        return g.invalidPattern
+          ? errorResult(g.output)
+          : textResult(`[${name} section=${rawSection ?? 'main'}]\n${g.output}`);
+      }
+      // Structured format: return JSON with metadata + decomposed source
+      if (args.format === 'structured') {
+        const structured = await client.getClassStructured(name);
+        return textResult(toolJson(structured));
+      }
+      const methodParam = args.method as string | undefined;
+      if (methodParam) {
+        // An explicit include is authoritative, including `main`. Only an omitted include may be
+        // inferred from a qualified local-class name (the same convention used by edit_method).
+        const requestedInclude = (args.include as string | undefined)?.toLowerCase();
+        const resolvedInclude =
+          requestedInclude === undefined
+            ? detectLocalHandlerInclude(methodParam)
+            : requestedInclude === 'main'
+              ? undefined
+              : requestedInclude;
+        let methodSource: string;
+        if (resolvedInclude) {
+          // Include reads bypass the source cache: its key has no class-section dimension, so a
+          // cached MAIN body must never satisfy an implementations/testclasses request.
+          try {
+            methodSource = (
+              await client.getClassInclude(name, resolvedInclude, {
+                version: effectiveVersion,
+              })
+            ).source;
+          } catch (err) {
+            if (isNotFoundError(err)) {
+              return errorResult(
+                `Include "${resolvedInclude}" is not available for class ${name}, so method "${methodParam}" cannot be read from it.`,
+              );
+            }
+            throw err;
+          }
+        } else {
+          methodSource = (
+            await cachedGet('CLAS', name, effectiveVersion, (ifNoneMatch) =>
+              client.getClass(name, undefined, { ifNoneMatch, version: effectiveVersion }),
+            )
+          ).source;
+        }
+        const probedAbapRelease = getCachedFeatures()?.abapRelease;
+        const abaplintVer = probedAbapRelease ? mapSapReleaseToAbaplintVersion(probedAbapRelease) : undefined;
+        if (methodParam === '*') {
+          const listing = listMethods(methodSource, name, abaplintVer);
+          return textResult(formatMethodListing(listing));
+        }
+        const extracted = extractMethod(methodSource, name, methodParam, abaplintVer);
+        if (!extracted.success) {
+          const location = resolvedInclude ? ` (read from include=${resolvedInclude})` : '';
+          const hint =
+            requestedInclude === undefined && !resolvedInclude
+              ? ' Methods of class-local classes live in an include: qualify the method as "lhc_x~method" (or "ltc_x~method" for testclasses), or pass include= explicitly.'
+              : '';
+          return errorResult(`${extracted.error ?? `Method "${methodParam}" not found in ${name}.`}${location}${hint}`);
+        }
+        return cachedTextResult(extracted.methodSource, false, false, versionWarning);
+      }
+      // Only cache the full merged source (no include param), not individual includes
+      if (!args.include) {
+        const { source, cacheHit, revalidated } = await cachedGet('CLAS', name, effectiveVersion, (ifNoneMatch) =>
+          client.getClass(name, undefined, { ifNoneMatch, version: effectiveVersion }),
+        );
+        return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+      }
+      const includeResult = await client.getClass(name, args.include as string | undefined, {
+        version: effectiveVersion,
+      });
+      return cachedTextResult(includeResult.source, false, false, versionWarning);
+    }
+    case 'INTF': {
+      const { source, cacheHit, revalidated } = await cachedGet('INTF', name, effectiveVersion, (ifNoneMatch) =>
+        client.getInterface(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'FUNC': {
+      let group = String(args.group ?? '');
+      if (!group) {
+        // Use cached func group resolution if available
+        const resolved = cachingLayer
+          ? await cachingLayer.resolveFuncGroup(client, name)
+          : await client.resolveFunctionGroup(name);
+        if (!resolved) {
+          return errorResult(
+            `Cannot resolve function group for "${name}". Provide the group parameter explicitly, or use SAPSearch("${name}") to find the function group.`,
+          );
+        }
+        group = resolved;
+      }
+      const { source, cacheHit, revalidated } = await cachedGet('FUNC', name, effectiveVersion, (ifNoneMatch) =>
+        client.getFunction(group, name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      // Issue #252: when caller asks for includeSignature, return JSON with the
+      // source body and the parsed structured signature.
+      if (args.includeSignature === true) {
+        const parsed = parseFmSignature(source);
+        const grouped: Record<FmParameterKind, FmParameter[]> = {
+          importing: [],
+          exporting: [],
+          changing: [],
+          tables: [],
+          exceptions: [],
+          raising: [],
+        };
+        for (const p of parsed.params) grouped[p.kind].push(p);
+        // processingType/updateTaskKind live in the fmodule metadata document, not in the source —
+        // without them a caller can set RFC-enablement but never verify it. Best-effort: a metadata
+        // hiccup must not break signature reading, which callers already depend on.
+        let properties: FunctionModuleProperties | undefined;
+        let propertiesError: string | undefined;
+        try {
+          properties = await client.getFunctionModuleProperties(group, name);
+        } catch (err) {
+          propertiesError = err instanceof Error ? err.message : String(err);
+        }
+        const payload = {
+          source,
+          signature: grouped,
+          ...(properties?.processingType ? { processingType: properties.processingType } : {}),
+          ...(properties?.updateTaskKind ? { updateTaskKind: properties.updateTaskKind } : {}),
+          ...(propertiesError ? { propertiesError } : {}),
+        };
+        return textResult(toolJson(payload));
+      }
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'FUGR': {
+      // grep searches the include sources, so it implies the expansion; without the
+      // sources there is nothing to search and the metadata would ignore the pattern.
+      const expand = Boolean(args.expand_includes) || Boolean(args.grep);
+      if (expand) {
+        // Recursive expansion: the function module bodies (FUNCTION…ENDFUNCTION) and
+        // PBO/PAI modules live in nested includes (LZ<grp>U01, …O…, …I…) pulled in from
+        // the UXX include — a one-level walk misses them. getFunctionGroupExpanded BFS-es
+        // the include graph (depth/count-capped, cycle-guarded). Dynpros + GUI status are
+        // not included: ADT doesn't expose them over REST (SAPGUI-only).
+        const { blocks, truncated } = await client.getFunctionGroupExpanded(name, { version: effectiveVersion });
+        if (args.grep) {
+          // Each include on its own, so a line number counts within the include it names.
+          const g = grepSourceBlocks(blocks, String(args.grep));
+          const note = truncated
+            ? '\n\n=== [truncated] ===\nInclude expansion limit reached (80 source blocks or 5 levels); some nested includes were not searched. ' +
+              'Search a known include with SAPRead(type="INCL", name="...", grep="...") or a function module with type="FUNC", group="...", name="...", grep="...".'
+            : '';
+          const output = `${g.output}${note}`;
+          return g.invalidPattern ? errorResult(output) : textResult(output);
+        }
+        const parts = blocks.map((b) => `=== ${b.name} ===\n${b.source}`);
+        if (truncated) {
+          parts.push(
+            '=== [truncated] ===\nInclude expansion limit reached (80 source blocks or 5 levels); some nested includes were not expanded. ' +
+              'Read remaining includes individually with SAPRead(type="INCL", name="...").',
+          );
+        }
+        return textResult(parts.join('\n\n'));
+      }
+      const fg = await client.getFunctionGroup(name);
+      return textResult(toolJson(fg));
+    }
+    case 'INCL': {
+      const { source, cacheHit, revalidated } = await cachedGet('INCL', name, effectiveVersion, (ifNoneMatch) =>
+        client.getInclude(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'DDLS': {
+      const {
+        source: ddlSource,
+        cacheHit,
+        revalidated,
+      } = await cachedGet('DDLS', name, effectiveVersion, (ifNoneMatch) =>
+        client.getDdls(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (ddlSource.trim() === '') {
+        return textResult(
+          `DDLS ${name} exists in the object directory but has no source code stored. ` +
+            `The DDL source may need to be written via SAPWrite(action="create" or "update", type="DDLS", name="${name}", source="...").`,
+        );
+      }
+      if ((args.include as string | undefined)?.toLowerCase() === 'elements') {
+        // Elements extraction is derived from source — no cache indicator
+        return cachedTextResult(extractCdsElements(ddlSource, name), false, false, versionWarning);
+      }
+      if (args.grep) return grepText(ddlSource);
+      return cachedTextResult(ddlSource, cacheHit, revalidated, versionWarning);
+    }
+    case 'DCLS': {
+      const { source, cacheHit, revalidated } = await cachedGet('DCLS', name, effectiveVersion, (ifNoneMatch) =>
+        client.getDcl(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'BDEF': {
+      const { source, cacheHit, revalidated } = await cachedGet('BDEF', name, effectiveVersion, (ifNoneMatch) =>
+        client.getBdef(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'SRVD': {
+      const { source, cacheHit, revalidated } = await cachedGet('SRVD', name, effectiveVersion, (ifNoneMatch) =>
+        client.getSrvd(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'DDLX': {
+      try {
+        const { source, cacheHit, revalidated } = await cachedGet('DDLX', name, effectiveVersion, (ifNoneMatch) =>
+          client.getDdlx(name, { ifNoneMatch, version: effectiveVersion }),
+        );
+        if (args.grep) return grepText(source);
+        return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return textResult(
+            `No metadata extension (DDLX) found for "${name}". This means no @UI annotations are defined via DDLX for this view. The view may use inline annotations in the DDLS source, or the Fiori app may configure columns via manifest.json / app descriptor.`,
+          );
+        }
+        throw err;
+      }
+    }
+    case 'SRVB': {
+      const { source, cacheHit, revalidated } = await cachedGet('SRVB', name, effectiveVersion, (ifNoneMatch) =>
+        client.getSrvb(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'SKTD': {
+      try {
+        // ADT returns a <sktd:docu> XML envelope with the Markdown body base64-encoded
+        // inside <sktd:text>. Cache the raw envelope (update flow re-uses it) and
+        // return the decoded Markdown to the LLM.
+        const { source, cacheHit, revalidated } = await cachedGet('SKTD', name, effectiveVersion, (ifNoneMatch) =>
+          client.getKtd(name, { ifNoneMatch, version: effectiveVersion }),
+        );
+        // Full reads use the reversible route-safe representation so their output can
+        // be pasted into SAPWrite. Grep searches the stored Markdown without escapes.
+        const markdown = decodeKtdText(source, { routeSafe: !args.grep });
+        if (args.grep) return grepText(markdown);
+        // List copyable names for every writable node, including empty nodes omitted from Markdown.
+        // The labels use the same resolver as SAPWrite.
+        const index = formatKtdNodeIndex(source);
+        const readOnlyContext = [
+          versionWarning,
+          cacheHit && revalidated ? '[cached:revalidated]' : undefined,
+          formatKtdShortTexts(source) || undefined,
+          index || undefined,
+        ]
+          .filter((entry): entry is string => Boolean(entry))
+          .join('\n\n');
+        const text = readOnlyContext
+          ? [markdown || undefined, `${KTD_META_MARKER}\n${readOnlyContext}`]
+              .filter((entry): entry is string => Boolean(entry))
+              .join('\n\n')
+          : markdown;
+        return textResult(text);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return textResult(
+            `No Knowledge Transfer Document (SKTD) found for "${name}". KTD docs are optional Markdown documentation attached to ABAP objects — either one was never created for "${name}", or the name is wrong.`,
+          );
+        }
+        throw err;
+      }
+    }
+    case 'TABL': {
+      // Unified TABL: covers transparent tables and DDIC structures (Model B).
+      // client.getTabl() handles the /tables/ → /structures/ fallback internally
+      // and caches the resolved URL for subsequent write/activate paths.
+      const { source, cacheHit, revalidated } = await cachedGet('TABL', name, effectiveVersion, (ifNoneMatch) =>
+        client.getTabl(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'VIEW': {
+      const { source, cacheHit, revalidated } = await cachedGet('VIEW', name, effectiveVersion, (ifNoneMatch) =>
+        client.getView(name, { ifNoneMatch, version: effectiveVersion }),
+      );
+      if (args.grep) return grepText(source);
+      return cachedTextResult(source, cacheHit, revalidated, versionWarning);
+    }
+    case 'DOMA': {
+      const domain = await client.getDomain(name);
+      return textResult(toolJson(domain));
+    }
+    case 'DTEL': {
+      // SAP's version-less developer view exposes pending drafts for omitted and `auto` reads.
+      const dtelVersion = args.version === 'active' || args.version === 'inactive' ? args.version : undefined;
+      const dtel = await client.getDataElement(name, dtelVersion);
+      return textResult(toolJson(dtel));
+    }
+    case 'TTYP': {
+      const ttyp = await client.getTableType(name);
+      return textResult(toolJson(ttyp));
+    }
+    case 'ENQU': {
+      // Omitted/auto keeps SAP's developer view (a pending inactive edit shows up), like DTEL.
+      const enquVersion = args.version === 'active' || args.version === 'inactive' ? args.version : undefined;
+      const enqu = await getLockObject(client.http, client.safety, name, enquVersion);
+      return textResult(toolJson(enqu));
+    }
+    case 'AUTH': {
+      const authField = await client.getAuthorizationField(name);
+      return textResult(toolJson(authField));
+    }
+    case 'FTG2':
+    case 'FEATURE_TOGGLE': {
+      // FEATURE_TOGGLE is the canonical short type. 'FTG2' is a deprecated alias —
+      // see docs/research/abap-types/types/ftg2.md (ARC-1-invented; zero hits in TADIR,
+      // abap-file-formats, Eclipse apidoc). Removed in the next minor.
+      if (type === 'FTG2') {
+        logger.warn('SAPRead type "FTG2" is deprecated — use "FEATURE_TOGGLE" instead', {
+          type: 'FTG2',
+          replacement: 'FEATURE_TOGGLE',
+        });
+      }
+      const toggle = await client.getFeatureToggle(name);
+      return textResult(toolJson(toggle));
+    }
+    case 'ENHO': {
+      if (args.version === 'active' || args.version === 'inactive') {
+        return errorResult(
+          'ENHO does not support explicit version selection. Omit version or use "auto" for SAP\'s developer view.',
+        );
+      }
+      const enhancement = await client.getEnhancementImplementation(name);
+      return textResult(toolJson(enhancement));
+    }
+    case 'VERSIONS': {
+      const include = typeof args.include === 'string' ? args.include : undefined;
+      let group = typeof args.group === 'string' ? args.group : undefined;
+      const objectType = normalizeObjectType(String(args.objectType ?? '')) || inferObjectType(name) || 'PROG';
+
+      if (objectType === 'FUNC' && !group) {
+        const resolved = cachingLayer
+          ? await cachingLayer.resolveFuncGroup(client, name)
+          : await client.resolveFunctionGroup(name);
+        if (!resolved) {
+          return errorResult(
+            `Cannot resolve function group for "${name}". Provide the group parameter explicitly, or use SAPSearch("${name}") to find the function group.`,
+          );
+        }
+        group = resolved;
+      }
+
+      try {
+        const revisions = await client.getRevisions(objectType, name, { include, group });
+        return textResult(toolJson(revisions));
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return textResult(
+            `No version history available for ${objectType} "${name}" on this SAP system. ` +
+              `This usually means the object does not exist, or the ADT versions endpoint is not supported for ${objectType} on this backend release.`,
+          );
+        }
+        throw err;
+      }
+    }
+    case 'VERSION_SOURCE': {
+      const versionUri = String(args.versionUri ?? '');
+      if (!versionUri) {
+        return errorResult(
+          'VERSION_SOURCE requires a versionUri parameter. Get it from SAPRead(type="VERSIONS", name="...") response (.revisions[].uri).',
+        );
+      }
+      try {
+        return textResult(await client.getRevisionSource(versionUri));
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          return errorResult(
+            `Revision at URI "${versionUri}" was not found. The revision may have been removed, or the URI is malformed. Fetch a fresh list via SAPRead(type="VERSIONS", name="...").`,
+          );
+        }
+        throw err;
+      }
+    }
+    case 'TRAN': {
+      const tran = await client.getTransaction(name);
+      // Enrich with program name via SQL — only if free SQL is allowed by safety config
+      let tranWarning: string | undefined;
+      if (isOperationAllowed(client.safety, OperationType.FreeSQL)) {
+        try {
+          const safeName = name.toUpperCase().replace(/[^A-Z0-9_/]/g, '');
+          const data = await client.runQuery(`SELECT TCODE, PGMNA FROM TSTC WHERE TCODE = '${safeName}'`, 1);
+          if (data.rows.length > 0) {
+            tran.program = String(data.rows[0]!.PGMNA ?? '').trim();
+          }
+        } catch (error) {
+          // Optional enrichment: still return the transaction metadata, but say the program name is
+          // missing rather than letting the model read its absence as "this transaction has none".
+          if (error instanceof DataSourcePolicyError) {
+            tranWarning = internalOperationWarning('tran_program_enrichment', error.code);
+          }
+          // Other failures (e.g. TSTC absent on BTP) keep the existing silent-metadata behaviour.
+        }
+      }
+      return textResult(toolJson(tranWarning ? { ...tran, warning: tranWarning } : tran));
+    }
+    case 'API_STATE': {
+      // Determine object type for URL construction — use explicit objectType, infer from name, or error
+      const explicitType = normalizeObjectType(String(args.objectType ?? ''));
+      const inferredType = explicitType || inferObjectType(name);
+      if (!inferredType) {
+        return errorResult(
+          `Cannot infer object type from name "${name}". Please specify objectType explicitly (e.g., objectType="CLAS", "INTF", "PROG", "TABL", "DDLS", "DCLS", "FUGR", "DOMA", "DTEL", "SRVD", "SRVB", "BDEF").`,
+        );
+      }
+      // Use raw URI (no name encoding) — getApiReleaseState encodes the full URI as a single path segment
+      const objectUri = objectUrlForTypeRaw(inferredType, name);
+      const releaseState = await client.getApiReleaseState(objectUri);
+      return textResult(toolJson(releaseState));
+    }
+    case 'TABLE_CONTENTS': {
+      const maxRows = Number(args.maxRows ?? 100);
+      const data = await client.getTableContents(name, maxRows, args.sqlFilter as string | undefined);
+      return textResult(toolJson(data));
+    }
+    case 'TABLE_QUERY': {
+      const maxRows = Number(args.maxRows ?? 100);
+      const columns = Array.isArray(args.columns) ? (args.columns as string[]) : undefined;
+      const where = Array.isArray(args.where)
+        ? (args.where as Array<{ field: string; op: string; value?: string }>)
+        : undefined;
+      try {
+        const data = await client.runTableQuery(name, { columns, where, maxRows });
+        return textResult(toolJson(data));
+      } catch (err) {
+        // Self-correct an unknown-column error (a bad entry in `columns`/`where`) by listing the
+        // table's real columns (best-effort).
+        const badColumn = extractUnknownColumn(err);
+        if (badColumn) {
+          try {
+            const { columns: valid } = await client.getTableContents(name, 1);
+            if (valid.length > 0) return errorResult(formatUnknownColumnHint(badColumn, name, valid));
+          } catch {
+            // best-effort — fall through to the original error
+          }
+        }
+        throw err;
+      }
+    }
+    case 'SOBJ': {
+      const method = String(args.method ?? '');
+      // Sanitize inputs to prevent SQL injection — BOR names are alphanumeric + underscore only
+      const safeName = name.toUpperCase().replace(/[^A-Z0-9_/]/g, '');
+      const safeMethod = method.toUpperCase().replace(/[^A-Z0-9_]/g, '');
+      if (safeName !== name.toUpperCase().replace(/\s/g, '')) {
+        return errorResult(
+          `Invalid BOR object name: "${name}". Only alphanumeric characters, underscores, and slashes are allowed.`,
+        );
+      }
+      if (safeMethod) {
+        // Read specific BOR method implementation via SWOTLV lookup
+        const data = await swotlv(minimalErrors, () =>
+          client.runQuery(
+            `SELECT PROGNAME, FORMNAME FROM SWOTLV WHERE LOBJTYPE = '${safeName}' AND VERB = '${safeMethod}'`,
+            1,
+          ),
+        );
+        if ('policyDenial' in data) return data.policyDenial;
+        if (data.rows.length > 0) {
+          const prog = String(data.rows[0]!.PROGNAME ?? '').trim();
+          if (!prog) {
+            return errorResult(`BOR method "${method}" on "${name}" has no program assigned.`);
+          }
+          const { source } = await client.getProgram(prog);
+          return textResult(
+            `=== BOR ${name}.${method} (program: ${prog}, form: ${String(data.rows[0]!.FORMNAME ?? '').trim()}) ===\n${source}`,
+          );
+        }
+        return errorResult(
+          `BOR method "${method}" not found on object type "${name}". Use SAPRead(type="SOBJ", name="${name}") without method to list all methods.`,
+        );
+      }
+      // List all methods for this BOR object
+      const methods = await swotlv(minimalErrors, () =>
+        client.runQuery(`SELECT VERB, PROGNAME, FORMNAME, DESCRIPT FROM SWOTLV WHERE LOBJTYPE = '${safeName}'`, 100),
+      );
+      if ('policyDenial' in methods) return methods.policyDenial;
+      if (methods.rows.length === 0) {
+        return errorResult(`No BOR methods found for object type "${name}". Verify the BOR object type name.`);
+      }
+      return textResult(toolJson(methods));
+    }
+    case 'DEVC': {
+      const maxResults = args.maxResults != null ? Number(args.maxResults) : undefined;
+      const contents = await client.getPackageContents(name, maxResults);
+      const listing = describePackageListing(contents.length, maxResults);
+      if (args.format === 'structured') return textResult(toolJson({ objects: contents, listing }));
+      const result = textResult(toolJson(contents));
+      result.content.push({ type: 'text', text: toolJson({ listing }) });
+      return result;
+    }
+    case 'SYSTEM':
+      return textResult(await client.getSystemInfo());
+    case 'COMPONENTS': {
+      const components = await client.getInstalledComponents();
+      return textResult(toolJson(components));
+    }
+    case 'MESSAGES':
+    case 'MSAG': {
+      // MSAG is the canonical TADIR R3TR type for message classes; 'MESSAGES' is a
+      // deprecated read alias kept for one minor release. See
+      // docs/research/abap-types/types/msag.md.
+      if (type === 'MESSAGES') {
+        logger.warn('SAPRead type "MESSAGES" is deprecated — use "MSAG" instead', {
+          type: 'MESSAGES',
+          replacement: 'MSAG',
+        });
+      }
+      try {
+        const mcInfo = await client.getMessageClassInfo(name);
+        return textResult(toolJson(mcInfo));
+      } catch {
+        // Fall back to legacy endpoint if messageclass endpoint unavailable
+        return textResult(await client.getMessages(name));
+      }
+    }
+    case 'TEXT_ELEMENTS': {
+      // objectType picks the textelements collection (PROG default, also CLAS/FUGR); include picks
+      // one subobject (symbols | selections | headings) instead of the whole pool.
+      const part = (args.include as string | undefined)?.toLowerCase() as TextElementPart | undefined;
+      return textResult(
+        await client.getTextElements(name, {
+          objectType: (args.objectType as string | undefined) ?? 'PROG',
+          part,
+        }),
+      );
+    }
+    case 'VARIANTS':
+      return textResult(await client.getVariants(name));
+    case 'BSP': {
+      const ui5Feature = getCachedFeatures()?.ui5;
+      if (ui5Feature && !ui5Feature.available) {
+        return errorResult(
+          'UI5/Fiori BSP Filestore is not available on this SAP system. Run SAPManage(action="probe") ' +
+            'for the reason (often a missing S_ADT_RES authorization), or set SAP_FEATURE_UI5=on to force it on.',
+        );
+      }
+      if (!name) {
+        // List all BSP apps (optional search via query param not used here since name is empty)
+        const apps = await client.listBspApps();
+        return textResult(toolJson(apps));
+      }
+      const { appName, path } = resolveBspNameAndPath(name, args.include as string | undefined);
+      const content = await client.getBspPathContent(appName, path);
+      return content.kind === 'folder' ? textResult(toolJson(content.nodes)) : textResult(content.content);
+    }
+    case 'BSP_DEPLOY': {
+      const ui5repoFeature = getCachedFeatures()?.ui5repo;
+      if (ui5repoFeature && !ui5repoFeature.available) {
+        return errorResult(
+          'ABAP Repository OData Service is not available on this SAP system. Run SAPManage(action="probe") ' +
+            'for the reason, or set SAP_FEATURE_UI5REPO=on to force it on.',
+        );
+      }
+      if (!name) {
+        return errorResult('BSP_DEPLOY requires a name parameter (e.g., name="ZAPP_BOOKING").');
+      }
+      const info = await getAppInfo(client.http, client.safety, name);
+      if (!info) {
+        return textResult(`App "${name}" not found in ABAP Repository.`);
+      }
+      return textResult(toolJson(info));
+    }
+    case 'INACTIVE_OBJECTS': {
+      const objects = await client.getInactiveObjects();
+      return textResult(toolJson({ count: objects.length, objects }));
+    }
+    default:
+      return errorResult(
+        `Unknown SAPRead type: "${type}". Supported types: PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD, TABL, TTYP, ENQU, VIEW, DOMA, DTEL, MSAG, AUTH, FEATURE_TOGGLE, ENHO, VERSIONS, VERSION_SOURCE, TRAN, TABLE_CONTENTS, DEVC, SOBJ, SYSTEM, COMPONENTS, TEXT_ELEMENTS, VARIANTS, BSP, BSP_DEPLOY, API_STATE, INACTIVE_OBJECTS. Deprecated aliases: MESSAGES (use MSAG), FTG2 (use FEATURE_TOGGLE). ` +
+          'Tip: Type aliases are auto-normalized (e.g., DDLS/DF → DDLS, DCLS/DL → DCLS, CLAS/OC → CLAS, PROG/P → PROG). ' +
+          'Do not pass a URI — use the "type" and "name" parameters instead.',
+      );
+  }
+}

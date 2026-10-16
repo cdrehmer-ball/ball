@@ -1,0 +1,628 @@
+# Authorization & Roles
+
+This page explains how to decide **who can do what** in ARC-1.
+
+The goal is simple: an admin should be able to answer these questions without reading code:
+
+- Which env var do I set on the server?
+- Which role, scope, or API-key profile does the user need?
+- Why was a request blocked?
+
+For a flat list of every flag, use [Configuration Reference](configuration-reference.md). For the v0.6 to v0.7 migration table, use [Updating](updating.md#v07-authorization-refactor-breaking-change).
+
+---
+
+## The model in one picture
+
+ARC-1 has three independent gates. A request succeeds only if all relevant gates allow it.
+
+| Gate | Question | Set by | Example |
+| ---- | -------- | ------ | ------- |
+| **1. Server ceiling** | Is this capability enabled on this ARC-1 instance? | ARC-1 admin, env vars / CLI | `SAP_ALLOW_WRITES=true` |
+| **2. User permission** | Is this user allowed to use the capability? | XSUAA role, OIDC scope, or API-key profile | `write` scope, `developer` key |
+| **3. SAP authorization** | Does the SAP user have backend authorization? | SAP Basis / role admin | `S_DEVELOP`, `S_ADT_RES`, package auth |
+
+Think of it as **AND**, never OR:
+
+```text
+Effective permission = server ceiling AND user permission AND SAP authorization
+```
+
+A user scope can never widen the server. SAP auth can still block a request after ARC-1 allows it.
+
+---
+
+## Defaults
+
+With no safety flags set, ARC-1 starts in the safest useful mode:
+
+| Capability | Default |
+| ---------- | ------- |
+| Read/search/navigate/lint/diagnose | On, subject to user `read` scope in HTTP auth mode and SAP auth |
+| Object writes / activation / package changes / FLP mutations | Off |
+| Named table preview | Off |
+| Freestyle SQL | Off |
+| Transport writes | Off |
+| Git writes | Off |
+| Write package allowlist | `$TMP` if writes are later enabled |
+
+Important details:
+
+- Reads are not package-gated by ARC-1. Use SAP authorization for read-level restrictions.
+- The `SAP_ALLOWED_PACKAGES` ceiling applies to **every** mutating operation against the object's **real** package (resolved from ADT metadata, fail-closed): create/update/delete/method-surgery, **activation** (`SAPActivate`, single and batch), and **`change_package`** (gated by the move's real source package, never the caller-supplied `oldPackage`). Activating a draft, or moving an object, in a package outside the allowlist is refused even when `SAP_ALLOW_WRITES=true`. Service-binding publish/unpublish also resolves and checks the binding's package before the mutation.
+- Transport and Git **read** actions are available when the backend feature exists. Transport/Git **write** actions need extra opt-ins.
+- `SAP_ALLOW_WRITES=false` blocks every mutation, including activation, transport writes, and Git writes.
+
+---
+
+## SAP API Policy: data preview and free SQL are gated for a reason
+
+These two gates exist partly because SAP's API Policy restricts large-scale extraction and ungoverned autonomous AI call patterns — see **[SAP API Policy & Architecture Alignment](sap-api-policy-and-architecture.md)** for what the policy says and how ARC-1 is positioned against it. Operators should validate productive use against SAP documentation, their SAP agreement, and internal governance.
+
+ARC-1's defaults keep the highest-risk data paths disabled. Two server flags map directly onto capabilities that can expose business data or run ad-hoc SQL, and both default to off:
+
+| Flag | Default | What it enables | Governance note |
+| ---- | ------- | --------------- | ----------------- |
+| `SAP_ALLOW_DATA_PREVIEW=true` | `false` (off) | `SAPRead(type=TABLE_CONTENTS)` — named table content preview | Can expose application-table data; keep off unless approved. |
+| `SAP_ALLOW_FREE_SQL=true` | `false` (off) | `SAPQuery` — freestyle ABAP SQL | Executes ad-hoc ABAP SQL; keep off unless approved. |
+
+With both flags at their defaults, the data/sql rows in the capability matrix below are unreachable. Turning either flag on is a valid operational choice for approved scenarios, but it should be deliberate: check the current SAP API Policy, the customer's SAP agreement, SAP authorizations, and internal data-protection rules before enabling it on a productive system.
+
+The `data` and `sql` user scopes (and the `viewer-data`, `viewer-sql`, `developer-data`, `developer-sql` API-key profiles) only become useful after the matching server flag is on. Granting `data` / `sql` to a user does **not** widen the server ceiling.
+
+## Experimental data-source blocklist
+
+!!! warning "Experimental, default-off, administrator-only"
+    `SAP_BLOCKED_DATA_SOURCES` is the only public field for this feature, and `--blocked-data-sources`
+    is the same field spelled as a CLI flag — not a second mode. There is no enable flag, allowlist,
+    cache option, policy mode, or destination property, and no MCP tool argument can enable, weaken,
+    or bypass it. It is a **deny emergency brake, not an allowlist**: every source you do not list
+    stays reachable.
+
+```bash
+SAP_BLOCKED_DATA_SOURCES=USR02,PA0002
+```
+
+### Value grammar
+
+| Value | Meaning |
+|---|---|
+| unset | off |
+| `""` | off |
+| ASCII whitespace only | off |
+| `USR02,PA0002` | active with two entries |
+| `,` · `,,,` · `,USR02` · `USR02,` · `USR02,,PA0002` | **startup error** |
+| `SCARR*` · `TABL:SCARR` · `!SCARR` · `'SCARR'` · `US R02` | **startup error** |
+
+Blank means off so that the shipped Docker image and MTA descriptors can carry a visible empty
+default and operators keep a one-field rollback. But once the value is non-empty **every
+comma-separated field is mandatory** — a stray separator fails startup instead of silently shortening
+or disabling a security control. Entries are trimmed of ASCII whitespace, validated as raw ASCII
+*before* case folding, uppercased, and deduplicated preserving first-occurrence order. Only
+`A-Z a-z 0-9 _ / $` are accepted, with at least one letter or digit and a 128-character limit; nothing
+is ever silently stripped. Non-ASCII input is rejected rather than case-folded, so `uſr02` cannot
+become `USR02`. Configuration is read at startup only — changing it needs a restart or redeploy.
+
+Startup errors name the variable (or the CLI flag) and the failing token position without printing
+unrelated environment content.
+
+### How a request is decided
+
+Order matters and does not change:
+
+1. **Capability gate** — `checkOperation(Query|FreeSQL)`, i.e. `SAP_ALLOW_DATA_PREVIEW` /
+   `SAP_ALLOW_FREE_SQL`, plus the caller's `data`/`sql` scope.
+2. **Blocklist policy** — this feature. It can only ever *narrow* an already-enabled capability; it
+   can never enable or widen data access.
+3. **Requested data query.** Policy evaluation may itself read metadata.
+
+Because the capability gate runs first, turning both data flags off means no governed data request is
+reachable at all — external *or* internal — and startup says so.
+
+With an active list, one logical request is decided exactly once:
+
+- direct exact matches are denied with **zero SAP calls**;
+- otherwise free SQL is parsed locally, each direct source is resolved through exact ADT search, CDS
+  roots are expanded through SAP's active SQL dependency graph, and DDIC replacement chains are followed through active `DD02L`/`DDLDEPENDENCY` catalog rows;
+- every repository/entity/database alias of every node is compared against the list;
+- IN-list chunking does **not** re-decide: the union of all chunks is authorized once and the
+  already-authorized statements are then executed.
+
+Classic CDS views, CDS view entities (including root entities), and transactional projection views
+share the same lineage checks. Their graph must identify the requested source and expand to proven
+terminal tables. A childless view, or one SAP reports without a database object (such as a transient
+analytical query), is denied. SAP's SQL restrictions still apply after the policy permits a query.
+CDS view-entity **replacement objects** remain a separate, unsupported catalog-mapping case.
+
+### Failure codes
+
+| Code | Meaning |
+|---|---|
+| `DATA_SOURCE_BLOCKED` | An exact configured rule matched, directly or transitively. |
+| `DATA_POLICY_UNAVAILABLE` | The fixed replacement-catalog request returned `404`; required data-preview metadata is unavailable. |
+| `DATA_LINEAGE_UNRESOLVED` | Identity, dependency-graph or replacement lineage could not be proven. |
+| `DATA_SQL_UNSUPPORTED` | The statement is outside the strict accepted SQL grammar. |
+
+All four mean the requested data query was **not executed**; metadata reads may have run. Each carries `executed=false` and an opaque
+`decisionId` that also appears in the audit log.
+
+### What is deliberately unsupported
+
+While the list is active, these are refused rather than guessed at:
+
+- ABAP comments (`"` to end of line, `*` in column one) — the parser strips them, so what is checked
+  would not be what SAP receives;
+- host expressions and host variables (`@`, `@( … )`), `FOR ALL ENTRIES`;
+- dynamic sources `FROM (name)`, `WITH PRIVILEGED ACCESS`, `CLIENT SPECIFIED`/`USING CLIENT`,
+  `CONNECTION …`, provider syntax;
+- CDS association and column paths;
+- `SELECT SINGLE`, caller-supplied `INTO`/`APPENDING`, multiple statements, DML;
+- CDS table functions — live SAP does not expose their AMDP `USING` lineage in the graph;
+- classic/generated DDIC views, where complete lineage cannot be proven;
+- `TABLE_CONTENTS` with a `sqlFilter` — use the structured `TABLE_QUERY` `where`/`columns` instead.
+
+Joins, unions, nested subqueries, CTEs, parameterized CDS roots, hierarchy sources and aggregates
+**are** supported.
+This describes caller SQL parsing, not every CDS graph shape: CDS definitions using set operations
+can contain structural `SELECT` nodes and currently fail closed ([COMPAT-10](roadmap.md#compat-10)).
+
+### Impact on ARC-1's own features
+
+ARC-1 declares its internal metadata sources in one registry. Blocking a source disables
+the feature that needs it:
+
+| Blocked source | Affected feature | Behaviour |
+|---|---|---|
+| `DD02L` + `DDLDEPENDENCY` | Blocklist replacement lineage | Denied before catalog access; the policy cannot prove table lineage without both |
+| `TADIR` | `SAPSearch(tadir_lookup, source="db"\|"both")` | Denied; retry with `source="adt"` (which cannot see orphan/ghost TADIR rows) |
+| `SEOMETAREL` | `SAPNavigate(action="hierarchy")` | Denied; use `SAPRead(type="CLAS", include="definitions")` |
+| `SEOMETAREL` | Interface-implementer where-used augmentation | Returns native results **with an explicit incompleteness warning** |
+| `TSTC` | `SAPRead(type="TRAN")` program name | Returns metadata **with a warning**, without the program name |
+| `SWOTLV` | `SAPRead(type="SOBJ")` | Denied; no alternative in ARC-1 |
+| `SUAUTHVALTRC` + `TOBJ` | `SAPDiagnose(authorization_trace)` | Denied — both are required; positional values without decoded field names would be misleading |
+
+Optional enrichment always warns rather than silently returning less.
+
+### Cost, and what this is not
+
+**Blocklist mode performs additional SAP metadata requests and is slower by design.** There is no
+cross-request cache in v1: every request revalidates live lineage, so a policy change or a CDS
+activation takes effect immediately and no stale decision can be reused. Directly blocked sources
+stay cheap and local. The check and the query are separate SAP requests, so the pair is not
+transactionally atomic (a TOCTOU window remains).
+
+Replacement proof uses one fixed catalog query per distinct table, on every release.
+For supported DDIC-based replacements, `DD02L.VIEWREF` identifies the SQL view; active
+`DDLDEPENDENCY` maps it to its DDLS source.
+Missing/ambiguous rows, an error flag or an unmapped replacement fail closed. The graph must identify
+the SQL view, and both identities are checked against the blocklist. No DDL-source resource or release
+number is used to infer the absence of replacements.
+
+Pooled and cluster tables (common on older, non-HANA ECC systems) cannot carry a
+[replacement object](https://help.sap.com/doc/abapdocu_750_index_htm/7.50/en-US/abenddic_database_tables_poclure.htm).
+The same catalog row must show no replacement metadata and name the physical table pool or cluster
+(`DD02L.SQLTAB`); that container is checked against the blocklist as the table's lineage node. Blocking
+a container such as `RFBLG` therefore blocks every logical table stored in it (`BSEG`, `BSEC`, `BSET`),
+while blocking one logical table leaves its siblings readable. A direct query of the physical container
+stays unresolved and fails closed. This policy check does not grant SAP permissions
+or remove SAP's SQL restrictions on pooled/cluster tables.
+
+Classic DDIC views and CDS view-entity replacements are unsupported and fail closed.
+These are policy limitations, not evidence that SAP cannot query those objects.
+
+This private query reads authorization metadata and cannot recursively authorize itself. It runs only
+after the enclosing Query/FreeSQL capability and caller-scope checks, under the same SAP identity,
+with direct block checks for both catalog tables. It selects only fixed metadata fields for one exact
+name and at most two rows, shares the caller's cumulative response budget, and never returns catalog
+rows to the model. There is no caller-controlled bypass. A caller's own query of these tables still
+receives the full normal lineage check.
+
+The policy requires `/sap/bc/adt/datapreview/freestyle`; without it, requests needing catalog metadata
+return `DATA_POLICY_UNAVAILABLE`. Missing SAP authorization for catalog or graph reads also fails
+closed, even if the original query would be allowed.
+
+Out of scope in v1: generic extension `ctx.http.get()` calls are **not** governed by this policy, so a
+plugin can read a blocked source. Object source, dumps and traces are likewise outside the boundary.
+Do not enable untrusted plugins if you need this to be a complete data boundary.
+
+This does not replace CDS DCL and does not assume DCL is transitive — SAP evaluates access control at
+the entity used as the SQL entry point, not inherited from wrapped entities. It also does not
+remediate **SAP Note 3772411**: a default-off feature fixes nothing, and `SAP_ALLOW_WRITES=false` does
+not neutralize a database-side mutation reached through a vulnerable SQL Console host expression.
+Patch or apply SAP's workaround independently.
+
+The SAP dependency graph can omit implicit customizing-table reads inside CDS currency/unit
+conversion functions. Those dependencies are not checked by this policy, in both classic CDS and
+view entities; see [SEC-18](roadmap.md#sec-18). Do not treat the graph as a complete account of every
+table the database may read.
+
+### Seeing the effective policy
+
+Exact names appear only on administrator surfaces: `arc1 config show`, the local operator UI, and the
+authenticated admin-scoped web UI. Ordinary startup logs and the unauthenticated `/health` endpoint
+show no names — startup logs carry enabled, count and a deterministic fingerprint. That fingerprint is
+a **configuration-drift and correlation signal only**: it is unsalted by design, the candidate name
+space is small and guessable, and it must not be treated as protecting the contents of the list.
+
+---
+
+<a id="capability-matrix"></a>
+
+## Capability requirements
+
+Use this table to answer: "what must be true before this action can run?" For HTTP auth, the user needs the listed scope or `admin`.
+
+| Capability | User needs | Server needs | Notes |
+| ---------- | ---------- | ------------ | ----- |
+| Read object source / metadata | `read` | Nothing | `SAPRead`, most `SAPContext`, metadata reads |
+| Search objects | `read` | Nothing | `SAPSearch` |
+| Navigate / code intelligence | `read` | Nothing | Find definition, references, completion. Class hierarchy is the exception below. |
+| Class hierarchy (`SAPNavigate.hierarchy`) | `data` or `sql` plus `read` | `SAP_ALLOW_DATA_PREVIEW=true` or `SAP_ALLOW_FREE_SQL=true` | Reads `SEOMETAREL` via table preview or SQL |
+| Lint / local format / diagnostics | `read` | Nothing | Unit tests can execute code but do not mutate repository objects |
+| Update SAP PrettyPrinter settings | `write` | `SAP_ALLOW_WRITES=true` | `SAPLint.set_formatter_settings` mutates global formatter settings |
+| Read transport info | `read` | Nothing | `SAPTransport.list`, `get`, `diff`, `check`, `history` |
+| Read Git info | `read` | Nothing | `SAPGit.list_repos`, `history`, `objects`, etc. when Git feature exists |
+| Preview named table contents | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `sql` implies `data` |
+| Authorization trace (`SUAUTHVALTRC`) | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `SAPDiagnose action=authorization_trace`; on-prem STUSERTRACE read only |
+| Run freestyle SQL | `sql` | `SAP_ALLOW_FREE_SQL=true` | High risk on productive systems |
+| Apply exact source blocklist (experimental) | Existing `data`/`sql` scope | `SAP_BLOCKED_DATA_SOURCES=...` | Further restricts all three data paths; cannot enable access, and unresolved lineage is denied |
+| Create / update / delete objects | `write` | `SAP_ALLOW_WRITES=true` | `SAP_ALLOWED_PACKAGES` applies; supports exact (`ZFOO`), prefix (`Z*`), and DEVCLASS subtree (`ZFOO/**`) patterns. Subtree resolution is fail-closed on SAP errors. |
+| Activate objects | `write` | `SAP_ALLOW_WRITES=true` | Activation is a mutation |
+| Package / FLP mutations | `write` | `SAP_ALLOW_WRITES=true` | FLP list actions are reads; FLP create/delete actions are writes |
+| Create / release / delete transports | `write` + `transports` | `SAP_ALLOW_WRITES=true` + `SAP_ALLOW_TRANSPORT_WRITES=true` | `SAP_ALLOWED_TRANSPORTS` can further restrict CTS IDs |
+| Gated abapGit mutation / SAP-side Git egress | `write` + `git` | `SAP_ALLOW_WRITES=true` + `SAP_ALLOW_GIT_WRITES=true` | Package-bound actions also need subtree authorization. Accepted push/branch operations can return incomplete; inspect before retrying. Every gCTS mutation is currently quarantined before HTTP. |
+
+Why transport and Git rows list `write` plus the specialized scope: ARC-1's safety layer turns off all mutations for users without `write`. The specialized `transports` / `git` scopes decide who may use those write families after general write permission exists.
+
+Transport mutation checklist:
+
+1. User has `write` scope.
+2. User has `transports` scope.
+3. Server has `SAP_ALLOW_WRITES=true`.
+4. Server has `SAP_ALLOW_TRANSPORT_WRITES=true`.
+5. `SAP_DENY_ACTIONS` does not deny the concrete action.
+6. SAP backend authorization allows the SAP user to create, release, delete, or reassign CTS requests.
+
+Tool schemas are pruned to hide actions that cannot pass ARC-1 gates. Treat schema visibility as a helpful signal, not a separate authorization layer.
+
+---
+
+## Where to set things
+
+| You want to change... | Change this | Do not change this |
+| --------------------- | ----------- | ------------------ |
+| What this ARC-1 instance can ever do | Server env / CLI flags (`SAP_ALLOW_*`, `SAP_ALLOWED_PACKAGES`, `SAP_DENY_ACTIONS`). On BTP, set these with `mta-overrides.mtaext`, `cf set-env`, `manifest.yml`, or MTA properties. | User JWT scopes |
+| What one BTP user can do | XSUAA role collection assignment | Server env vars; they change the whole ARC-1 instance, not one user |
+| What a specific API key can do | `ARC1_API_KEYS="key:profile"` | Server flags only |
+| What an OIDC user can do | `scope` / `scp` claim in the JWT | MCP client JSON |
+| What SAP ultimately allows | SAP roles / authorization objects | ARC-1 scopes |
+
+Precedence for server config is:
+
+```text
+CLI flag > environment variable > .env file > built-in default
+```
+
+Why not `.env` for BTP? `.env` is mainly the local/dev way to set the same server config. On BTP, use `mta-overrides.mtaext` (preferred — gitignored per-landscape overrides applied at `cf deploy -e ...`; copy from the tracked `mta-overrides.mtaext.example` template), `cf set-env`, `manifest.yml`, or MTA properties instead. Those values are still the **server ceiling** and affect every user of that ARC-1 instance. To change one BTP user's access, change their XSUAA role collection assignment.
+
+Use `arc1 config show` to see the final resolved server policy and where each field came from.
+
+---
+
+## User scopes
+
+Seven scopes exist:
+
+| Scope | Meaning | Implies |
+| ----- | ------- | ------- |
+| `read` | Read source, search, navigate, lint, diagnose | - |
+| `write` | Object/package/activation/FLP mutations | `read` |
+| `data` | Named table preview | - |
+| `sql` | Freestyle SQL | `data` |
+| `transports` | CTS transport mutations | - |
+| `git` | Gated abapGit mutations, SAP-side Git egress, and the reserved authorization boundary for currently quarantined gCTS mutations | - |
+| `admin` | All ARC-1 scopes | all other scopes |
+
+Assigning only `transports` or only `git` is not useful for mutations because transport/Git writes also need `write`. The shipped `developer` profiles and BTP `MCPDeveloper` role include `write`, `transports`, and `git` together.
+
+---
+
+## BTP XSUAA role templates
+
+Start here for BTP deployments. API-key profiles apply to API-key callers; they can coexist with XSUAA/OIDC on the same HTTP endpoint.
+
+BTP users receive scopes through role collections. The shipped `xs-security.json` contains these role templates:
+
+| Role template | Scopes |
+| ------------- | ------ |
+| `MCPViewer` | `read` |
+| `MCPDataViewer` | `data` |
+| `MCPSqlUser` | `data`, `sql` |
+| `MCPDeveloper` | `read`, `write`, `transports`, `git` |
+| `MCPAdmin` | all 7 |
+
+Common role collections:
+
+| Role collection | Effective scopes |
+| --------------- | ---------------- |
+| `ARC-1 Viewer` | `read` |
+| `ARC-1 Data Viewer` | `read`, `data` |
+| `ARC-1 Viewer + SQL` | `read`, `data`, `sql` |
+| `ARC-1 Developer` | `read`, `write`, `transports`, `git` |
+| `ARC-1 Developer + Data` | `read`, `write`, `data`, `transports`, `git` |
+| `ARC-1 Developer + SQL` | `read`, `write`, `data`, `sql`, `transports`, `git` |
+| `ARC-1 Admin` | all 7 |
+
+> Deployed collection names carry the CF space as a suffix — e.g. `ARC-1 Developer (dev)` — because `mta.yaml` derives them from the `${space}` placeholder so the same mtar can run in several spaces of one subaccount. Assign the one matching your space. See [XSUAA Setup](xsuaa-setup.md).
+
+Want a developer who can write code but cannot transport or use Git? Create a custom role template with just `read` + `write`, then update the XSUAA service. Or leave the shipped role as-is and turn off `SAP_ALLOW_TRANSPORT_WRITES` / `SAP_ALLOW_GIT_WRITES` server-wide.
+
+To grant SQL to one BTP user, assign a role collection that includes `MCPSqlUser` (for example `ARC-1 Viewer + SQL` for read-only SQL or `ARC-1 Developer + SQL` for full developer access) to that user. Do **not** change server env vars for one user. The ARC-1 instance must already have `SAP_ALLOW_FREE_SQL=true`; there is no `SAP_ALLOW_SQL` flag.
+
+See [XSUAA Setup](xsuaa-setup.md) for BTP Cockpit assignment steps.
+
+---
+
+## API-key profiles (non-BTP)
+
+Use API-key profiles for HTTP callers authenticated by a key. They can coexist with XSUAA/OIDC; explicit strict PP rejects non-JWT tool calls:
+
+```bash
+ARC1_API_KEYS="viewer-key:viewer,dev-key:developer,admin-key:admin"
+```
+
+Each profile grants scopes and, for developer profiles, an additional safety cap. The final result is still intersected with the server ceiling.
+
+Profiles are fixed names built into ARC-1. `ARC1_API_KEYS` only selects one of the profiles below; it does **not** let you attach custom scopes or custom package allowlists to one key.
+
+| Profile | Scopes | Extra profile safety |
+| ------- | ------ | -------------------- |
+| `viewer` | `read` | No writes, no data preview, no SQL, no transports, no Git |
+| `viewer-data` | `read`, `data` | No writes, no SQL, no transports, no Git |
+| `viewer-sql` | `read`, `data`, `sql` | No writes, no transports, no Git |
+| `developer` | `read`, `write`, `transports`, `git` | Writes capped to `$TMP`, no data preview, no SQL |
+| `developer-data` | `read`, `write`, `data`, `transports`, `git` | Writes capped to `$TMP`, no SQL |
+| `developer-sql` | `read`, `write`, `data`, `sql`, `transports`, `git` | Writes capped to `$TMP` |
+| `admin` | all 7 scopes | No profile package cap; server ceiling still applies |
+
+Key implications:
+
+- A `developer` key can write only to `$TMP`, even if the server allows `Z*`.
+- Because API-key profiles are fixed, there is no `developer-z` profile and no `key:developer:Z*` syntax.
+- To give an API key transportable-package write access, use a tightly scoped `admin` key on a server whose `SAP_ALLOWED_PACKAGES` is restricted, or use OIDC/XSUAA for real per-user roles.
+- A profile cannot override the server. If `SAP_ALLOW_WRITES=false`, every API key is effectively read-only.
+
+Example: shared sandbox with one viewer and one `$TMP` developer key:
+
+```bash
+SAP_TRANSPORT=http-streamable
+SAP_ALLOW_WRITES=true
+SAP_ALLOW_TRANSPORT_WRITES=true
+SAP_ALLOW_GIT_WRITES=false
+SAP_ALLOWED_PACKAGES='$TMP,Z*'
+ARC1_API_KEYS='viewer-key:viewer,dev-key:developer'
+```
+
+In that example, `dev-key:developer` can write `$TMP` only. The server also allows `Z*`, but the profile narrows the key to `$TMP`.
+
+---
+
+## Advanced deny actions
+
+`SAP_DENY_ACTIONS` is the fine-grained deny list. It applies after scope and flag checks, and it always wins.
+
+Use it for rules like "developers can write, but cannot delete".
+
+| Form | Meaning | Example |
+| ---- | ------- | ------- |
+| `Tool` | Deny every action of this tool | `SAPGit` |
+| `Tool.action` | Deny exactly this action | `SAPWrite.delete` |
+| `Tool.glob*` | Glob inside one tool | `SAPManage.flp_*` |
+
+Cross-tool wildcards like `*.delete` are rejected at startup.
+
+```bash
+# Inline CSV
+SAP_DENY_ACTIONS='SAPWrite.delete,SAPManage.flp_*'
+
+# Or a JSON file path
+SAP_DENY_ACTIONS='./deny-actions.json'  # ["SAPWrite.delete", "SAPManage.flp_*"]
+```
+
+On Windows, a drive-letter absolute path accepts either separator (`C:\arc1\deny-actions.json`
+or `C:/arc1/deny-actions.json`). For relative paths, use `./deny-actions.json`, not a bare filename.
+
+ARC-1 fails fast if a deny entry references an unknown tool/action, has invalid grammar, or points to an unreadable file. That is intentional: typoed security config should not silently start.
+
+---
+
+## Recipes
+
+### 1. Read and search only
+
+Set nothing. This is the default.
+
+### 2. Read-only with table preview and SQL
+
+```bash
+SAP_ALLOW_DATA_PREVIEW=true
+SAP_ALLOW_FREE_SQL=true
+# Optional defense in depth; exact names, no wildcards:
+SAP_BLOCKED_DATA_SOURCES=USR02,PA0002
+```
+
+Users still need `data` / `sql` scopes in HTTP auth mode.
+
+### 3. Local developer on a sandbox
+
+```bash
+SAP_ALLOW_WRITES=true
+SAP_ALLOWED_PACKAGES='$TMP,Z*'
+```
+
+Add only if needed:
+
+```bash
+SAP_ALLOW_TRANSPORT_WRITES=true
+SAP_ALLOW_GIT_WRITES=true
+SAP_ALLOW_DATA_PREVIEW=true
+SAP_ALLOW_FREE_SQL=true
+```
+
+### 4. Team server with API keys
+
+```bash
+SAP_TRANSPORT=http-streamable
+SAP_ALLOW_WRITES=true
+SAP_ALLOWED_PACKAGES='$TMP,Z*'
+ARC1_API_KEYS='viewer-key:viewer,dev-key:developer,admin-key:admin'
+```
+
+Use `viewer` for read-only users, `developer` for `$TMP` sandbox writes, and `admin` only for trusted operators. If `admin-key` should write only to Z-packages, keep the server ceiling narrow with `SAP_ALLOWED_PACKAGES='Z*,$TMP'`.
+
+### 5. BTP/XSUAA with per-user identity
+
+```bash
+SAP_XSUAA_AUTH=true
+SAP_PP_ENABLED=true
+SAP_PP_STRICT=true
+SAP_ALLOW_WRITES=true
+SAP_ALLOW_TRANSPORT_WRITES=true
+SAP_ALLOWED_PACKAGES='Z*,$TMP'
+```
+
+Then assign role collections in BTP Cockpit. The server says what the instance can do; XSUAA says which user can do it.
+
+---
+
+## Common misconfigurations
+
+| Symptom | Why | Fix |
+| ------- | --- | --- |
+| User has `write`, but writes fail with `allowWrites=false` | Server ceiling is still closed | Set `SAP_ALLOW_WRITES=true` |
+| User has `transports`, but transport create fails | Mutations also need `write`, and server needs both write flags | Grant `write` + `transports`; set `SAP_ALLOW_WRITES=true` and `SAP_ALLOW_TRANSPORT_WRITES=true` |
+| `SAP_ALLOW_TRANSPORT_WRITES=true`, but transport create fails | `SAP_ALLOW_WRITES=false` still blocks all mutations | Set both flags |
+| `developer` API key cannot write to `Z*` | Developer API-key profiles are capped to `$TMP` | Use `$TMP`, use a restricted `admin` key, or use XSUAA/OIDC |
+| You want one API key to write `Z*`, but not be full admin | API-key profiles are fixed; per-key custom package caps are not supported | Use an `admin` key on a narrowly configured server, or use XSUAA/OIDC |
+| SQL still blocked after `SAP_ALLOW_FREE_SQL=true` | User lacks `sql` scope | Grant `sql` or use `viewer-sql` / `developer-sql` |
+| Table preview blocked after `SAP_ALLOW_DATA_PREVIEW=true` | User lacks `data` scope | Grant `data`; `sql` also implies `data` |
+| Package allowlist seems ignored for reads | ARC-1 package allowlist is write-only | Enforce read restrictions in SAP roles |
+| `DATA_SOURCE_BLOCKED` | A direct or transitive table/CDS alias matches the experimental list | Use a permitted source, or remove the exact entry only after security review |
+| `DATA_SQL_UNSUPPORTED` / `DATA_LINEAGE_UNRESOLVED` | Strict SQL or live lineage analysis could not prove the request safe | Use one supported static source/`TABLE_QUERY`; inspect the reported reason and dependency path |
+| Action is hidden from tool list | User scope, server flag, backend feature, or `SAP_DENY_ACTIONS` pruned it | Run `arc1 config show` and check startup feature logs |
+
+---
+
+## Troubleshooting: which layer blocked me?
+
+| Error fragment | Layer | What to change |
+| -------------- | ----- | -------------- |
+| `Insufficient scope: 'write' required` | User permission | Grant `write` scope / profile / role collection |
+| `Insufficient scope: 'data' required` | User permission | Grant `data` scope or `viewer-data` profile |
+| `Insufficient scope: 'sql' required` | User permission | Grant `sql` scope or `viewer-sql` / `developer-sql` profile |
+| `Insufficient scope: 'transports' required` | User permission | Grant role/profile with `transports` |
+| `Insufficient scope: 'git' required` | User permission | Grant role/profile with `git` |
+| `allowWrites=false blocks mutations` | Server ceiling | Set `SAP_ALLOW_WRITES=true` |
+| `allowTransportWrites=false` | Server ceiling | Set `SAP_ALLOW_TRANSPORT_WRITES=true` and `SAP_ALLOW_WRITES=true` |
+| `allowGitWrites=false` | Server ceiling | Set `SAP_ALLOW_GIT_WRITES=true` and `SAP_ALLOW_WRITES=true` |
+| `allowDataPreview=false` | Server ceiling | Set `SAP_ALLOW_DATA_PREVIEW=true` |
+| `allowFreeSQL=false` | Server ceiling | Set `SAP_ALLOW_FREE_SQL=true` |
+| `DATA_SOURCE_BLOCKED` / `DATA_SQL_UNSUPPORTED` / `DATA_LINEAGE_UNRESOLVED` / `DATA_POLICY_UNAVAILABLE` | Experimental source policy | Follow the returned path/reason; do not disable the list merely to make an unsupported query run |
+| `Operations on package ... are blocked` | Server/profile safety | Adjust `SAP_ALLOWED_PACKAGES` or API-key profile choice |
+| `denied by server policy (SAP_DENY_ACTIONS)` | Deny list | Remove or narrow the deny pattern |
+| `No authorization for object ...` / SAP 403 | SAP authorization | Fix SAP user roles / PFCG / package auth |
+| Bare 403 only for `SAPQuery` / `TABLE_QUERY`, while unfiltered `TABLE_CONTENTS` works | Possibly an upstream WAF/body-inspection false positive | Inspect the gateway audit log and matched rule. Prefer a narrowly scoped WAF rule exclusion; if the security owner approves compressed bodies, use `SAP_GZIP_DATAPREVIEW_BODY=true` as the default-off fallback. |
+| `Legacy authorization config detected` | Migration | Replace old v0.6 env vars per [Updating](updating.md#v07-authorization-refactor-breaking-change) |
+
+Debug commands:
+
+```bash
+arc1 config show
+arc1 config show --format=json
+```
+
+Also read startup logs for:
+
+- `effective safety: ...` - final server ceiling
+- `config contradiction: ...` - flags that cannot take effect, such as transport writes without writes
+- `auth: MCP=[...] SAP=[...]` - active auth methods
+
+The WAF row is a fingerprint, not a diagnosis by status code alone. `SAPQuery` and structured
+`TABLE_QUERY` both POST SQL text to `/sap/bc/adt/datapreview/freestyle`; unfiltered
+`TABLE_CONTENTS` normally POSTs no filter body to `/sap/bc/adt/datapreview/ddic`. If the same SAP
+identity succeeds directly or for the bodyless control but receives a bare gateway-style 403 for
+the SQL-bearing call, compare the gateway and SAP access logs to establish where the request
+stopped. Do not enable gzip merely to make an unexplained authorization failure disappear.
+
+### MCP sign-in ends on a blank page / "this site can't be reached" / "Missing required parameters … code, state, nonce"
+
+One possible cause is a rejected XSUAA authorization, so no `code` was issued. For example,
+`invalid_scope` with "this user is not allowed any of the requested scopes" points to the user's
+grant. A closed loopback listener can produce `ERR_CONNECTION_REFUSED`, but that symptom alone
+does not identify the authorization problem.
+
+Confirm the real error in the server log — it lands on ARC-1's callback, not the client:
+
+```bash
+cf logs arc1-mcp-server --recent | grep '/oauth/callback?error='
+# GET /oauth/callback?error=invalid_scope&error_description=[...] is invalid. This user is not allowed any of the requested scopes
+```
+
+Since v0.9.8 ARC-1 renders this reason on its `/oauth/callback` error page (instead of bouncing to the dead loopback), so the browser shows the cause directly.
+
+For the specific message **"this user is not allowed any of the requested scopes"**, check the
+collection's roles and the signed-in IdP origin below. `invalid_scope` can also mean an unknown or
+malformed requested scope; use the [XSUAA diagnosis table](xsuaa-setup.md#insufficient-scope-invalid_scope)
+before changing roles or browser state.
+
+### "I changed the user's role but the new scopes don't appear"
+
+Changing role collections does not rewrite already issued JWTs. Their claims remain unchanged
+until expiry; an XSUAA browser session can also retain old authorities. Check the actual grant
+and token lifetime rather than assuming a reconnect refreshes either.
+
+After a verified role change:
+
+1. Verify the required role collection contains current application roles and is assigned under the IdP used for login. An unknown scope name needs configuration repair, not another role.
+2. On ARC-1's failure page, select **Role assigned? Refresh access**. ARC-1 sends the browser through XSUAA's logout endpoint with its bound client ID and a fixed, allowlisted return URL.
+3. After **Access refreshed** appears, use the MCP client's re-authentication flow and refresh its tool catalog. Reconnecting alone may reuse a token. A new identity-provider login may be required.
+4. If the deployment predates this recovery action, retry in a private browser window or clear the XSUAA-domain cookies manually. See [XSUAA Setup → invalid_scope](xsuaa-setup.md#insufficient-scope-invalid_scope).
+
+A fresh token should reflect the current grant. If claim inspection is needed, inspect it locally;
+do not paste bearer tokens into websites, tickets or chat. Decoding claims alone does not validate
+the token or prove SAP access.
+
+The recovery action does not revoke access tokens already issued to other sessions. Do not construct a logout URL from request parameters or use an arbitrary redirect: XSUAA application logout requires an allowlisted redirect to prevent open redirects.
+
+### "I have two `marian@example.com` users in BTP and only one shows the role I changed"
+
+BTP can hold multiple identities for the same email - one per IdP origin (`sap.default`, the IAS tenant, custom IdPs). Role assignments are per-identity. The MCP client logs in via one specific IdP, so check that you're updating the role for the **same identity** that the OAuth flow uses.
+
+In BTP Cockpit → Users you can see all identities for a given email and their `Identity-Provider` column. Update the role on the identity whose IdP matches the OAuth login.
+
+From the CLI, assign under the right origin — `--of-idp` is the critical part. On subaccounts with a custom SAP Cloud Identity (IAS) tenant, the application login uses **that** origin (often `sap.custom`), **not** `sap.default`:
+
+```bash
+# list the IdP origins (the IAS "business users" trust is the usual app-login IdP)
+btp list security/trust --subaccount <subaccount-id>
+
+# Example only: substitute the required collection and the verified origin from the trust list.
+btp assign security/role-collection "ARC-1 Viewer (<space>)" --subaccount <subaccount-id> --to-user <email> --of-idp sap.custom
+```
+
+Assigning under only `sap.default` while logging in via another origin is one cause of the
+"not allowed any requested scopes" error. Do not assume every IAS tenant uses `sap.custom`.
+
+---
+
+## References
+
+- [Configuration Reference](configuration-reference.md) - every flag and env var
+- [API Key Setup](api-key-setup.md) - non-BTP role-based API keys
+- [XSUAA Setup](xsuaa-setup.md) - BTP role collections and OAuth
+- [OAuth / JWT Setup](oauth-jwt-setup.md) - external IdP scopes
+- [Principal Propagation Setup](principal-propagation-setup.md) - per-user SAP identity
+- [Security Guide](security-guide.md) - production hardening
+- [Updating](updating.md) - migration from v0.6
+- [Cloud Foundry UAA: Session Management](https://docs.cloudfoundry.org/api/uaa/index.html#session-management) - `/logout.do` parameters and behavior
+- [SAP: Configure Redirect URLs for Browser Logout](https://help.sap.com/docs/btp/sap-business-technology-platform/configure-redirect-urls-for-browser-logout) - logout redirect allowlisting

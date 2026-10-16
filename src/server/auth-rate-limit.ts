@@ -1,0 +1,148 @@
+/**
+ * Layer 1 — HTTP-edge per-IP rate limiter.
+ *
+ * Mounted in `src/server/http.ts` on `/register`, `/authorize`, `/token`, `/revoke`,
+ * and `/mcp`. Closes the OAuth surface against brute-force / probing and the `/mcp`
+ * surface against anonymous probing of the pre-bearer-auth path. CodeQL alert #12
+ * (`js/missing-rate-limiting`) is resolved by this module's mount.
+ *
+ * Design choices:
+ * - Per-IP, in-memory only — multi-instance attackers cost `limit × instances`. We
+ *   accept that trade-off to preserve the stateless-deployment property from PR #212.
+ *   IPv6 clients are keyed by /56 subnet (via express-rate-limit v8's `ipKeyGenerator`)
+ *   so they can't bypass the cap by rotating addresses within their prefix.
+ * - `ARC1_AUTH_RATE_LIMIT` (default 20) controls the OAuth baseline. The MCP
+ *   bucket derives a higher default in http.ts and has its own explicit
+ *   `ARC1_MCP_HTTP_RATE_LIMIT` override so disabling OAuth limiting cannot
+ *   silently remove pre-bearer MCP protection.
+ * - On limit hit, emits a typed `auth_rate_limited` audit event BEFORE responding so
+ *   the security event stream captures the denial regardless of response timing.
+ * - Uses `standardHeaders: 'draft-7'` for RFC 9331 / draft-ietf-httpapi-ratelimit
+ *   headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`).
+ */
+
+import type { Request, RequestHandler, Response } from 'express';
+import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { logger } from './logger.js';
+import { PINNED_MCP_PATH_PATTERN } from './multi-target-identity.js';
+
+/**
+ * Optional knobs for `createAuthRateLimiter`.
+ *
+ * `skip` lets one middleware mounted at the Express root count only the
+ * request classes assigned to its shared bucket. See http.ts for the MCP and
+ * Copilot Studio routing rationale.
+ * Passing a `skip` function is preferred over building an outer conditional
+ * dispatcher: CodeQL's `js/missing-rate-limiting` query only recognises
+ * `app.use(path, rateLimit({...}))` patterns where the second argument is
+ * directly a `rateLimit({...})` result. Going through an inline arrow
+ * function with branch-based delegation re-opens the alert.
+ */
+export interface AuthRateLimiterOptions {
+  skip?: (req: Request, res: Response) => boolean;
+}
+
+/**
+ * Build a per-IP rate limiter for one endpoint. The returned middleware:
+ * - allows `perMinute` requests per minute per IP (60_000 ms window),
+ * - returns HTTP 429 with `Retry-After` and RFC 9331 `RateLimit-*` headers on hit,
+ * - emits a typed `auth_rate_limited` audit event on every denial,
+ * - honors an optional `skip` predicate so a root-mounted limiter can share
+ *   one bucket across several endpoint styles.
+ *
+ * `endpoint` is used only for the audit event label and for diagnostic logs;
+ * the path-based mount in Express is done by the caller.
+ *
+ * Operators disable Layer 1 by setting `ARC1_AUTH_RATE_LIMIT=0`, which makes
+ * `http.ts` skip the `app.use(…)` mount entirely — there is intentionally no
+ * "noop middleware" path here. Keeping the dataflow `rateLimit({…}) → app.use`
+ * direct lets CodeQL's `js/missing-rate-limiting` query close cleanly.
+ */
+export function createAuthRateLimiter(
+  endpoint: string,
+  perMinute: number,
+  opts: AuthRateLimiterOptions = {},
+): RequestHandler {
+  return rateLimit({
+    windowMs: 60_000,
+    max: perMinute,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    // Explicit keyGenerator: rely on Express's req.ip after `trust proxy 1` (set in http.ts).
+    // Operators running behind multiple proxy hops must increase the trust-proxy count there.
+    // `ipKeyGenerator` (express-rate-limit v8) masks IPv6 addresses to a /56 subnet so a client
+    // cannot bypass the per-IP cap by rotating addresses within its prefix; IPv4 is returned
+    // unchanged, so IPv4 keying is identical to before. Using the helper (vs raw `req.ip`) is
+    // also required by v8's `keyGeneratorIpFallback` validation: a raw-`req.ip` keyGenerator
+    // logs ERR_ERL_KEY_GEN_IPV6 and re-opens the IPv6 bypass that v8.0.0 explicitly fixed.
+    keyGenerator: (req) => (req.ip ? ipKeyGenerator(req.ip) : 'unknown'),
+    skip: opts.skip,
+    handler: (req, res, _next, options) => {
+      const ip = req.ip ?? 'unknown';
+      logger.emitAudit({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        event: 'auth_rate_limited',
+        endpoint,
+        ip,
+        limitPerMinute: perMinute,
+      });
+      res.status(options.statusCode).json({
+        error: 'rate_limited',
+        message: `Too many requests to ${endpoint} from ${ip}. Limit: ${perMinute}/min.`,
+      });
+    },
+  });
+}
+
+/**
+ * Detect Copilot Studio MCP JSON-RPC requests sent to `/authorize`.
+ *
+ * Copilot Studio POSTs JSON-RPC tool calls to `/authorize` (a known quirk of
+ * that MCP client). On `/authorize`, this predicate is used in two limiter
+ * mounts: the OAuth-cap limiter `skip`s when this is true; the MCP-cap
+ * limiter `skip`s when this is false. The pair gives JSON-RPC traffic the
+ * higher `/mcp` cap while real OAuth flows stay on the OAuth cap.
+ *
+ * Critically, this predicate MUST agree with the routing handler in `http.ts`
+ * that actually dispatches the request to either the OAuth flow or the MCP
+ * handler. The handler uses `req.body?.jsonrpc` — a truthiness check that
+ * rejects falsy values (`''`, `0`, `null`). We mirror that exactly:
+ * presence + truthiness. Earlier code used a presence-only check, which let
+ * a request like `{"jsonrpc": ""}` skip the OAuth limiter (presence true =
+ * "Copilot traffic, use MCP cap") AND get routed as a normal OAuth request
+ * (truthiness false = "not Copilot, run OAuth"), producing a 30× rate-limit
+ * bypass on `/authorize`. The predicate and the routing handler are now
+ * defined identically and `http.ts` reuses this function in both places.
+ *
+ * Exported so http.ts AND its tests use the exact same predicate — drift
+ * here would silently re-introduce the bypass.
+ */
+export function isCopilotJsonRpc(req: Request): boolean {
+  if (req.method !== 'POST') return false;
+  const body = req.body as { jsonrpc?: unknown } | undefined;
+  return body != null && Boolean(body.jsonrpc);
+}
+
+/**
+ * Return true for requests that consume ARC-1's single MCP-edge bucket.
+ *
+ * The path match is intentionally registry-independent: syntactically valid
+ * unknown target routes are rate-limited before authentication and route
+ * resolution, exactly like accepted targets. OAuth metadata and normal OAuth
+ * `/authorize` traffic remain outside this bucket.
+ */
+export function isMcpHttpTraffic(req: Request): boolean {
+  // Express string routes accept one or more trailing delimiters in the default
+  // non-strict mode. Normalize them here so an accepted alias cannot skip the
+  // root-mounted bucket before reaching `/mcp` or `/authorize`.
+  const requestPath = req.path.length > 1 ? req.path.replace(/\/+$/, '') : req.path;
+  // Express string routes are case-insensitive by default. Normalize those
+  // aliases for the limiter too; otherwise `/MCP` or Copilot
+  // JSON-RPC on `/AUTHORIZE` can reach the same handler without consuming the
+  // root edge bucket. The pinned-target regex stays deliberately uppercase.
+  const staticPath = requestPath.toLowerCase();
+  if (staticPath === '/mcp' || staticPath === '/multi/mcp') return true;
+  if (PINNED_MCP_PATH_PATTERN.test(requestPath)) return true;
+  return staticPath === '/authorize' && isCopilotJsonRpc(req);
+}

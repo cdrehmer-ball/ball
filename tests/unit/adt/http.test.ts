@@ -1,0 +1,2927 @@
+import { Readable } from 'node:stream';
+import { gunzipSync } from 'node:zlib';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DataResponseBudget } from '../../../src/adt/data-result-context.js';
+import { AdtApiError, AdtNetworkError, AdtResponseLimitError } from '../../../src/adt/errors.js';
+import { requestContext } from '../../../src/server/context.js';
+import { mockResponse } from '../../helpers/mock-fetch.js';
+
+// Mock undici's fetch and Client (used by AdtHttpClient.doFetch / doProxyRequest)
+const mockFetch = vi.fn();
+const mockClientRequest = vi.fn();
+const mockClientClose = vi.fn().mockResolvedValue(undefined);
+const mockClientDestroy = vi.fn().mockResolvedValue(undefined);
+
+class MockClient {
+  request = mockClientRequest;
+  close = mockClientClose;
+  destroy = mockClientDestroy;
+}
+
+vi.mock('undici', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('undici')>();
+  return { ...actual, fetch: mockFetch, Client: MockClient };
+});
+
+// Import after mock setup
+const { AdtHttpClient } = await import('../../../src/adt/http.js');
+type AdtHttpConfig = ConstructorParameters<typeof AdtHttpClient>[0];
+
+function getDefaultConfig(): AdtHttpConfig {
+  return {
+    baseUrl: 'http://sap.example.com:8000',
+    username: 'admin',
+    password: 'secret',
+    client: '001',
+    language: 'EN',
+  };
+}
+
+/** Helper to get the options (second arg) from a fetch call */
+function fetchOptions(callIndex = 0): RequestInit & Record<string, unknown> {
+  return mockFetch.mock.calls[callIndex]?.[1] ?? {};
+}
+
+/** Helper to get the URL (first arg) from a fetch call */
+function fetchUrl(callIndex = 0): string {
+  return mockFetch.mock.calls[callIndex]?.[0] ?? '';
+}
+
+/** Helper to get headers from a fetch call */
+function fetchHeaders(callIndex = 0): Record<string, string> {
+  return (fetchOptions(callIndex).headers as Record<string, string>) ?? {};
+}
+
+function fetchBody(callIndex = 0): unknown {
+  return fetchOptions(callIndex).body;
+}
+
+/** Helper to create a mock undici Client response (for proxy tests) */
+function mockClientResponse(statusCode: number, body: string, headers: Record<string, string | string[]> = {}) {
+  const responseBody = Readable.from([Buffer.from(body)]);
+  Object.assign(responseBody, { text: vi.fn(async () => body) });
+  return {
+    statusCode,
+    headers,
+    body: responseBody,
+  };
+}
+
+/** Helper to get headers from a Client.request call */
+function clientRequestHeaders(callIndex = 0): Record<string, string> {
+  return (mockClientRequest.mock.calls[callIndex]?.[0]?.headers as Record<string, string>) ?? {};
+}
+
+/** Helper to get the path from a Client.request call */
+function clientRequestPath(callIndex = 0): string {
+  return mockClientRequest.mock.calls[callIndex]?.[0]?.path ?? '';
+}
+
+function clientRequestBody(callIndex = 0): unknown {
+  return mockClientRequest.mock.calls[callIndex]?.[0]?.body;
+}
+
+function streamedResponse(status: number, chunks: Uint8Array[], headers: Record<string, string> = {}): Response {
+  let index = 0;
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[index++];
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    }),
+    { status, headers },
+  );
+}
+
+describe('AdtHttpClient', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  // ─── GET Requests ──────────────────────────────────────────────────
+
+  describe('GET requests', () => {
+    it('makes a GET request to the correct URL with sap-client and sap-language', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<source>REPORT zhello.</source>'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const response = await client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+
+      expect(fetchOptions(0).method).toBe('GET');
+      expect(fetchUrl(0)).toContain('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('REPORT zhello');
+    });
+
+    it('includes sap-client and sap-language in URL', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchUrl(0)).toContain('sap-client=001');
+      expect(fetchUrl(0)).toContain('sap-language=EN');
+    });
+
+    it('handles response with empty body', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/some/path');
+      expect(resp.body).toBe('');
+    });
+
+    it('passes extra headers through', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path', { Accept: 'application/xml' });
+      expect(fetchHeaders(0).Accept).toBe('application/xml');
+    });
+
+    it('omits sap-client and sap-language when not configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      const client = new AdtHttpClient({ baseUrl: 'http://sap:8000' });
+      await client.get('/sap/bc/adt/core/discovery');
+      expect(fetchUrl(0)).not.toContain('sap-client');
+      expect(fetchUrl(0)).not.toContain('sap-language');
+    });
+  });
+
+  // ─── Auth headers ──────────────────────────────────────────────────
+
+  describe('SAMLAssertion principal propagation (S/4HANA Public Cloud)', () => {
+    function samlConfig(): AdtHttpConfig {
+      // Per-user config as applyPerUserAuthTokens builds it: shared Basic creds stripped,
+      // the ready-to-use assertion in samlAuthorization.
+      return {
+        baseUrl: 'https://my.s4hana.cloud.sap',
+        client: '100',
+        language: 'EN',
+        samlAuthorization: 'SAML2.0 ass=base64assertion',
+      } as AdtHttpConfig;
+    }
+
+    it('sends the SAML assertion as Authorization plus x-sap-security-session: create', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(samlConfig());
+      await client.get('/sap/bc/adt/core/discovery');
+
+      const headers = fetchHeaders(0);
+      expect(headers.Authorization).toBe('SAML2.0 ass=base64assertion');
+      expect(headers['x-sap-security-session']).toBe('create');
+    });
+
+    it('does NOT send Basic auth when a SAML assertion is configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      // Even if creds linger, the SAML path wins and Basic is never emitted.
+      const client = new AdtHttpClient({ ...samlConfig(), username: 'TECH', password: 'secret' } as AdtHttpConfig);
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchHeaders(0).Authorization).toBe('SAML2.0 ass=base64assertion');
+      expect(fetchHeaders(0).Authorization).not.toContain('Basic');
+    });
+
+    it('carries the SAML assertion on the CSRF fetch for a write (same session)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' })); // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created')); // POST
+
+      const client = new AdtHttpClient(samlConfig());
+      await client.post('/sap/bc/adt/path', '<xml/>', 'application/xml');
+
+      // CSRF fetch (call 0) must also carry the assertion + session-create so the token
+      // binds to the SAML-authenticated session.
+      expect(fetchHeaders(0).Authorization).toBe('SAML2.0 ass=base64assertion');
+      expect(fetchHeaders(0)['x-sap-security-session']).toBe('create');
+      expect(fetchHeaders(1).Authorization).toBe('SAML2.0 ass=base64assertion');
+    });
+  });
+
+  // ─── POST/PUT/DELETE ───────────────────────────────────────────────
+
+  describe('modifying requests', () => {
+    it('POST sends body and content type', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // POST
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.post('/path', '<xml/>', 'application/xml');
+      expect(resp.body).toBe('created');
+      expect(fetchHeaders(1)['Content-Type']).toBe('application/xml');
+    });
+
+    it('PUT sends body and content type', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // PUT
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.put('/path', 'source code', 'text/plain');
+      expect(fetchOptions(1).method).toBe('PUT');
+      expect(fetchOptions(1).body).toBe('source code');
+    });
+
+    it('DELETE request works', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.delete('/path');
+      expect(fetchOptions(1).method).toBe('DELETE');
+    });
+  });
+
+  // ─── CSRF Token Handling ───────────────────────────────────────────
+
+  describe('CSRF token handling', () => {
+    it('fetches CSRF token before first modifying request', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN123' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/sap/bc/adt/checkruns', '<xml/>', 'application/xml');
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      // First call is CSRF fetch (HEAD)
+      expect(fetchOptions(0).method).toBe('HEAD');
+      expect(fetchHeaders(0)['X-CSRF-Token']).toBe('fetch');
+      // Second call uses the token
+      expect(fetchHeaders(1)['X-CSRF-Token']).toBe('TOKEN123');
+    });
+
+    it('retries CSRF fetch with GET when HEAD returns 403 (S/4HANA Public Cloud compat)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/sap/bc/adt/checkruns', '<xml/>', 'application/xml');
+
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(fetchOptions(0).method).toBe('HEAD');
+      expect(fetchOptions(1).method).toBe('GET');
+      expect(fetchHeaders(2)['X-CSRF-Token']).toBe('TOKEN');
+    });
+
+    it('retries CSRF fetch with GET when HEAD succeeds without a token', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', {}, ['SAP_SESSIONID=csrf-session; Path=/']));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/sap/bc/adt/checkruns', '<xml/>', 'application/xml');
+
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(fetchOptions(0).method).toBe('HEAD');
+      expect(fetchOptions(1).method).toBe('GET');
+      expect(fetchHeaders(1).Cookie).toContain('SAP_SESSIONID=csrf-session');
+      expect(fetchHeaders(2)['X-CSRF-Token']).toBe('TOKEN');
+      expect(fetchHeaders(2).Cookie).toContain('SAP_SESSIONID=csrf-session');
+    });
+
+    it('surfaces a GET authentication failure when HEAD succeeds without a token', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toMatchObject({
+        statusCode: 401,
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(fetchOptions(0).method).toBe('HEAD');
+      expect(fetchOptions(1).method).toBe('GET');
+    });
+
+    it('retries CSRF fetch with GET when HEAD returns the Required marker', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'Required' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.fetchCsrfToken();
+
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(fetchOptions(0).method).toBe('HEAD');
+      expect(fetchOptions(1).method).toBe('GET');
+    });
+
+    it('throws when both HEAD and GET return 403', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      try {
+        await client.fetchCsrfToken();
+        throw new Error('Expected fetchCsrfToken to throw');
+      } catch (error) {
+        expect(error).toBeInstanceOf(AdtApiError);
+        expect(error).toMatchObject({
+          statusCode: 403,
+          message: expect.stringMatching(/forbidden/i),
+        });
+      }
+    });
+
+    it('does not use GET fallback when HEAD returns 401', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toMatchObject({
+        statusCode: 401,
+      });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(fetchOptions(0).method).toBe('HEAD');
+    });
+
+    it('does not re-fetch CSRF token for second POST', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T1' }));
+      // First POST
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      // Second POST (should reuse token)
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/path1', '<xml/>');
+      await client.post('/path2', '<xml/>');
+      expect(mockFetch).toHaveBeenCalledTimes(3); // CSRF + 2 POSTs
+    });
+
+    it('does not fetch CSRF token for GET requests', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries on 403 with fresh CSRF token', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'OLD_TOKEN' }));
+      // POST → 403
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'CSRF token expired'));
+      // Re-fetch CSRF
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'NEW_TOKEN' }));
+      // Retry POST → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'success'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const response = await client.post('/sap/bc/adt/activation', '<xml/>');
+
+      expect(response.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('stores CSRF token from any response header', async () => {
+      // GET response includes a token
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok', { 'x-csrf-token': 'FROM_GET' }));
+      // POST should use that token (no separate CSRF fetch)
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path');
+      await client.post('/path2', '<xml/>');
+
+      // Should use token from GET response, so only 2 calls total
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(fetchHeaders(1)['X-CSRF-Token']).toBe('FROM_GET');
+    });
+
+    it('ignores "Required" token value in response headers', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok', { 'x-csrf-token': 'Required' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path');
+      // csrfToken should still be empty — so next POST will fetch
+    });
+
+    it('sends a token and session cookie from the same fetch when concurrent requests refresh both', async () => {
+      // SAP binds the CSRF token to the session cookie; a torn pair is a 403. With a
+      // bearerTokenProvider awaiting mid-build, a second request's CSRF fetch can swap
+      // both fields between the two reads. Park request A there and let B overwrite them.
+      let releaseA!: () => void;
+      const aReleased = new Promise<void>((resolve) => {
+        releaseA = resolve;
+      });
+      let aParked!: () => void;
+      const aIsParked = new Promise<void>((resolve) => {
+        aParked = resolve;
+      });
+
+      let discoveryCalls = 0;
+      const posts: Array<{ token?: string; cookie?: string }> = [];
+      mockFetch.mockImplementation(async (url: string, init: RequestInit) => {
+        const headers = (init.headers ?? {}) as Record<string, string>;
+        if (url.includes('/core/discovery')) {
+          const nth = ++discoveryCalls;
+          // Second (cold) fetch lands while A is parked, replacing token + cookie.
+          if (nth === 2) await aIsParked;
+          return mockResponse(200, '', { 'x-csrf-token': `TOKEN-S${nth}` }, [`SAP_SESSIONID_A4H_001=S${nth}; Path=/`]);
+        }
+        posts.push({ token: headers['X-CSRF-Token'], cookie: headers.Cookie });
+        if (posts.length === 1) releaseA(); // B is on the wire — let A finish building
+        return mockResponse(200, 'ok');
+      });
+
+      let parked = false;
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        bearerTokenProvider: async () => {
+          // fetchCsrfToken() calls this too, before any discovery — park only the
+          // in-request call that sits between the token read and the cookie read.
+          if (!parked && discoveryCalls > 0) {
+            parked = true;
+            aParked();
+            await aReleased;
+          }
+          return 'bearer';
+        },
+      });
+
+      await Promise.all([client.post('/path', '<xml/>'), client.post('/path', '<xml/>')]);
+
+      expect(posts).toHaveLength(2);
+      for (const sent of posts) {
+        const session = /SAP_SESSIONID_A4H_001=(S\d)/.exec(sent.cookie ?? '')?.[1];
+        expect(sent.token).toBe(`TOKEN-${session}`);
+      }
+    });
+  });
+
+  describe('data-preview request gzip compatibility', () => {
+    const sql = "SELECT MTEXT FROM T000 WHERE MTEXT = 'München'";
+
+    function clientWithToken(config: AdtHttpConfig): InstanceType<typeof AdtHttpClient> {
+      const client = new AdtHttpClient(config);
+      (client as unknown as { csrfToken: string }).csrfToken = 'TOKEN';
+      return client;
+    }
+
+    it('keeps data-preview bodies plain by default', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = clientWithToken(getDefaultConfig());
+      await client.post('/sap/bc/adt/datapreview/freestyle?rowNumber=10', sql, 'text/plain');
+
+      expect(fetchBody(0)).toBe(sql);
+      expect(fetchHeaders(0)['Content-Encoding']).toBeUndefined();
+    });
+
+    it('gzip-encodes an exact freestyle POST and preserves UTF-8 text', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = clientWithToken({ ...getDefaultConfig(), gzipDataPreviewBody: true });
+      await client.post('/sap/bc/adt/datapreview/freestyle?rowNumber=10', sql, 'text/plain', {
+        'content-encoding': 'br',
+      });
+
+      const body = fetchBody(0);
+      expect(Buffer.isBuffer(body)).toBe(true);
+      expect(gunzipSync(body as Buffer).toString('utf8')).toBe(sql);
+      expect(fetchHeaders(0)['Content-Encoding']).toBe('gzip');
+      expect(fetchHeaders(0)['content-encoding']).toBeUndefined();
+    });
+
+    it('gzip-encodes a filtered DDIC data-preview POST', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = clientWithToken({ ...getDefaultConfig(), gzipDataPreviewBody: true });
+      await client.post('/sap/bc/adt/datapreview/ddic?rowNumber=10&ddicEntityName=T000', "MANDT = '001'", 'text/plain');
+
+      const body = fetchBody(0);
+      expect(Buffer.isBuffer(body)).toBe(true);
+      expect(gunzipSync(body as Buffer).toString('utf8')).toBe("MANDT = '001'");
+      expect(fetchHeaders(0)['Content-Encoding']).toBe('gzip');
+    });
+
+    it.each([
+      ['empty DDIC body', '/sap/bc/adt/datapreview/ddic?rowNumber=10', ''],
+      ['metadata child', '/sap/bc/adt/datapreview/freestyle/metadata', sql],
+      ['look-alike suffix', '/sap/bc/adt/datapreview/freestyle-extra', sql],
+      ['unrelated POST', '/sap/bc/adt/repository/informationsystem/search', sql],
+    ])('does not gzip %s', async (_label, path, body) => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = clientWithToken({ ...getDefaultConfig(), gzipDataPreviewBody: true });
+      await client.post(path, body, 'text/plain');
+
+      expect(fetchBody(0)).toBe(body);
+      expect(fetchHeaders(0)['Content-Encoding']).toBeUndefined();
+    });
+
+    it('does not add content encoding to an exact data-preview GET', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), gzipDataPreviewBody: true });
+      await client.get('/sap/bc/adt/datapreview/freestyle');
+
+      expect(fetchHeaders(0)['Content-Encoding']).toBeUndefined();
+      expect(fetchBody(0)).toBeUndefined();
+    });
+
+    it('reuses the exact gzip bytes and header after a 403 CSRF refresh', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'NEW_TOKEN' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = clientWithToken({ ...getDefaultConfig(), gzipDataPreviewBody: true });
+      await client.post('/sap/bc/adt/datapreview/freestyle', sql, 'text/plain');
+
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      expect(fetchOptions(0).method).toBe('POST');
+      expect(fetchOptions(1).method).toBe('HEAD');
+      expect(fetchOptions(2).method).toBe('POST');
+      expect(Buffer.isBuffer(fetchBody(0))).toBe(true);
+      expect(fetchBody(2)).toEqual(fetchBody(0));
+      expect(fetchHeaders(0)['Content-Encoding']).toBe('gzip');
+      expect(fetchHeaders(2)['Content-Encoding']).toBe('gzip');
+    });
+
+    it('preserves the gzip body and header through the BTP proxy transport', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'ok'));
+
+      const client = clientWithToken({
+        ...getDefaultConfig(),
+        gzipDataPreviewBody: true,
+        btpProxy: {
+          protocol: 'http',
+          host: 'proxy.example.com',
+          port: 20003,
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+      await client.post('/sap/bc/adt/datapreview/freestyle', sql, 'text/plain');
+
+      const body = clientRequestBody(0);
+      expect(Buffer.isBuffer(body)).toBe(true);
+      expect(gunzipSync(body as Buffer).toString('utf8')).toBe(sql);
+      expect(clientRequestHeaders(0)['Content-Encoding']).toBe('gzip');
+    });
+  });
+
+  // ─── Cookie Jar ────────────────────────────────────────────────────
+
+  describe('cookie jar', () => {
+    it('persists Set-Cookie headers from responses', async () => {
+      // First request returns cookies
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, 'ok', {}, [
+          'SAP_SESSIONID_A4H_001=abc123; Path=/; HttpOnly',
+          'sap-usercontext=lang=EN; Path=/',
+        ]),
+      );
+      // Second request should include those cookies
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/first');
+      await client.get('/second');
+
+      const secondHeaders = fetchHeaders(1);
+      expect(secondHeaders.Cookie).toContain('SAP_SESSIONID_A4H_001=abc123');
+      expect(secondHeaders.Cookie).toContain('sap-usercontext=lang=EN');
+    });
+
+    it('CSRF token works with cookie jar (session correlation)', async () => {
+      // CSRF fetch → returns session cookie
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '', { 'x-csrf-token': 'TOKEN_ABC' }, ['SAP_SESSIONID=sess123; Path=/']),
+      );
+      // POST should include both token AND cookie
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/sap/bc/adt/datapreview/ddic', 'data', 'text/plain');
+
+      const postHeaders = fetchHeaders(1);
+      expect(postHeaders['X-CSRF-Token']).toBe('TOKEN_ABC');
+      expect(postHeaders.Cookie).toContain('SAP_SESSIONID=sess123');
+    });
+
+    it('merges config cookies with jar cookies', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok', {}, ['jarCookie=jar1; Path=/']));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { configCookie: 'cfg1' },
+      });
+      await client.get('/first');
+      await client.get('/second');
+
+      const headers = fetchHeaders(1);
+      expect(headers.Cookie).toContain('configCookie=cfg1');
+      expect(headers.Cookie).toContain('jarCookie=jar1');
+    });
+
+    it('handles Set-Cookie with no value gracefully', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok', {}, ['=noname; Path=/']));
+      const client = new AdtHttpClient(getDefaultConfig());
+      // Should not throw
+      await client.get('/path');
+    });
+
+    it('jar wins over a stale config cookie of the same name — no duplicate SAP_SESSIONID (issue #293)', async () => {
+      // The cookie file seeded a (now stale) session id + the SSO ticket; the
+      // first response re-sets the session id with a fresh value.
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok', {}, ['SAP_SESSIONID_A4H_100=FRESH; Path=/; HttpOnly']));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { SAP_SESSIONID_A4H_100: 'STALE', MYSAPSSO2: 'TICKET' },
+      });
+      await client.get('/first');
+      await client.get('/second');
+
+      const cookie = fetchHeaders(1).Cookie ?? '';
+      const sessionMatches = cookie.match(/SAP_SESSIONID_A4H_100=/g) ?? [];
+      expect(sessionMatches).toHaveLength(1);
+      expect(cookie).toContain('SAP_SESSIONID_A4H_100=FRESH');
+      expect(cookie).not.toContain('SAP_SESSIONID_A4H_100=STALE');
+      // Auth cookie (only in config, never re-set by the server) is preserved.
+      expect(cookie).toContain('MYSAPSSO2=TICKET');
+    });
+
+    it('stateful LOCK→PUT carries the LOCK-issued session id, not the stale file copy (issue #293)', async () => {
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookieFile: '/tmp/arc1-test-cookies.txt',
+        cookies: { SAP_SESSIONID_A4H_100: 'STALE', MYSAPSSO2: 'TICKET' },
+      });
+      // Pretend CSRF is already known so the LOCK POST doesn't trigger a HEAD fetch
+      // (keeps the mock call indices aligned: 0 = LOCK, 1 = PUT).
+      (client as unknown as { csrfToken: string }).csrfToken = 'T';
+
+      // LOCK (POST) → server opens a stateful session and re-sets the session id.
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<LOCK_HANDLE>LH1</LOCK_HANDLE>', {}, ['SAP_SESSIONID_A4H_100=FRESH; Path=/']),
+      );
+      // PUT (source) succeeds.
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      await client.withStatefulSession(async (session) => {
+        await session.post('/sap/bc/adt/programs/programs/ZX?_action=LOCK&accessMode=MODIFY');
+        await session.put('/sap/bc/adt/programs/programs/ZX/source/main?lockHandle=LH1', 'REPORT zx.', 'text/plain');
+      });
+
+      const putCookie = fetchHeaders(1).Cookie ?? '';
+      expect(putCookie.match(/SAP_SESSIONID_A4H_100=/g) ?? []).toHaveLength(1);
+      expect(putCookie).toContain('SAP_SESSIONID_A4H_100=FRESH');
+      expect(putCookie).not.toContain('STALE');
+      expect(putCookie).toContain('MYSAPSSO2=TICKET');
+    });
+  });
+
+  // ─── Error Handling ────────────────────────────────────────────────
+
+  describe('error handling', () => {
+    it('throws AdtApiError on 404', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(404, 'Object not found'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/sap/bc/adt/programs/programs/ZNOTFOUND/source/main')).rejects.toThrow(AdtApiError);
+    });
+
+    it('logs expected 404s at debug level when requested', async () => {
+      const { logger } = await import('../../../src/server/logger.js');
+      const emitSpy = vi.spyOn(logger, 'emitAudit').mockImplementation(() => undefined);
+      mockFetch.mockResolvedValueOnce(mockResponse(404, 'Optional include not found'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(
+        client.get('/sap/bc/adt/oo/classes/ZCL_EXAMPLE/includes/testclasses', undefined, {
+          suppressNotFoundLog: true,
+        }),
+      ).rejects.toThrow(AdtApiError);
+
+      const failedRequest = emitSpy.mock.calls
+        .map((call) => call[0])
+        .find((event) => event.event === 'http_request' && event.statusCode === 404);
+      expect(failedRequest?.level).toBe('debug');
+      emitSpy.mockRestore();
+    });
+
+    it('logs probe misses at debug level for any status (404 and 400)', async () => {
+      const { logger } = await import('../../../src/server/logger.js');
+
+      // 404 — feature absent (e.g. abapGit/AMDP not installed)
+      const spy404 = vi.spyOn(logger, 'emitAudit').mockImplementation(() => undefined);
+      mockFetch.mockResolvedValueOnce(mockResponse(404, 'No suitable resource found'));
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/sap/bc/adt/abapgit/repos', undefined, { probe: true }),
+      ).rejects.toThrow(AdtApiError);
+      const ev404 = spy404.mock.calls.map((c) => c[0]).find((e) => e.event === 'http_request' && e.statusCode === 404);
+      expect(ev404?.level).toBe('debug');
+      spy404.mockRestore();
+
+      // 400 — the RAP probe (`/ddic/ddl/sources`) intentionally 400s without query params;
+      // suppressNotFoundLog (404-only) can't cover this, which is why `probe` exists.
+      const spy400 = vi.spyOn(logger, 'emitAudit').mockImplementation(() => undefined);
+      mockFetch.mockResolvedValueOnce(mockResponse(400, 'uriMappingError'));
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/sap/bc/adt/ddic/ddl/sources', undefined, { probe: true }),
+      ).rejects.toThrow(AdtApiError);
+      const ev400 = spy400.mock.calls.map((c) => c[0]).find((e) => e.event === 'http_request' && e.statusCode === 400);
+      expect(ev400?.level).toBe('debug');
+      spy400.mockRestore();
+    });
+
+    it('logs a non-probe 404 at warn level (default — no opt-in)', async () => {
+      const { logger } = await import('../../../src/server/logger.js');
+      const emitSpy = vi.spyOn(logger, 'emitAudit').mockImplementation(() => undefined);
+      mockFetch.mockResolvedValueOnce(mockResponse(404, 'Object not found'));
+
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/sap/bc/adt/programs/programs/ZNOPE/source/main'),
+      ).rejects.toThrow(AdtApiError);
+
+      const failedRequest = emitSpy.mock.calls
+        .map((call) => call[0])
+        .find((event) => event.event === 'http_request' && event.statusCode === 404);
+      expect(failedRequest?.level).toBe('warn');
+      emitSpy.mockRestore();
+    });
+
+    it('throws AdtApiError on 500', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(500, 'Internal Server Error'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toThrow(AdtApiError);
+    });
+
+    it('throws AdtApiError(401) when ADT path returns HTML login page', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<html><body>login</body></html>', { 'content-type': 'text/html; charset=UTF-8' }),
+      );
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toMatchObject({
+        statusCode: 401,
+        message: expect.stringContaining('HTML login page'),
+      });
+    });
+
+    it('notifies exactly once when an HTML login page becomes a synthetic 401', async () => {
+      const onUnauthorized = vi.fn();
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<html><body>System Logon</body></html>', { 'content-type': 'text/html' }),
+      );
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false, onUnauthorized });
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toMatchObject({ statusCode: 401 });
+
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledWith({ path: '/sap/bc/adt/core/discovery', statusCode: 401 });
+      expect(mockFetch).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      ['without Content-Type', {}],
+      ['with a misleading Content-Type', { 'content-type': 'application/octet-stream' }],
+    ])('turns a full login document %s into a synthetic 401', async (_label, headers) => {
+      const onUnauthorized = vi.fn();
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<html><body>System Logon</body></html>', headers));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false, onUnauthorized });
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toMatchObject({ statusCode: 401 });
+
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+      expect(mockFetch).toHaveBeenCalledOnce();
+    });
+
+    it('does not classify a UI5 HTML file with a binary media type as a login page', async () => {
+      const indexHtml = '<!doctype html><html><head><title>My UI5 App</title></head><body></body></html>';
+      mockFetch.mockResolvedValueOnce(mockResponse(200, indexHtml, { 'content-type': 'application/octet-stream' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const response = await client.get('/sap/bc/adt/filestore/ui5-bsp/objects/ZAPP/content');
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(indexHtml);
+    });
+
+    it.each([401, 403])('suppresses HTTP %s response bodies from audit fields', async (statusCode) => {
+      const { logger } = await import('../../../src/server/logger.js');
+      const emitSpy = vi.spyOn(logger, 'emitAudit').mockImplementation(() => undefined);
+      const previousDebug = process.env.ARC1_LOG_HTTP_DEBUG;
+      process.env.ARC1_LOG_HTTP_DEBUG = 'true';
+      mockFetch.mockResolvedValueOnce(mockResponse(statusCode, 'SECRET_AUTH_RESPONSE_SENTINEL'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false });
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toThrow(AdtApiError);
+
+      const failure = emitSpy.mock.calls
+        .map((call) => call[0])
+        .find((event) => event.event === 'http_request' && event.statusCode === statusCode) as
+        | { errorBody?: string; responseBody?: string }
+        | undefined;
+      expect(failure?.errorBody).toBeUndefined();
+      expect(failure?.responseBody).toBe('[suppressed authentication response]');
+      expect(JSON.stringify(failure)).not.toContain('SECRET_AUTH_RESPONSE_SENTINEL');
+      if (previousDebug === undefined) delete process.env.ARC1_LOG_HTTP_DEBUG;
+      else process.env.ARC1_LOG_HTTP_DEBUG = previousDebug;
+      emitSpy.mockRestore();
+    });
+
+    it('throws AdtApiError(401) when ADT path returns a DOCTYPE logon document', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<!DOCTYPE html>\n<html><head><title>System Logon</title></head></html>', {
+          'content-type': 'text/html; charset=UTF-8',
+        }),
+      );
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/sap/bc/adt/core/discovery')).rejects.toMatchObject({
+        statusCode: 401,
+        message: expect.stringContaining('HTML login page'),
+      });
+    });
+
+    it('passes through HTML fragment responses (e.g. gateway error log detail)', async () => {
+      // Real /sap/bc/adt/gw/errorlog/{type}/{tx} returns HTML fragments that
+      // start with <h4 id="..."> and have text/html content-type — they must
+      // not trigger the login-page heuristic.
+      const fragment = '<h4 id="OVERVIEW"><u>Content</u></h4><a href="#HEADER">Header Information</a><br>';
+      mockFetch.mockResolvedValueOnce(mockResponse(200, fragment, { 'content-type': 'text/html; charset=utf-8' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const response = await client.get('/sap/bc/adt/gw/errorlog/FrontendError/ABC123');
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(fragment);
+    });
+
+    it('accepts XML response on ADT path', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<adt/>', { 'content-type': 'application/xml' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const response = await client.get('/sap/bc/adt/core/discovery');
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe('<adt/>');
+    });
+
+    it('throws AdtApiError on 401 during CSRF fetch with client info', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toThrow(/sap-client=001/);
+    });
+
+    it('throws AdtApiError on 403 during CSRF fetch', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+      mockFetch.mockResolvedValueOnce(mockResponse(403, 'Forbidden'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toThrow(AdtApiError);
+    });
+
+    it('throws AdtApiError when CSRF token is missing from response', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toThrow(AdtApiError);
+    });
+
+    it('truncates long error bodies to 500 chars', async () => {
+      const longBody = 'X'.repeat(1000);
+      mockFetch.mockResolvedValueOnce(mockResponse(404, longBody));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      try {
+        await client.get('/path');
+      } catch (e) {
+        expect((e as AdtApiError).message.length).toBeLessThanOrEqual(600);
+      }
+    });
+
+    it('wraps network errors in AdtNetworkError', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtNetworkError);
+    });
+
+    it('wraps CSRF fetch network errors in AdtNetworkError', async () => {
+      mockFetch.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.fetchCsrfToken()).rejects.toThrow(AdtNetworkError);
+    });
+
+    it('wraps all non-AdtApiError errors as AdtNetworkError', async () => {
+      // Previously TypeError would pass through — now all errors become AdtNetworkError
+      mockFetch.mockRejectedValueOnce(new TypeError('null'));
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtNetworkError);
+    });
+  });
+
+  // ─── Config Cookies ────────────────────────────────────────────────
+
+  describe('config cookies', () => {
+    it('includes cookies in request headers', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { 'sap-usercontext': 'abc', SAP_SESSIONID: 'xyz' },
+      });
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchHeaders(0).Cookie).toContain('sap-usercontext=abc');
+      expect(fetchHeaders(0).Cookie).toContain('SAP_SESSIONID=xyz');
+    });
+
+    it('sends cookies with CSRF fetch when configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN' }));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { 'sap-usercontext': 'abc' },
+      });
+      await client.fetchCsrfToken();
+
+      expect(fetchHeaders(0).Cookie).toContain('sap-usercontext=abc');
+    });
+  });
+
+  // ─── URL Building ──────────────────────────────────────────────────
+
+  describe('URL building', () => {
+    it('handles trailing slash in baseUrl', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      const client = new AdtHttpClient({ ...getDefaultConfig(), baseUrl: 'http://sap:8000/' });
+      await client.get('/sap/bc/adt/core/discovery');
+      expect(fetchUrl(0)).not.toContain('//sap/bc');
+    });
+
+    it('handles path without leading slash', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('sap/bc/adt/core/discovery');
+      expect(fetchUrl(0)).toContain('/sap/bc/adt/core/discovery');
+    });
+  });
+
+  describe('SAML disable', () => {
+    it('adds X-SAP-SAML2 header when disableSaml=true', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), disableSaml: true });
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchHeaders(0)['X-SAP-SAML2']).toBe('disabled');
+    });
+
+    it('adds saml2=disabled query param when disableSaml=true', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), disableSaml: true });
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchUrl(0)).toContain('saml2=disabled');
+    });
+
+    it('does not add SAML header or query param when disableSaml=false', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/sap/bc/adt/core/discovery');
+
+      expect(fetchHeaders(0)['X-SAP-SAML2']).toBeUndefined();
+      expect(fetchUrl(0)).not.toContain('saml2=disabled');
+    });
+  });
+
+  // ─── TLS / Insecure ────────────────────────────────────────────────
+
+  describe('insecure mode', () => {
+    it('creates client with undici Agent when insecure=true', () => {
+      const client = new AdtHttpClient({ ...getDefaultConfig(), insecure: true });
+      expect(client).toBeDefined();
+      // Verify a dispatcher was created
+      expect((client as any).dispatcher).toBeDefined();
+    });
+
+    it('does not create dispatcher when insecure=false', () => {
+      const client = new AdtHttpClient(getDefaultConfig());
+      expect((client as any).dispatcher).toBeUndefined();
+    });
+  });
+
+  // ─── Basic Auth ────────────────────────────────────────────────────
+
+  describe('basic auth', () => {
+    it('sends Authorization Basic header with correct encoding', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path');
+
+      const expectedAuth = `Basic ${Buffer.from('admin:secret').toString('base64')}`;
+      expect(fetchHeaders(0).Authorization).toBe(expectedAuth);
+    });
+
+    it('does not send Basic Auth when bearerTokenProvider is configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        bearerTokenProvider: async () => 'bearer-token-123',
+      });
+      await client.get('/path');
+
+      expect(fetchHeaders(0).Authorization).toBe('Bearer bearer-token-123');
+      expect(fetchHeaders(0).Authorization).not.toContain('Basic');
+    });
+
+    it('does not send Basic Auth when sapConnectivityAuth is configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        sapConnectivityAuth: 'Bearer saml-assertion-for-user',
+      });
+      await client.get('/path');
+
+      expect(fetchHeaders(0).Authorization).toBeUndefined();
+    });
+
+    it('does not send Basic Auth when ppProxyAuth is configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        ppProxyAuth: 'Bearer exchanged-token',
+      });
+      await client.get('/path');
+
+      expect(fetchHeaders(0).Authorization).toBeUndefined();
+    });
+
+    it('does not send Authorization when no credentials configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({ baseUrl: 'http://sap:8000' });
+      await client.get('/path');
+
+      expect(fetchHeaders(0).Authorization).toBeUndefined();
+    });
+
+    it('sends Basic Auth header with CSRF fetch', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'CSRF_TOKEN_OK' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.fetchCsrfToken();
+
+      const expectedAuth = `Basic ${Buffer.from('admin:secret').toString('base64')}`;
+      expect(fetchHeaders(0).Authorization).toBe(expectedAuth);
+    });
+  });
+
+  // ─── Timeout ───────────────────────────────────────────────────────
+
+  describe('timeout', () => {
+    it('passes AbortSignal.timeout to fetch', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/path');
+
+      // Verify signal was passed
+      expect(fetchOptions(0).signal).toBeDefined();
+    });
+
+    it('honors a caller-provided per-fetch timeout for long-running operations', async () => {
+      mockFetch.mockImplementationOnce(
+        (_url, init) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+          }),
+      );
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path', undefined, { fetchTimeoutMs: 20 })).rejects.toThrow(AdtNetworkError);
+      expect(fetchOptions(0).dispatcher).toBeDefined();
+    });
+
+    it('wraps timeout errors as AdtNetworkError', async () => {
+      const abortError = new DOMException('The operation was aborted', 'AbortError');
+      mockFetch.mockRejectedValueOnce(abortError);
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtNetworkError);
+    });
+
+    it('refuses a pre-aborted caller signal without contacting SAP', async () => {
+      const controller = new AbortController();
+      controller.abort(new DOMException('caller cancelled', 'AbortError'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path', undefined, { signal: controller.signal })).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('refuses an expired absolute deadline without contacting SAP', async () => {
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path', undefined, { deadline: Date.now() - 1 })).rejects.toThrow(
+        /deadline was exceeded/i,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('composes caller cancellation with the built-in fetch timeout', async () => {
+      const controller = new AbortController();
+      mockFetch.mockImplementationOnce(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            const signal = init.signal as AbortSignal;
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          }),
+      );
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const pending = client.get('/path', undefined, { signal: controller.signal });
+      controller.abort(new DOMException('cancelled by poll owner', 'AbortError'));
+
+      await expect(pending).rejects.toThrow(AdtNetworkError);
+      expect(fetchOptions(0).signal).toBeDefined();
+    });
+
+    it('does not start a 503 retry after the caller deadline expires during backoff', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(503, 'busy', { 'retry-after': '5' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path', undefined, { deadline: Date.now() + 20 })).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('applies the same deadline to the CSRF bootstrap of a write', async () => {
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(
+        client.post('/path', '<xml/>', 'application/xml', undefined, { deadline: Date.now() - 1 }),
+      ).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('returns at the deadline while a bearer-token provider is still pending', async () => {
+      let rejectProvider!: (error: Error) => void;
+      const providerResult = new Promise<string>((_resolve, reject) => {
+        rejectProvider = reject;
+      });
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        bearerTokenProvider: () => providerResult,
+      });
+
+      await expect(client.get('/path', undefined, { deadline: Date.now() + 20 })).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      // The abandoned provider remains rejection-handled after the caller has returned.
+      rejectProvider(new Error('late provider rejection'));
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+
+    it('honors caller cancellation while a bearer-token provider is still pending', async () => {
+      const controller = new AbortController();
+      let rejectProvider!: (error: Error) => void;
+      const providerResult = new Promise<string>((_resolve, reject) => {
+        rejectProvider = reject;
+      });
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        bearerTokenProvider: () => providerResult,
+      });
+
+      const pending = client.get('/path', undefined, { signal: controller.signal });
+      controller.abort(new DOMException('cancelled by caller', 'AbortError'));
+
+      await expect(pending).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      rejectProvider(new Error('late provider rejection'));
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+
+    it('returns at the deadline while waiting for the shared-auth serial turn', async () => {
+      let resolveFirst!: (response: Response) => void;
+      mockFetch
+        .mockImplementationOnce(
+          () =>
+            new Promise<Response>((resolve) => {
+              resolveFirst = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(mockResponse(200, 'third'));
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false });
+
+      const first = client.get('/first');
+      await vi.waitFor(() => expect(mockFetch).toHaveBeenCalledTimes(1));
+      await expect(client.get('/second', undefined, { deadline: Date.now() + 20 })).rejects.toThrow(AdtNetworkError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+
+      resolveFirst(mockResponse(200, 'first'));
+      await expect(first).resolves.toMatchObject({ statusCode: 200 });
+      await expect(client.get('/third')).resolves.toMatchObject({ body: 'third' });
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── Principal Propagation ─────────────────────────────────────────
+
+  describe('principal propagation', () => {
+    it('sends SAP-Connectivity-Authentication header when sapConnectivityAuth is set', async () => {
+      const ppConfig: AdtHttpConfig = {
+        ...getDefaultConfig(),
+        sapConnectivityAuth: 'Bearer saml-assertion-for-user',
+      };
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'OK'));
+
+      const client = new AdtHttpClient(ppConfig);
+      await client.get('/sap/bc/adt/programs/programs/ZTEST/source/main');
+
+      expect(fetchHeaders(0)['SAP-Connectivity-Authentication']).toBe('Bearer saml-assertion-for-user');
+    });
+
+    it('does NOT send SAP-Connectivity-Authentication when not configured', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'OK'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/sap/bc/adt/programs/programs/ZTEST/source/main');
+
+      expect(fetchHeaders(0)['SAP-Connectivity-Authentication']).toBeUndefined();
+    });
+
+    it('sends SAP-Connectivity-Authentication on the CSRF fetch so the token binds to the user session', async () => {
+      const ppConfig: AdtHttpConfig = {
+        ...getDefaultConfig(),
+        sapConnectivityAuth: 'Bearer saml-assertion-for-user',
+      };
+      // CSRF fetch (HEAD) → token returned
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'PP_TOKEN' }));
+      // POST → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(ppConfig);
+      await client.post('/sap/bc/adt/repository/informationsystem/search', 'body', 'application/xml');
+
+      expect(fetchHeaders(0)['SAP-Connectivity-Authentication']).toBe('Bearer saml-assertion-for-user');
+      expect(fetchHeaders(1)['SAP-Connectivity-Authentication']).toBe('Bearer saml-assertion-for-user');
+    });
+
+    it('omits SAP-Connectivity-Authentication on CSRF fetch when ppProxyAuth (Option 1) is used', async () => {
+      const ppConfig: AdtHttpConfig = {
+        ...getDefaultConfig(),
+        sapConnectivityAuth: 'Bearer saml-assertion-for-user',
+        ppProxyAuth: 'Bearer exchanged-token',
+      };
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'PP_TOKEN' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(ppConfig);
+      await client.post('/sap/bc/adt/repository/informationsystem/search', 'body', 'application/xml');
+
+      expect(fetchHeaders(0)['SAP-Connectivity-Authentication']).toBeUndefined();
+      expect(fetchHeaders(1)['SAP-Connectivity-Authentication']).toBeUndefined();
+    });
+  });
+
+  // ─── Proactive MIME Discovery ─────────────────────────────────────
+
+  describe('discovery-aware header selection', () => {
+    it('uses discovered Accept for object-level paths (shallow match)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(new Map([['/sap/bc/adt/oo/classes', ['application/vnd.sap.adt.oo.classes.v4+xml']]]));
+
+      await client.get('/sap/bc/adt/oo/classes/ZCL_FOO');
+      expect(fetchHeaders(0).Accept).toBe('application/vnd.sap.adt.oo.classes.v4+xml');
+    });
+
+    it('does NOT apply discovery to deep sub-resource paths like /source/main', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(new Map([['/sap/bc/adt/oo/classes', ['application/vnd.sap.adt.oo.classes.v4+xml']]]));
+
+      await client.get('/sap/bc/adt/oo/classes/ZCL_FOO/source/main');
+      expect(fetchHeaders(0).Accept).toBe('*/*');
+    });
+
+    it('does not override explicit Accept with discovery result', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(new Map([['/sap/bc/adt/oo/classes', ['application/vnd.sap.adt.oo.classes.v4+xml']]]));
+
+      await client.get('/sap/bc/adt/oo/classes/ZCL_FOO', { Accept: 'application/xml' });
+      expect(fetchHeaders(0).Accept).toBe('application/xml');
+    });
+
+    it('falls back to default Accept for unknown paths', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(new Map([['/sap/bc/adt/oo/classes', ['application/vnd.sap.adt.oo.classes.v4+xml']]]));
+
+      await client.get('/sap/bc/adt/unmapped/endpoint');
+      expect(fetchHeaders(0).Accept).toBe('*/*');
+    });
+
+    it('keeps default behavior when discovery map is empty', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+      expect(fetchHeaders(0).Accept).toBe('*/*');
+    });
+
+    it('caches successful 406 retry headers for later requests', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.get('/sap/bc/adt/repository/informationsystem/search', { Accept: 'application/custom+xml' });
+      await client.get('/sap/bc/adt/repository/informationsystem/search');
+
+      expect(fetchHeaders(2).Accept).toBe('application/xml');
+    });
+
+    it('caches successful 415 retry Content-Type for later writes', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // First POST and retry
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Unsupported'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      // Second POST should use cached Content-Type
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/sap/bc/adt/ddic/ddl/sources/ZI_TRAVEL/source/main', '<source/>', 'text/xml');
+      await client.post('/sap/bc/adt/ddic/ddl/sources/ZI_TRAVEL/source/main', '<source2/>');
+
+      expect(fetchHeaders(3)['Content-Type']).toBe('application/xml');
+    });
+
+    it('stateful sessions inherit discovery map', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(new Map([['/sap/bc/adt/oo/classes', ['application/vnd.sap.adt.oo.classes.v4+xml']]]));
+
+      await client.withStatefulSession(async (session) => {
+        await session.get('/sap/bc/adt/oo/classes/ZCL_SESSION');
+      });
+
+      expect(fetchHeaders(0).Accept).toBe('application/vnd.sap.adt.oo.classes.v4+xml');
+      expect(fetchHeaders(0)['X-sap-adt-sessiontype']).toBe('stateful');
+    });
+
+    // Regression guard for the vibing-steampunk #98 bug class: a class-include write
+    // (CCDEF/CCIMP/testclasses) must carry the stateful-session header so SAP's ICM
+    // routes the PUT to the same session that holds the ENQUEUE lock. ARC-1 sets the
+    // header at the session-client level (request()), so EVERY in-session request —
+    // including include PUTs — gets it; this test pins that for the include URL shape.
+    it('class-include PUT inside a stateful session carries X-sap-adt-sessiontype', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as unknown as { csrfToken: string }).csrfToken = 'T'; // skip CSRF fetch round-trip
+
+      await client.withStatefulSession(async (session) => {
+        await session.put(
+          '/sap/bc/adt/oo/classes/ZCL_X/includes/implementations?lockHandle=ABC',
+          'CLASS lcl IMPLEMENTATION. ENDCLASS.',
+          'text/plain',
+        );
+      });
+
+      expect(fetchHeaders(0)['X-sap-adt-sessiontype']).toBe('stateful');
+    });
+
+    it('explicit extra headers win over discovery for Accept and Content-Type', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      client.setDiscoveryMap(
+        new Map([['/sap/bc/adt/ddic/ddl/sources', ['application/vnd.sap.adt.ddic.ddl.sources.v2+xml']]]),
+      );
+
+      await client.post('/sap/bc/adt/ddic/ddl/sources/ZI_TRAVEL', '<source/>', undefined, {
+        Accept: 'application/json',
+        'Content-Type': 'text/plain',
+      });
+
+      expect(fetchHeaders(1).Accept).toBe('application/json');
+      expect(fetchHeaders(1)['Content-Type']).toBe('text/plain');
+    });
+  });
+
+  // ─── 406/415 Content Negotiation Retry ─────────────────────────────
+
+  describe('406/415 content negotiation retry', () => {
+    it('retries GET with fallback Accept on 406', async () => {
+      // First request → 406
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      // Retry with fallback Accept → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/path', { Accept: 'application/vnd.sap.adt.custom+xml' });
+
+      expect(resp.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      // Retry should use fallback Accept (application/xml since original was specific)
+      expect(fetchHeaders(1).Accept).toBe('application/xml');
+    });
+
+    it('406 skips retry when default Accept */* has no useful fallback', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      // Default Accept is */* — no better fallback available, should throw
+      await expect(client.get('/path')).rejects.toThrow();
+
+      // Only one fetch call — no retry
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses inferred Accept from SAP error body on 406', async () => {
+      const errorBody =
+        '<exc:exception><exc:localizedMessage>Expected application/vnd.sap.adt.transportorganizertree.v1+xml</exc:localizedMessage></exc:exception>';
+      mockFetch.mockResolvedValueOnce(mockResponse(406, errorBody));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/path', { Accept: 'application/xml' });
+
+      expect(resp.statusCode).toBe(200);
+      expect(fetchHeaders(1).Accept).toBe('application/vnd.sap.adt.transportorganizertree.v1+xml');
+    });
+
+    it('retries POST with fallback Content-Type on 415', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // POST → 415
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Unsupported Media Type'));
+      // Retry with application/xml → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.post('/path', '<data/>', 'text/xml');
+
+      expect(resp.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      // Retry Content-Type should fall back to application/xml
+      expect(fetchHeaders(2)['Content-Type']).toBe('application/xml');
+    });
+
+    it('does not retry on non-406/415 errors', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(500, 'Internal Server Error'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not retry infinitely — only retries once for 406', async () => {
+      // First 406
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      // Retry also 406 — should NOT retry again, should throw
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Still Not Acceptable'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path', { Accept: 'application/custom+xml' })).rejects.toThrow(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry infinitely — only retries once for 415', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // First 415
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Unsupported'));
+      // Retry also 415 — should throw
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Still Unsupported'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.post('/path', '<d/>', 'text/xml')).rejects.toThrow(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(3); // CSRF + POST + retry
+    });
+
+    it('preserves CSRF token and cookies during 406 retry', async () => {
+      // CSRF fetch returns cookie
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '', { 'x-csrf-token': 'MY_TOKEN' }, ['SAP_SESSIONID=sess1; Path=/']),
+      );
+      // POST → 406
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      // Retry → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.post('/path', '<d/>', 'application/custom+xml', {
+        Accept: 'application/custom+xml',
+      });
+
+      expect(resp.statusCode).toBe(200);
+      // Retry should still have CSRF token
+      expect(fetchHeaders(2)['X-CSRF-Token']).toBe('MY_TOKEN');
+      // Retry should still have session cookie
+      expect(fetchHeaders(2).Cookie).toContain('SAP_SESSIONID=sess1');
+    });
+
+    it('406 skips retry when Accept is already */* and no inferred type', async () => {
+      // Default Accept is */* — no useful fallback, should throw without retry
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow();
+
+      // Only one fetch call — no retry
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('406 falls back to wildcard when Accept is application/xml and no inferred type', async () => {
+      // Accept: application/xml → 406, no inferred type in error body → retry with */*
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/path', { Accept: 'application/xml' });
+
+      expect(resp.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(fetchHeaders(1).Accept).toBe('*/*');
+    });
+
+    it('negotiation retry guard is per-request, not per-instance', async () => {
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      // First request: 406 → retry → success
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'first ok'));
+      const resp1 = await client.get('/path', { Accept: 'application/custom+xml' });
+      expect(resp1.statusCode).toBe(200);
+
+      // Second request on same instance: should also retry (guard is per-request)
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'second ok'));
+      const resp2 = await client.get('/path', { Accept: 'application/custom+xml' });
+      expect(resp2.statusCode).toBe(200);
+
+      // 4 total fetches: 2 per request (original + retry)
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('415 retries with application/* when Content-Type is application/xml', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // POST with application/xml → 415
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Unsupported'));
+      // Retry with application/* → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.post('/path', '<d/>', 'application/xml');
+
+      expect(resp.statusCode).toBe(200);
+      // CSRF fetch + initial POST + retry POST
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+      // Verify retry used application/* content type
+      const retryCall = mockFetch.mock.calls[2];
+      expect(retryCall[1].headers['Content-Type']).toBe('application/*');
+    });
+
+    it('415 skips retry when Content-Type is already application/*', async () => {
+      // CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      // POST with application/* → 415 (no useful fallback, should throw without retry)
+      mockFetch.mockResolvedValueOnce(mockResponse(415, 'Unsupported'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.post('/path', '<d/>', 'application/*')).rejects.toThrow();
+
+      // CSRF fetch + one POST — no retry
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── 401 Session Timeout Auto-Retry ────────────────────────────────
+
+  describe('401 session timeout auto-retry', () => {
+    it('can disable the retry and emits one narrow final-401 callback', async () => {
+      const onUnauthorized = vi.fn();
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false, onUnauthorized });
+      await expect(client.get('/path')).rejects.toThrow(AdtApiError);
+
+      expect(mockFetch).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledWith({ path: '/path', statusCode: 401 });
+    });
+
+    it('never treats a 401 body marker as a retryable DB-connection failure', async () => {
+      const onUnauthorized = vi.fn();
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'database connection is not open'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false, onUnauthorized });
+      await expect(client.get('/path')).rejects.toMatchObject({ statusCode: 401 });
+
+      expect(mockFetch).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledWith({ path: '/path', statusCode: 401 });
+    });
+
+    it('serializes retry-disabled requests and makes only one rejected SAP attempt', async () => {
+      const onUnauthorized = vi.fn();
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), retryUnauthorized: false, onUnauthorized });
+      const results = await Promise.allSettled([client.get('/one'), client.get('/two'), client.get('/three')]);
+
+      expect(results.every((result) => result.status === 'rejected')).toBe(true);
+      expect(mockFetch).toHaveBeenCalledOnce();
+      expect(onUnauthorized).toHaveBeenCalledOnce();
+      expect(results.map((result) => (result.status === 'rejected' ? result.reason.statusCode : undefined))).toEqual([
+        401, 401, 401,
+      ]);
+    });
+
+    it('retries GET on 401 after session reset', async () => {
+      // GET → 401
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(401, 'Unauthorized', { 'www-authenticate': 'Basic realm="SAP"' }, [
+          'sap-usercontext=sap-client=001; path=/',
+        ]),
+      );
+      // Retry GET → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'success'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/sap/bc/adt/programs/programs/ZTEST/source/main');
+
+      expect(resp.statusCode).toBe(200);
+      expect(resp.body).toBe('success');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries POST on 401 with fresh CSRF token', async () => {
+      // Initial CSRF fetch
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN1' }));
+      // POST → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // CSRF re-fetch during retry
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN2' }));
+      // Retry POST → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'created'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.post('/sap/bc/adt/activation', '<xml/>');
+
+      expect(resp.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+      // Retry POST should have fresh CSRF token
+      expect(fetchHeaders(3)['X-CSRF-Token']).toBe('TOKEN2');
+    });
+
+    it('does not retry on 401 when already retrying (guard)', async () => {
+      // GET → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // Retry also → 401 (should not retry again)
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Still Unauthorized'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry non-401 errors', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(500, 'Internal Server Error'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await expect(client.get('/path')).rejects.toThrow(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears cookies on 401 retry', async () => {
+      // CSRF fetch → sets session cookie
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '', { 'x-csrf-token': 'T' }, ['SAP_SESSIONID_A4H_001=SESSION1; Path=/']),
+      );
+      // POST → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // CSRF re-fetch during retry
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T2' }));
+      // Retry POST → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      await client.post('/path', '<xml/>');
+
+      // Retry request should NOT contain the old session cookie
+      const retryCookie = fetchHeaders(3).Cookie ?? '';
+      expect(retryCookie).not.toContain('SAP_SESSIONID_A4H_001=SESSION1');
+    });
+
+    it('refreshes bearer token on 401 retry', async () => {
+      const tokenProvider = vi.fn().mockResolvedValueOnce('token1').mockResolvedValueOnce('token2');
+
+      // GET with token1 → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // Retry with token2 → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        bearerTokenProvider: tokenProvider,
+      });
+      const resp = await client.get('/path');
+
+      expect(resp.statusCode).toBe(200);
+      expect(fetchHeaders(1).Authorization).toBe('Bearer token2');
+    });
+
+    it('401 retry guard is per-request not per-instance', async () => {
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      // First request: 401 → retry → success
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'first ok'));
+      const resp1 = await client.get('/path1');
+      expect(resp1.statusCode).toBe(200);
+
+      // Second request: also 401 → retry → success (guard resets between requests)
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'second ok'));
+      const resp2 = await client.get('/path2');
+      expect(resp2.statusCode).toBe(200);
+
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('preserves config cookies on 401 retry', async () => {
+      // GET → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // Retry → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { configCookie: 'cfg1' },
+      });
+      await client.get('/path');
+
+      // Retry should include the config cookie
+      expect(fetchHeaders(1).Cookie).toContain('configCookie=cfg1');
+    });
+
+    it('401 retry falls through to 406 negotiation recovery', async () => {
+      // GET → 401
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      // Retry → 406 (negotiation failure)
+      mockFetch.mockResolvedValueOnce(mockResponse(406, 'Not Acceptable'));
+      // 406 fallback retry → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      const resp = await client.get('/path', { Accept: 'application/vnd.sap.adt.custom+xml' });
+
+      expect(resp.statusCode).toBe(200);
+      // 3 fetches: original 401, retry 406, negotiation fallback 200
+      expect(mockFetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('auth retry guard is per-request scope (local variable)', async () => {
+      // Verify two separate instances can both retry independently
+      // This confirms the guard is not shared across instances/requests
+      const client1 = new AdtHttpClient(getDefaultConfig());
+      const client2 = new AdtHttpClient(getDefaultConfig());
+
+      // Client 1: 401 → retry → 200
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok1'));
+      const resp1 = await client1.get('/path1');
+      expect(resp1.statusCode).toBe(200);
+
+      // Client 2: 401 → retry → 200 (not blocked by client1's retry)
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok2'));
+      const resp2 = await client2.get('/path2');
+      expect(resp2.statusCode).toBe(200);
+
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  describe('bounded response bodies', () => {
+    it('rejects a known oversized identity body from Content-Length before reading it', async () => {
+      const cancelled = vi.fn();
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            cancel: cancelled,
+          }),
+          { status: 200, headers: { 'content-length': '9' } },
+        ),
+      );
+
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/path', undefined, {
+          responseBudget: new DataResponseBudget(3),
+        }),
+      ).rejects.toBeInstanceOf(AdtResponseLimitError);
+      expect(cancelled).toHaveBeenCalledOnce();
+    });
+
+    it('rejects and cancels when the first chunk crosses the byte ceiling', async () => {
+      const cancelled = vi.fn();
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('oversized'));
+            },
+            cancel: cancelled,
+          }),
+          { status: 200 },
+        ),
+      );
+      const budget = new DataResponseBudget(3);
+
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/path', undefined, { responseBudget: budget }),
+      ).rejects.toBeInstanceOf(AdtResponseLimitError);
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(budget.consumedBytes).toBe(0);
+      expect(budget.reservedBytes).toBe(0);
+    });
+
+    it('allows the exact decompressed-byte boundary and preserves UTF-8 split across chunks', async () => {
+      const encoded = new TextEncoder().encode('A€B');
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [encoded.slice(0, 2), encoded.slice(2)]));
+      const budget = new DataResponseBudget(encoded.byteLength);
+
+      const response = await new AdtHttpClient(getDefaultConfig()).get('/path', undefined, { responseBudget: budget });
+
+      expect(response.body).toBe('A€B');
+      expect(budget.consumedBytes).toBe(encoded.byteLength);
+      expect(budget.reservedBytes).toBe(0);
+    });
+
+    it('cancels before a later chunk can cross the byte ceiling', async () => {
+      const cancelled = vi.fn();
+      mockFetch.mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('abc'));
+              controller.enqueue(new TextEncoder().encode('def'));
+            },
+            cancel: cancelled,
+          }),
+          { status: 200 },
+        ),
+      );
+      const budget = new DataResponseBudget(5);
+
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/path', undefined, { responseBudget: budget }),
+      ).rejects.toBeInstanceOf(AdtResponseLimitError);
+      expect(cancelled).toHaveBeenCalledOnce();
+      expect(budget.consumedBytes).toBe(0);
+      expect(budget.reservedBytes).toBe(0);
+    });
+
+    it('accounts successful responses cumulatively while keeping non-2xx retry bodies separate', async () => {
+      const budget = new DataResponseBudget(3);
+      mockFetch.mockResolvedValueOnce(streamedResponse(406, [new TextEncoder().encode('bad')]));
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('ok')]));
+
+      const response = await new AdtHttpClient(getDefaultConfig()).get(
+        '/path',
+        { Accept: 'application/xml' },
+        {
+          responseBudget: budget,
+        },
+      );
+
+      expect(response.body).toBe('ok');
+      expect(budget.consumedBytes).toBe(2);
+    });
+
+    it.each([
+      ['401 authentication', 401, 'bad', undefined],
+      ['406 content negotiation', 406, 'bad', undefined],
+      ['429 throttling', 429, 'bad', { 'retry-after': '0' }],
+      ['500 database reconnect', 500, 'database connection is not open', undefined],
+      ['503 availability', 503, 'bad', { 'retry-after': '0' }],
+    ])('does not charge a bounded %s retry body to the successful allowance', async (_name, status, body, headers) => {
+      const budget = new DataResponseBudget(64);
+      mockFetch.mockResolvedValueOnce(streamedResponse(status, [new TextEncoder().encode(body)], headers));
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('ok')]));
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      const response = await client.get(
+        '/path',
+        status === 406 ? { Accept: 'application/vnd.sap.adt.custom+xml' } : undefined,
+        { responseBudget: budget },
+      );
+
+      expect(response.body).toBe('ok');
+      expect(budget.consumedBytes).toBe(2);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not charge a bounded 415 retry body to the successful allowance', async () => {
+      const budget = new DataResponseBudget(3);
+      mockFetch.mockResolvedValueOnce(streamedResponse(415, [new TextEncoder().encode('bad')]));
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('ok')]));
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const response = await client.post('/path', '<x/>', 'text/xml', undefined, { responseBudget: budget });
+
+      expect(response.body).toBe('ok');
+      expect(budget.consumedBytes).toBe(2);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('rejects an oversized non-2xx body before AdtApiError buffering', async () => {
+      mockFetch.mockResolvedValueOnce(streamedResponse(400, [new TextEncoder().encode('1234')]));
+
+      await expect(
+        new AdtHttpClient(getDefaultConfig()).get('/path', undefined, {
+          responseBudget: new DataResponseBudget(3),
+        }),
+      ).rejects.toBeInstanceOf(AdtResponseLimitError);
+    });
+
+    it('prevents parallel successful streams from oversubscribing one cumulative budget', async () => {
+      const budget = new DataResponseBudget(5);
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('abc')]));
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('def')]));
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      const results = await Promise.allSettled([
+        client.get('/one', undefined, { responseBudget: budget }),
+        client.get('/two', undefined, { responseBudget: budget }),
+      ]);
+
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      expect(results.filter((result) => result.status === 'rejected')).toHaveLength(1);
+      expect(budget.consumedBytes).toBe(3);
+      expect(budget.reservedBytes).toBe(0);
+    });
+
+    it('does not attach a data budget to CSRF bootstrap requests', async () => {
+      const budget = new DataResponseBudget(2);
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ignored bootstrap body', { 'x-csrf-token': 'T' }));
+      mockFetch.mockResolvedValueOnce(streamedResponse(200, [new TextEncoder().encode('ok')]));
+
+      const response = await new AdtHttpClient(getDefaultConfig()).post('/path', 'body', 'text/plain', undefined, {
+        responseBudget: budget,
+      });
+
+      expect(response.body).toBe('ok');
+      expect(budget.consumedBytes).toBe(2);
+    });
+  });
+
+  // ─── Proxy Configuration ──────────────────────────────────────────
+
+  describe('proxy configuration', () => {
+    it('forwards the configured User-Agent on proxy CSRF and mutation requests', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, '', { 'x-csrf-token': 'T' }));
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'saved'));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        userAgent: 'arc-1/proxy-test',
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+      await client.post('/path', 'source');
+      expect(mockClientRequest).toHaveBeenCalledTimes(2);
+      expect(clientRequestHeaders(0)['User-Agent']).toBe('arc-1/proxy-test');
+      expect(clientRequestHeaders(1)['User-Agent']).toBe('arc-1/proxy-test');
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('uses undici Client for proxy requests (standard HTTP proxy, not CONNECT)', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      // No static dispatcher on the client — proxy uses Client directly
+      expect((client as any).dispatcher).toBeUndefined();
+
+      await client.get('/path');
+
+      // Should use Client.request (not fetch) for proxy requests
+      expect(mockClientRequest).toHaveBeenCalledTimes(1);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('sends Proxy-Authorization and full URL via Client for standard HTTP proxy protocol', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token-xyz',
+        },
+      });
+      await client.get('/path');
+
+      // Proxy-Authorization should be in the Client request headers
+      expect(clientRequestHeaders(0)['Proxy-Authorization']).toBe('Bearer proxy-token-xyz');
+      // The path should be the full URL (standard HTTP proxy protocol)
+      expect(clientRequestPath(0)).toBe('http://sap.example.com:8000/path?sap-client=001&sap-language=EN');
+    });
+
+    it('streams a budgeted proxy response with identity encoding and closes its client once', async () => {
+      const proxyResponse = mockClientResponse(200, 'okay', { etag: '"abc"' });
+      mockClientRequest.mockResolvedValueOnce(proxyResponse);
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      const response = await client.get('/path', undefined, { responseBudget: new DataResponseBudget(4) });
+
+      expect(response.body).toBe('okay');
+      expect(response.headers.etag).toBe('"abc"');
+      expect(clientRequestHeaders(0)['Accept-Encoding']).toBe('identity');
+      expect((proxyResponse.body as unknown as { text: ReturnType<typeof vi.fn> }).text).not.toHaveBeenCalled();
+      expect(mockClientClose).toHaveBeenCalledOnce();
+      expect(mockClientDestroy).not.toHaveBeenCalled();
+    });
+
+    it('preserves multiple Set-Cookie values across the bounded response wrapper', async () => {
+      mockClientRequest
+        .mockResolvedValueOnce(mockClientResponse(200, 'ok', { 'set-cookie': ['SID=one; Path=/', 'AUTH=two; Path=/'] }))
+        .mockResolvedValueOnce(mockClientResponse(200, 'next'));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await client.get('/path', undefined, { responseBudget: new DataResponseBudget(10) });
+      await client.get('/next');
+
+      expect(clientRequestHeaders(1).Cookie).toContain('SID=one');
+      expect(clientRequestHeaders(1).Cookie).toContain('AUTH=two');
+    });
+
+    it('destroys the proxy client when a bounded source stream fails', async () => {
+      const failingBody = Readable.from(
+        (async function* () {
+          yield Buffer.from('ok');
+          throw new Error('proxy body failed');
+        })(),
+      );
+      Object.assign(failingBody, { text: vi.fn() });
+      mockClientRequest.mockResolvedValueOnce({ statusCode: 200, headers: {}, body: failingBody });
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await expect(client.get('/path', undefined, { responseBudget: new DataResponseBudget(10) })).rejects.toThrow(
+        AdtNetworkError,
+      );
+      expect(mockClientDestroy).toHaveBeenCalledOnce();
+      expect(mockClientClose).not.toHaveBeenCalled();
+    });
+
+    it('aborts a bounded proxy body and destroys its client after headers arrive', async () => {
+      const stalledBody = new Readable({ read() {} });
+      Object.assign(stalledBody, { text: vi.fn() });
+      mockClientRequest.mockResolvedValueOnce({ statusCode: 200, headers: {}, body: stalledBody });
+      const abort = new AbortController();
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      const pending = client.get('/path', undefined, {
+        responseBudget: new DataResponseBudget(10),
+        signal: abort.signal,
+      });
+      await vi.waitFor(() => expect(mockClientRequest).toHaveBeenCalledOnce());
+      abort.abort(new Error('caller cancelled'));
+
+      await expect(pending).rejects.toThrow(AdtNetworkError);
+      expect(mockClientDestroy).toHaveBeenCalledOnce();
+      expect(mockClientClose).not.toHaveBeenCalled();
+    });
+
+    it('closes the proxy client when the request fails before a response exists', async () => {
+      mockClientRequest.mockRejectedValueOnce(new Error('proxy unavailable'));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await expect(client.get('/path', undefined, { responseBudget: new DataResponseBudget(10) })).rejects.toThrow(
+        AdtNetworkError,
+      );
+      expect(mockClientClose).toHaveBeenCalledOnce();
+      expect(mockClientDestroy).not.toHaveBeenCalled();
+    });
+
+    it('destroys a budgeted proxy stream and client when the byte ceiling is crossed', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'oversized'));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await expect(
+        client.get('/path', undefined, { responseBudget: new DataResponseBudget(4) }),
+      ).rejects.toBeInstanceOf(AdtResponseLimitError);
+      expect(mockClientDestroy).toHaveBeenCalledOnce();
+      expect(mockClientClose).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unexpected proxy content encoding before returning the bounded body', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'compressed', { 'content-encoding': 'gzip' }));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await expect(client.get('/path', undefined, { responseBudget: new DataResponseBudget(100) })).rejects.toThrow(
+        AdtNetworkError,
+      );
+      expect(mockClientDestroy).toHaveBeenCalledOnce();
+      expect(mockClientClose).not.toHaveBeenCalled();
+    });
+
+    it('closes a budgeted null-body proxy response without constructing a body stream', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(304, '', { etag: '"abc"' }));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      const response = await client.get('/path', undefined, { responseBudget: new DataResponseBudget(1) });
+      expect(response).toMatchObject({ statusCode: 304, body: '' });
+      expect(mockClientClose).toHaveBeenCalledOnce();
+      expect(mockClientDestroy).not.toHaveBeenCalled();
+    });
+
+    it('handles a 304 (null-body status) from the proxy without crashing the Response constructor', async () => {
+      // Regression: a conditional GET (If-None-Match) that revalidates to 304
+      // over the Cloud Connector proxy must not throw "Invalid response status
+      // code 304" — that crashed edit_method's read-before-write on RISE/CC.
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(304, '', { etag: '"abc"' }));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      const resp = await client.get('/path', { 'If-None-Match': '"abc"' });
+      expect(resp.statusCode).toBe(304);
+      expect(resp.body).toBe('');
+      // The ETag must survive the proxy reconstruction — that's what lets the
+      // caching layer serve the cached source on a 304 revalidation.
+      expect(resp.headers.etag).toBe('"abc"');
+    });
+
+    it('uses the CSRF GET fallback through the BTP proxy and surfaces its 401', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, ''));
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await expect(client.fetchCsrfToken()).rejects.toMatchObject({ statusCode: 401 });
+      expect(mockClientRequest).toHaveBeenCalledTimes(2);
+      expect(mockClientRequest.mock.calls[0]?.[0]?.method).toBe('HEAD');
+      expect(mockClientRequest.mock.calls[1]?.[0]?.method).toBe('GET');
+    });
+
+    it('returns at the deadline while the connectivity proxy token is pending', async () => {
+      let rejectProvider!: (error: Error) => void;
+      const providerResult = new Promise<string>((_resolve, reject) => {
+        rejectProvider = reject;
+      });
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: () => providerResult,
+        },
+      });
+
+      await expect(client.get('/path', undefined, { deadline: Date.now() + 20 })).rejects.toThrow(AdtNetworkError);
+      expect(mockClientRequest).not.toHaveBeenCalled();
+
+      rejectProvider(new Error('late proxy-token rejection'));
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+  });
+
+  // ─── 503 Retry ──────────────────────────────────────────────────────
+
+  describe('503 retry with backoff', () => {
+    it('retries GET on 503 and succeeds on second attempt', async () => {
+      // First call: CSRF fetch (HEAD), second: GET returns 503, third: retry returns 200
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(200, 'OK'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T'; // skip CSRF fetch
+
+      const response = await client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe('OK');
+      // Two fetch calls: original 503 + retry
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws AdtApiError when GET retry also returns 503', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(503, 'Still Unavailable'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      await expect(client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main')).rejects.toThrow(AdtApiError);
+    });
+
+    it('retries HEAD on 503', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(200, ''));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const response = await client.head('/sap/bc/adt/core/discovery');
+      expect(response.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries POST on 503 (ICM rejects before WP execution)', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(200, '<ok/>', { 'x-csrf-token': 'T2' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const result = await client.post('/sap/bc/adt/some/action', '<xml/>');
+      expect(result.statusCode).toBe(200);
+      expect(result.body).toBe('<ok/>');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries PUT on 503', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(200, '<ok/>', { 'x-csrf-token': 'T2' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const result = await client.put('/sap/bc/adt/some/action', '<xml/>');
+      expect(result.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries DELETE on 503', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(503, 'Service Unavailable'))
+        .mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T2' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const result = await client.delete('/sap/bc/adt/some/action');
+      expect(result.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── 429 Retry (Layer 3 Retry-After) ────────────────────────────────
+
+  describe('429 retry with Retry-After honoring', () => {
+    it('retries GET on 429 and succeeds on second attempt', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(429, 'Too Many Requests', { 'retry-after': '1' }))
+        .mockResolvedValueOnce(mockResponse(200, 'OK'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const response = await client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe('OK');
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries POST on 429 (gateway-level rejection — safe for mutating methods)', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(429, 'Too Many Requests', { 'retry-after': '1' }))
+        .mockResolvedValueOnce(mockResponse(200, '<ok/>', { 'x-csrf-token': 'T2' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const result = await client.post('/sap/bc/adt/some/action', '<xml/>');
+      expect(result.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws AdtApiError when 429 retry also returns 429', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(429, 'Too Many Requests', { 'retry-after': '1' }))
+        .mockResolvedValueOnce(mockResponse(429, 'Still Throttled', { 'retry-after': '1' }));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      await expect(client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main')).rejects.toThrow(AdtApiError);
+      // Exactly one retry — the guard prevents a third attempt
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('falls back to jitter when Retry-After is missing on 429', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(429, 'Too Many Requests'))
+        .mockResolvedValueOnce(mockResponse(200, 'OK'));
+
+      const client = new AdtHttpClient(getDefaultConfig());
+      (client as any).csrfToken = 'T';
+
+      const response = await client.get('/sap/bc/adt/programs/programs/ZHELLO/source/main');
+      expect(response.statusCode).toBe(200);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── Semaphore Integration ──────────────────────────────────────────
+
+  describe('semaphore integration', () => {
+    it('limits concurrency when semaphore is provided', async () => {
+      const { Semaphore } = await import('../../../src/adt/semaphore.js');
+      const sem = new Semaphore(1);
+
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      mockFetch.mockImplementation(async () => {
+        concurrent++;
+        if (concurrent > maxConcurrent) maxConcurrent = concurrent;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        concurrent--;
+        return mockResponse(200, 'ok');
+      });
+
+      const client = new AdtHttpClient({ ...getDefaultConfig(), semaphore: sem });
+      (client as any).csrfToken = 'T';
+
+      await Promise.all([client.get('/path1'), client.get('/path2'), client.get('/path3')]);
+
+      expect(maxConcurrent).toBe(1);
+    });
+
+    it('cancels a queued deadline waiter so it never contacts SAP later', async () => {
+      const { Semaphore } = await import('../../../src/adt/semaphore.js');
+      const sem = new Semaphore(1);
+      await sem.acquire();
+      const client = new AdtHttpClient({ ...getDefaultConfig(), semaphore: sem });
+
+      await expect(client.get('/queued', undefined, { deadline: Date.now() + 20 })).rejects.toThrow(AdtNetworkError);
+      expect(sem.waiting).toBe(0);
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      sem.release();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(sem.inflight).toBe(0);
+    });
+  });
+
+  // ─── Cookie hot-reload on stale 401 ─────────────────────────────────
+  //
+  // Verifies the lazy reload state machine: persistent 401 in cookie-auth
+  // mode clears the cookie jar and re-reads the configured cookieFile on
+  // the NEXT request, with no restart. See docs/plans/2026-05-08-pr-alpha-cookie-hot-reload.md
+  // and docs/adr/0001-discovery-driven-endpoint-routing.md (architectural context).
+
+  describe('cookie hot-reload', () => {
+    let tmpFile = '';
+
+    function writeNetscapeCookieFile(cookies: Record<string, string>): string {
+      const fs = require('node:fs');
+      const os = require('node:os');
+      const path = require('node:path');
+      const file = path.join(os.tmpdir(), `arc1-test-cookies-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+      const lines = ['# Netscape HTTP Cookie File'];
+      for (const [k, v] of Object.entries(cookies)) {
+        lines.push(`sap.example.com\tFALSE\t/\tFALSE\t0\t${k}\t${v}`);
+      }
+      fs.writeFileSync(file, `${lines.join('\n')}\n`);
+      return file;
+    }
+
+    afterEach(() => {
+      if (tmpFile) {
+        const fs = require('node:fs');
+        try {
+          fs.unlinkSync(tmpFile);
+        } catch {
+          // best-effort-cleanup
+        }
+        tmpFile = '';
+      }
+    });
+
+    it('clears cookies on persistent 401 in cookie-auth mode', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'stale-value' });
+      // First GET → 401, retry GET → still 401 (persistent)
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'stale-value' },
+        cookieFile: tmpFile,
+      });
+      await expect(client.get('/sap/bc/adt/programs/programs/ZTEST/source/main')).rejects.toThrow();
+
+      // After persistent 401 in cookie-auth mode: cookies cleared, flag set.
+      expect((client as any).config.cookies).toEqual({});
+      expect((client as any).cookiesCleared).toBe(true);
+    });
+
+    it('reloads cookies from file on the next request after clearing', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'fresh-value' });
+      // Pre-set the client into cleared state.
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: {},
+        cookieFile: tmpFile,
+      });
+      (client as any).cookiesCleared = true;
+      (client as any).csrfToken = 'T';
+
+      await client.get('/sap/bc/adt/discovery');
+
+      // Inspect the fetch call: the Cookie header must contain the reloaded value.
+      const firstCall = mockFetch.mock.calls[0];
+      expect(firstCall).toBeDefined();
+      if (!firstCall) throw new Error('Expected a fetch call');
+      const headers = (firstCall[1] as RequestInit).headers as Record<string, string>;
+      expect(headers.Cookie).toContain('MYSAPSSO2=fresh-value');
+      // After reload, the cleared flag is reset.
+      expect((client as any).cookiesCleared).toBe(false);
+      // config.cookies has the reloaded entry.
+      expect((client as any).config.cookies).toEqual({ MYSAPSSO2: 'fresh-value' });
+    });
+
+    it('reloads a rotated cookie file before the 401 retry, so the retry recovers in place', async () => {
+      const fs = require('node:fs');
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'dead-value' });
+
+      // First GET → 401. The cookie file is rotated out-of-band while that
+      // request is in flight (an operator re-running `arc1-cli extract-cookies`,
+      // or a scheduled refresh job). The retry must pick the rotated ticket up
+      // instead of replaying the dead one and spending the call.
+      mockFetch.mockImplementationOnce(() => {
+        fs.writeFileSync(
+          tmpFile,
+          '# Netscape HTTP Cookie File\nsap.example.com\tFALSE\t/\tFALSE\t0\tMYSAPSSO2\tfresh-value\n',
+        );
+        return Promise.resolve(mockResponse(401, 'Unauthorized'));
+      });
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'dead-value' },
+        cookieFile: tmpFile,
+      });
+
+      await client.get('/sap/bc/adt/discovery');
+
+      const retryHeaders = fetchHeaders(1);
+      expect(retryHeaders.Cookie).toContain('MYSAPSSO2=fresh-value');
+      expect(retryHeaders.Cookie).not.toContain('dead-value');
+      // Recovered within the same call — nothing left marked for a later reload.
+      expect((client as any).cookiesCleared).toBe(false);
+    });
+
+    it('cookieString-only: a session-timeout 401 still retries with the configured ticket', async () => {
+      // No file to re-read, so the pre-retry reload must not touch config.cookies —
+      // otherwise an ordinary work-process timeout (ticket still valid) becomes a
+      // permanent auth failure instead of the retry it exists to be.
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'still-valid' },
+        cookieString: 'MYSAPSSO2=still-valid',
+      });
+
+      await client.get('/sap/bc/adt/discovery');
+
+      expect(fetchHeaders(1).Cookie).toContain('MYSAPSSO2=still-valid');
+      expect((client as any).config.cookies).toEqual({ MYSAPSSO2: 'still-valid' });
+    });
+
+    it('cookieFile unreadable at retry time: the retry keeps the in-memory ticket', async () => {
+      // A file caught mid-rotation (truncate-then-write) or simply missing must
+      // leave config.cookies alone — reloadCookiesFromSource is safe-on-failure and
+      // the retry has to fall back to replaying the ticket it already has.
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'still-valid' },
+        cookieFile: '/tmp/arc1-cookie-file-that-does-not-exist.txt',
+      });
+
+      await client.get('/sap/bc/adt/discovery');
+
+      expect(fetchHeaders(1).Cookie).toContain('MYSAPSSO2=still-valid');
+    });
+
+    it('warns and skips reload when only cookieString is configured (no cookieFile)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const warnSpy = vi.spyOn((await import('../../../src/server/logger.js')).logger, 'warn');
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'stale' },
+        cookieString: 'MYSAPSSO2=stale',
+      });
+      (client as any).cookiesCleared = true;
+      (client as any).csrfToken = 'T';
+
+      await client.get('/sap/bc/adt/discovery');
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SAP_COOKIE_STRING cannot be refreshed'));
+      // Cleared flag is still reset (one-shot semantics).
+      expect((client as any).cookiesCleared).toBe(false);
+      // config.cookies is unchanged (no source to reload from).
+      expect((client as any).config.cookies).toEqual({ MYSAPSSO2: 'stale' });
+      warnSpy.mockRestore();
+    });
+
+    it('warns when cookieFile reload returns empty result', async () => {
+      tmpFile = writeNetscapeCookieFile({}); // Empty cookie file (only the header comment)
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const warnSpy = vi.spyOn((await import('../../../src/server/logger.js')).logger, 'warn');
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { OLD: 'x' },
+        cookieFile: tmpFile,
+      });
+      (client as any).cookiesCleared = true;
+      (client as any).csrfToken = 'T';
+
+      await client.get('/sap/bc/adt/discovery');
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Cookie reload returned empty result'));
+      // config.cookies should be left unchanged on empty reload.
+      expect((client as any).config.cookies).toEqual({ OLD: 'x' });
+      warnSpy.mockRestore();
+    });
+
+    it('warns when cookieFile is unreadable (path does not exist)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const warnSpy = vi.spyOn((await import('../../../src/server/logger.js')).logger, 'warn');
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { OLD: 'x' },
+        cookieFile: '/no/such/path/that/exists.txt',
+      });
+      (client as any).cookiesCleared = true;
+      (client as any).csrfToken = 'T';
+
+      await client.get('/sap/bc/adt/discovery');
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to reload cookies from source'),
+        expect.any(Object),
+      );
+      // config.cookies left unchanged.
+      expect((client as any).config.cookies).toEqual({ OLD: 'x' });
+      warnSpy.mockRestore();
+    });
+
+    it('clears cookies in HTML-login fallback when in cookie-auth mode', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'stale' });
+      // 200 with HTML body that looks like a login page.
+      const loginHtml = '<html><head><title>Logon Error Message</title></head><body>Logon ticket invalid</body></html>';
+      mockFetch.mockResolvedValueOnce(mockResponse(200, loginHtml, { 'content-type': 'text/html' }));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'stale' },
+        cookieFile: tmpFile,
+      });
+      (client as any).csrfToken = 'T';
+
+      await expect(client.get('/sap/bc/adt/discovery')).rejects.toThrow();
+
+      expect((client as any).config.cookies).toEqual({});
+      expect((client as any).cookiesCleared).toBe(true);
+    });
+
+    it('does NOT clear cookies on 401 when not in cookie-auth mode (basic auth)', async () => {
+      // Persistent 401 with basic auth — should not clear anything cookie-related.
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { OLD: 'x' },
+      });
+      await expect(client.get('/sap/bc/adt/programs/programs/ZTEST/source/main')).rejects.toThrow();
+
+      expect((client as any).config.cookies).toEqual({ OLD: 'x' });
+      expect((client as any).cookiesCleared).toBe(false);
+    });
+
+    // ─── P1: cookieJar + csrfToken cleared alongside config.cookies ─────
+    // Without this, the cookieJar (populated from response Set-Cookie headers
+    // during the failed login round-trip) would override the freshly-reloaded
+    // SAP_COOKIE_FILE values on the next request — see codex review of PR #200.
+    it('clears cookieJar and csrfToken on persistent 401 (P1: jar leak fix)', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'fresh' });
+      // First GET → 401 with a Set-Cookie that lands in the jar; retry → 401 again.
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(401, 'Unauthorized', {}, ['SAP_SESSIONID_NPL_001=stale-jar-cookie; path=/']),
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse(401, 'Unauthorized'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'old' },
+        cookieFile: tmpFile,
+      });
+      // Pre-set a CSRF token to verify it's cleared.
+      (client as any).csrfToken = 'STALE_CSRF';
+      await expect(client.get('/sap/bc/adt/discovery')).rejects.toThrow();
+
+      // All three in-memory copies of the dead session must be cleared.
+      expect((client as any).config.cookies).toEqual({});
+      expect((client as any).cookieJar.size).toBe(0);
+      expect((client as any).csrfToken).toBe('');
+      expect((client as any).cookiesCleared).toBe(true);
+    });
+
+    it('clears cookieJar in HTML-login fallback path (P1)', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'fresh' });
+      const loginHtml = '<html><head><title>Logon Error Message</title></head><body>Logon ticket invalid</body></html>';
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, loginHtml, { 'content-type': 'text/html' }, ['SAP_SESSIONID_X=jar-stale; path=/']),
+      );
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'old' },
+        cookieFile: tmpFile,
+      });
+      (client as any).csrfToken = 'STALE_CSRF';
+      await expect(client.get('/sap/bc/adt/discovery')).rejects.toThrow();
+
+      expect((client as any).config.cookies).toEqual({});
+      expect((client as any).cookieJar.size).toBe(0);
+      expect((client as any).csrfToken).toBe('');
+      expect((client as any).cookiesCleared).toBe(true);
+    });
+
+    // ─── P2: markCookiesStale() public hook for preflight propagation ────
+    it('markCookiesStale() in cookie-auth mode clears jar+config+csrf and arms reload', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'fresh' });
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'old' },
+        cookieFile: tmpFile,
+      });
+      (client as any).cookieJar.set('SAP_SESSIONID_X', 'jar-stale');
+      (client as any).csrfToken = 'STALE_CSRF';
+
+      client.markCookiesStale();
+
+      expect((client as any).config.cookies).toEqual({});
+      expect((client as any).cookieJar.size).toBe(0);
+      expect((client as any).csrfToken).toBe('');
+      expect((client as any).cookiesCleared).toBe(true);
+    });
+
+    it('markCookiesStale() is a no-op when not in cookie-auth mode', async () => {
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        cookies: { MYSAPSSO2: 'old' },
+      });
+      (client as any).csrfToken = 'CSRF';
+
+      client.markCookiesStale();
+
+      // Basic-auth mode: nothing changes.
+      expect((client as any).config.cookies).toEqual({ MYSAPSSO2: 'old' });
+      expect((client as any).csrfToken).toBe('CSRF');
+      expect((client as any).cookiesCleared).toBe(false);
+    });
+
+    it('after markCookiesStale + reload, request emits ONLY fresh cookies (jar does not leak)', async () => {
+      tmpFile = writeNetscapeCookieFile({ MYSAPSSO2: 'fresh-from-file' });
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        username: undefined,
+        password: undefined,
+        cookies: { MYSAPSSO2: 'stale-config' },
+        cookieFile: tmpFile,
+      });
+      // Simulate a leftover jar entry that codex's bug would have re-emitted.
+      (client as any).cookieJar.set('MYSAPSSO2', 'stale-jar');
+      (client as any).csrfToken = 'T';
+
+      client.markCookiesStale();
+      await client.get('/sap/bc/adt/discovery');
+
+      const firstCall = mockFetch.mock.calls[0];
+      expect(firstCall).toBeDefined();
+      if (!firstCall) throw new Error('Expected a fetch call');
+      const headers = (firstCall[1] as RequestInit).headers as Record<string, string>;
+      // Only the fresh value from the file — no stale-config, no stale-jar.
+      expect(headers.Cookie).toBe('MYSAPSSO2=fresh-from-file');
+      expect(headers.Cookie).not.toContain('stale-config');
+      expect(headers.Cookie).not.toContain('stale-jar');
+    });
+  });
+
+  describe('W3C trace context propagation', () => {
+    const TRACEPARENT = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+
+    it('forwards the caller trace context to SAP', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      await requestContext.run({ requestId: 'REQ-1', traceparent: TRACEPARENT, tracestate: 'rojo=1' }, () =>
+        client.get('/path'),
+      );
+
+      expect(fetchHeaders(0).traceparent).toBe(TRACEPARENT);
+      expect(fetchHeaders(0).tracestate).toBe('rojo=1');
+    });
+
+    it('sends no trace headers when the caller supplied none — ARC-1 never originates a trace', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      await requestContext.run({ requestId: 'REQ-2' }, () => client.get('/path'));
+
+      expect(fetchHeaders(0).traceparent).toBeUndefined();
+      expect(fetchHeaders(0).tracestate).toBeUndefined();
+    });
+
+    it('sends no trace headers outside a request context (CLI / startup probe)', async () => {
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'ok'));
+      const client = new AdtHttpClient(getDefaultConfig());
+
+      await client.get('/path');
+
+      expect(fetchHeaders(0).traceparent).toBeUndefined();
+    });
+
+    it('forwards trace context through the Cloud Connector proxy branch too', async () => {
+      mockClientRequest.mockResolvedValueOnce(mockClientResponse(200, 'ok'));
+      const client = new AdtHttpClient({
+        ...getDefaultConfig(),
+        btpProxy: {
+          host: 'proxy.example.com',
+          port: 20003,
+          protocol: 'http',
+          getProxyToken: async () => 'proxy-token',
+        },
+      });
+
+      await requestContext.run({ requestId: 'REQ-3', traceparent: TRACEPARENT }, () => client.get('/path'));
+
+      expect(clientRequestHeaders(0).traceparent).toBe(TRACEPARENT);
+    });
+  });
+});

@@ -1,0 +1,197 @@
+/**
+ * SAPNavigate handler — code navigation (go-to-definition, references, where-used, completion,
+ * interface implementers, method surgery).
+ */
+
+import type { AdtClient } from '../adt/client.js';
+import { findDefinition, getCompletion } from '../adt/codeintel.js';
+import { DataSourcePolicyError } from '../adt/data-source-policy.js';
+import { AdtApiError } from '../adt/errors.js';
+import { internalOperationDenial } from '../adt/internal-data-operations.js';
+import { isOperationAllowed, OperationType } from '../adt/safety.js';
+import type { ClassHierarchy } from '../adt/types.js';
+import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
+import { lookupLiveUsages, resolveWhereUsedUri } from './where-used.js';
+
+// ─── SAPNavigate Handler ─────────────────────────────────────────────
+
+export async function handleSAPNavigate(
+  client: AdtClient,
+  args: Record<string, unknown>,
+  minimalErrors: boolean,
+): Promise<ToolResult> {
+  const action = String(args.action ?? '');
+  let uri = String(args.uri ?? '');
+  const line = Number(args.line ?? 1);
+  const column = Number(args.column ?? 1);
+  const source = String(args.source ?? '');
+
+  // Allow symbolic type+name as alternative to uri for references
+  if (action !== 'definition' && !uri && args.type && args.name) {
+    const symName = String(args.name);
+    uri = (await resolveWhereUsedUri(client, String(args.type), symName)) ?? '';
+    if (!uri) {
+      return errorResult(
+        `Cannot resolve function group for "${symName}". Provide the full uri parameter, or use SAPSearch("${symName}") to find the ADT URI.`,
+      );
+    }
+  }
+
+  switch (action) {
+    case 'definition': {
+      if (!uri) {
+        return errorResult('Provide uri pointing to the source (e.g. /source/main) for definition lookup.');
+      }
+      // SAP resolves the position against the posted text: without it the answer is empty.
+      if (
+        args.line === undefined ||
+        args.column === undefined ||
+        !Number.isInteger(line) ||
+        line < 1 ||
+        !Number.isInteger(column) ||
+        column < 0 ||
+        !source.trim()
+      ) {
+        return errorResult(
+          'Definition lookup needs line, column and source: pass current source text and integer ADT cursor coordinates (line >= 1, column >= 0).',
+        );
+      }
+      const result = await findDefinition(client.http, client.safety, uri, line, column, source);
+      if (!result) {
+        return textResult('No definition found at this position.');
+      }
+      return textResult(toolJson(result));
+    }
+    case 'references': {
+      if (!uri) {
+        return errorResult('Provide uri or type+name to find references.');
+      }
+      // objectType keeps its slash format (CLAS/OC, PROG/P) — do NOT normalize; the suffix is
+      // semantically meaningful. Filtering happens client-side (SAP ignores objectTypeFilter).
+      const objectType = args.objectType ? String(args.objectType) : undefined;
+      const maxResults = args.maxResults === undefined ? undefined : Number(args.maxResults);
+      const lookup = await lookupLiveUsages(client, uri, objectType, maxResults);
+      const { results, total, truncated } = lookup;
+
+      // No early text return for the empty case: a consumer that parses the envelope would throw on
+      // "No references found.", and `total: 0` is the honest answer to "how many reference this?".
+      return textResult(
+        toolJson({
+          total,
+          countMeaning: 'Reference entries, not distinct objects or runtime calls; not a complete inventory.',
+          shown: results.length,
+          truncated,
+          ...(lookup.warning ? { warning: lookup.warning } : {}),
+          ...(truncated
+            ? {
+                hint:
+                  `Showing ${results.length} of ${total} references. ` +
+                  (objectType?.trim()
+                    ? 'Object-type filter already applied. Raise '
+                    : 'Narrow with objectType (e.g. "CLAS/OC") or raise ') +
+                  'maxResults (max 1000) only if more entries are needed.',
+              }
+            : {}),
+          references: results,
+        }),
+      );
+    }
+    case 'completion': {
+      const proposals = await getCompletion(client.http, client.safety, uri, line, column, source);
+      return textResult(toolJson(proposals));
+    }
+    case 'hierarchy': {
+      const className = String(args.name ?? '').toUpperCase();
+      if (!className) {
+        return errorResult('Provide name (class name) for hierarchy lookup.');
+      }
+      // Sanitize to prevent SQL injection — class names are alphanumeric + underscore + namespace slash
+      const safeName = className.replace(/[^A-Z0-9_/]/g, '');
+      if (safeName !== className) {
+        return errorResult(
+          `Invalid class name: "${className}". Only alphanumeric characters, underscores, and slashes are allowed.`,
+        );
+      }
+
+      const canFreeSQL = isOperationAllowed(client.safety, OperationType.FreeSQL);
+      const canQuery = isOperationAllowed(client.safety, OperationType.Query);
+
+      if (!canFreeSQL && !canQuery) {
+        return errorResult(
+          'Class hierarchy requires data access permissions. ' +
+            'Enable free SQL (SAP_ALLOW_FREE_SQL=true / --allow-free-sql=true) or table preview ' +
+            '(SAP_ALLOW_DATA_PREVIEW=true / --allow-data-preview=true), and grant the matching sql/data scope in HTTP auth mode. ' +
+            'Without changing permissions, use SAPRead on the class MAIN source with grep="INTERFACES|INHERITING" for declarations; this does not enumerate subclasses.',
+        );
+      }
+
+      try {
+        let ownRels: { columns: string[]; rows: Record<string, string>[] };
+        let subRels: { columns: string[]; rows: Record<string, string>[] };
+
+        if (canFreeSQL) {
+          ownRels = await client.runQuery(
+            `SELECT CLSNAME, REFCLSNAME, RELTYPE FROM SEOMETAREL WHERE CLSNAME = '${safeName}'`,
+            100,
+          );
+          subRels = await client.runQuery(
+            `SELECT CLSNAME FROM SEOMETAREL WHERE REFCLSNAME = '${safeName}' AND RELTYPE = '2'`,
+            100,
+          );
+        } else {
+          // Structured query rather than getTableContents(sqlFilter): the filtered DDIC preview is a
+          // condition language outside the analyzed subset and is refused whenever the blocklist is
+          // active. This is the supported path and expresses the same restriction.
+          ownRels = await client.runTableQuery('SEOMETAREL', {
+            columns: ['CLSNAME', 'REFCLSNAME', 'RELTYPE'],
+            where: [{ field: 'CLSNAME', op: '=', value: safeName }],
+            maxRows: 100,
+          });
+          subRels = await client.runTableQuery('SEOMETAREL', {
+            columns: ['CLSNAME', 'REFCLSNAME', 'RELTYPE'],
+            where: [
+              { field: 'REFCLSNAME', op: '=', value: safeName },
+              { field: 'RELTYPE', op: '=', value: '2' },
+            ],
+            maxRows: 100,
+          });
+        }
+
+        let superclass: string | null = null;
+        const interfaces: string[] = [];
+        for (let i = 0; i < ownRels.rows.length; i++) {
+          const row = ownRels.rows[i]!;
+          const reltype = String(row.RELTYPE ?? '').trim();
+          const refName = String(row.REFCLSNAME ?? '').trim();
+          if (reltype === '2') {
+            superclass = refName;
+          } else if (reltype === '1') {
+            interfaces.push(refName);
+          }
+        }
+
+        const subclasses: string[] = [];
+        for (let i = 0; i < subRels.rows.length; i++) {
+          subclasses.push(String(subRels.rows[i]!.CLSNAME ?? '').trim());
+        }
+
+        const result: ClassHierarchy = { className: safeName, superclass, interfaces, subclasses };
+        return textResult(toolJson(result));
+      } catch (err) {
+        // Core dependency: name the affected feature and the alternative rather than letting a bare
+        // policy error reach the model without context.
+        if (err instanceof DataSourcePolicyError) {
+          return errorResult(internalOperationDenial('class_hierarchy', err, minimalErrors));
+        }
+        if (err instanceof AdtApiError && err.statusCode === 404) {
+          return errorResult('Cannot query SEOMETAREL — table may not be accessible on this system.');
+        }
+        throw err;
+      }
+    }
+    default:
+      return errorResult(
+        `Unknown SAPNavigate action: ${action}. Supported: definition, references, completion, hierarchy`,
+      );
+  }
+}

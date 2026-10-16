@@ -1,0 +1,1179 @@
+import { handleSAPCustomizing } from './customizing.js';
+/**
+ * handleToolCall — the intent dispatcher for ARC-1.
+ *
+ * Runs the per-call pipeline (rate-limit → scope → deny-actions → Zod → route to one of the 12
+ * tool handlers → audit) and owns the LLM-facing error-formatting tree.
+ */
+
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { AdtClient } from '../adt/client.js';
+import { DataSourcePolicyError } from '../adt/data-source-policy.js';
+import {
+  AdtApiError,
+  AdtError,
+  AdtNetworkError,
+  AdtResponseLimitError,
+  AdtSafetyError,
+  classifySapDomainError,
+} from '../adt/errors.js';
+import { AdtAnalysisDeadlineError, AdtRequestBudgetError } from '../adt/request-attempt-budget.js';
+/**
+ * Scope required for each tool.
+ *
+ * Scope enforcement is ADDITIVE to the safety system:
+ * - Safety system (allowWrites, allowedPackages, etc.) gates operations at the ADT client level
+ * - Scopes gate operations at the MCP tool level (only enforced when authInfo is present)
+ * - Both must pass for an operation to succeed
+ *
+ * A user with `write` scope but `allowWrites=false` in config still can't write.
+ *
+ * Scope lookup and implication rules are defined in `src/authz/policy.ts` (ACTION_POLICY,
+ * getActionPolicy, hasRequiredScope). This module routes through them.
+ */
+import { getActionPolicy, hasRequiredScope as hasScopeHelper, invocationPolicyKey } from '../authz/policy.js';
+import type { CachingLayer } from '../cache/caching-layer.js';
+import { type RegistryEntry, type ToolDispatchContext, ToolRegistry } from '../registry/tool-registry.js';
+import { sanitizeArgs } from '../server/audit.js';
+import { generateRequestId, getCurrentContext, requestContext } from '../server/context.js';
+import { logger } from '../server/logger.js';
+import { type McpRateLimiter, resolveRateLimitUserKey } from '../server/mcp-rate-limit.js';
+import { formatClientInfo } from '../server/trace-context.js';
+import type { ServerConfig } from '../server/types.js';
+import { handleSAPActivate } from './activate.js';
+import { buildCacheSecurityContext, invalidateInactiveList } from './cache-security.js';
+import { handleSAPContext } from './context.js';
+import { handleSAPDiagnose } from './diagnose.js';
+import { getCachedFeatures } from './feature-cache.js';
+import { handleSAPGit } from './git.js';
+import { expandHyperfocusedArgs } from './hyperfocused.js';
+import { handleSAPLint } from './lint.js';
+import { handleSAPManage } from './manage.js';
+import { handleSAPNavigate } from './navigate.js';
+import { canonicalTablType, normalizeObjectType, normalizeTypeArgsForValidation } from './object-types.js';
+import { handleSAPQuery } from './query.js';
+import { handleSAPRead } from './read.js';
+import { getToolSchema } from './schemas.js';
+import { handleSAPSearch } from './search.js';
+import { errorResult, hasSqlParserSignature, type ToolResult, toolJson } from './shared.js';
+import { handleSAPTransport } from './transport.js';
+import { handleSAPWrite } from './write.js';
+import { formatZodError } from './zod-errors.js';
+
+/**
+ * Back-compat re-export of a tool→scope map derived from ACTION_POLICY.
+ * New code should use `getActionPolicy(tool, action)` directly.
+ */
+export const TOOL_SCOPES: Record<string, string> = Object.fromEntries(
+  [
+    'SAPRead',
+    'SAPSearch',
+    'SAPQuery',
+    'SAPGit',
+    'SAPNavigate',
+    'SAPContext',
+    'SAPLint',
+    'SAPDiagnose',
+    'SAPWrite',
+    'SAPActivate',
+    'SAPManage',
+    'SAPTransport',
+    'SAPCustomizing',
+  ].map((t) => [t, getActionPolicy(t)?.scope ?? 'read']),
+);
+
+/**
+ * Check if authInfo has the required scope, routing through policy.hasRequiredScope.
+ */
+export function hasRequiredScope(authInfo: AuthInfo, requiredScope: string): boolean {
+  return hasScopeHelper(
+    authInfo.scopes,
+    requiredScope as 'read' | 'write' | 'data' | 'sql' | 'transports' | 'git' | 'admin',
+  );
+}
+
+const DDIC_SAVE_HINT_TYPES = new Set(['TABL', 'DDLS', 'DCLS', 'BDEF', 'SRVD', 'SRVB', 'DDLX', 'DOMA', 'DTEL']);
+const DATA_PREVIEW_COLLECTION_PATHS = new Set(['/sap/bc/adt/datapreview/freestyle', '/sap/bc/adt/datapreview/ddic']);
+
+function isPossibleDataPreviewWafBlock(err: AdtApiError, tool: string, args: Record<string, unknown>): boolean {
+  if (err.statusCode !== 403) return false;
+  const collectionPath = err.path.split(/[?#]/, 1)[0] ?? '';
+  if (!DATA_PREVIEW_COLLECTION_PATHS.has(collectionPath)) return false;
+  if (collectionPath === '/sap/bc/adt/datapreview/ddic') {
+    const isFilteredTableContents =
+      tool === 'SAPRead' &&
+      canonicalTablType(String(args.type ?? '').toUpperCase()) === 'TABLE_CONTENTS' &&
+      typeof args.sqlFilter === 'string' &&
+      args.sqlFilter.trim().length > 0;
+    if (!isFilteredTableContents) return false;
+  }
+
+  const body = (err.responseBody ?? '').trim();
+  return body === '' || /^(?:403\s+)?forbidden\.?$/i.test(body);
+}
+
+function formatPossibleDataPreviewWafBlock(err: AdtApiError, minimalErrors: boolean): string {
+  const prefix = minimalErrors
+    ? 'ADT API error: status 403. Use the request ID to correlate server-side audit and gateway logs.'
+    : err.message;
+  return (
+    `${prefix}\n\nHint: This bare 403 on an ADT data-preview endpoint is a possible upstream WAF/body inspection ` +
+    'block or a rejected CSRF/session pair, not proof of an SAP authorization failure. Compare an unfiltered ' +
+    'TABLE_CONTENTS call and inspect gateway logs for the matched rule. Prefer a scoped WAF rule exclusion. If ' +
+    'the security owner approves sending these request bodies as compressed content, set ' +
+    'SAP_GZIP_DATAPREVIEW_BODY=true as a compatibility fallback.'
+  );
+}
+
+function getWriteInfrastructureHint(err: AdtApiError, tool: string, args: Record<string, unknown>): string | undefined {
+  if (tool !== 'SAPWrite') return undefined;
+  const action = String(args.action ?? '').toLowerCase();
+  if (!['create', 'update', 'batch_create', 'edit_method', 'edit_unit', 'add_unit', 'delete'].includes(action))
+    return undefined;
+
+  // These failures happen around ADT session management, often after SAP has
+  // already accepted a mutation. They need cleanup guidance, not DDIC syntax hints.
+  const combined = `${err.message}\n${err.responseBody ?? ''}\n${err.path}`.toLowerCase();
+  const failedDuringCsrfFetch = err.path.includes('/sap/bc/adt/core/discovery') || combined.includes('no csrf token');
+  const failedDuringUnlock = combined.includes('_action=unlock');
+  const serviceRoutingFailure = combined.includes('service cannot be reached');
+  if (!failedDuringCsrfFetch && !failedDuringUnlock && !serviceRoutingFailure) return undefined;
+
+  return (
+    'SAP ADT write/session infrastructure failed, not a DDIC source save failure. ' +
+    'The object may have been partially created or changed before the session failed; verify with SAPRead/SAPSearch, ' +
+    'wait briefly, then retry cleanup. If an edit lock remains, release it in ADT/SM12 or ask Basis to clear it.'
+  );
+}
+
+/** Format error messages with LLM-friendly remediation hints */
+function formatErrorForLLM(
+  err: unknown,
+  message: string,
+  tool: string,
+  args: Record<string, unknown>,
+  config: ServerConfig,
+): string {
+  const base = buildBaseErrorMessage(err, message, tool, args, config);
+  // Handler-attached remediation hints (e.g., CDS delete blocker list) always
+  // appear last so the message reads "what happened → diagnostics → how to fix".
+  if (err instanceof AdtError && err.extraHint && !base.includes(err.extraHint)) {
+    return `${base}\n\n${err.extraHint}`;
+  }
+  return base;
+}
+
+function buildBaseErrorMessage(
+  err: unknown,
+  message: string,
+  tool: string,
+  args: Record<string, unknown>,
+  config: ServerConfig,
+): string {
+  if (err instanceof AdtRequestBudgetError || err instanceof AdtAnalysisDeadlineError) return message;
+  if (err instanceof AdtError && err.pluginPostOutcome === 'unknown') {
+    const detail = config.minimalErrors
+      ? err instanceof AdtApiError
+        ? formatMinimalAdtError(err)
+        : 'Extension POST failed. Use the request ID to correlate server-side logs.'
+      : message;
+    return `${detail}\nPOST completion is unconfirmed. Inspect the service's result or business state before retrying. Do not blindly repeat the extension call.`;
+  }
+  if (err instanceof AdtError && err.creationOutcome === 'unknown') {
+    const detail = config.minimalErrors
+      ? err instanceof AdtApiError
+        ? formatMinimalAdtError(err)
+        : 'Create request failed. Use the request ID to correlate server-side logs.'
+      : message;
+    let inspection =
+      'Use SAPRead/SAPSearch to inspect the object identity, package and source, including its inactive version, before updating an existing object.';
+    if (tool === 'SAPTransport') {
+      inspection = 'Use SAPTransport to list requests and inspect their owner, description and contents.';
+    } else if (tool === 'SAPManage' && String(args.action).startsWith('flp_')) {
+      inspection =
+        'Use SAPManage flp_list_catalogs/flp_list_groups/flp_list_tiles to inspect catalogs, groups and catalog tiles. Inspect group membership in SAP Fiori Launchpad Designer.';
+    }
+    return `${detail}\nCreate completion is unconfirmed. ${inspection} Do not blindly repeat create.`;
+  }
+  if (err instanceof AdtResponseLimitError && err.endpointFamily === 'repository-relations') {
+    return `${message} Reduce depth or choose a smaller root. maxResults does not reduce SAP's native response size. This is an analysis limit, not a connectivity failure.`;
+  }
+  if (err instanceof AdtResponseLimitError) {
+    const mebibytes = err.limitBytes / (1024 * 1024);
+    const displayLimit = Number.isInteger(mebibytes) ? `${mebibytes} MiB` : `${err.limitBytes}-byte`;
+    return toolJson({
+      error: err.code,
+      message:
+        `The SAP data-preview result exceeded the ${displayLimit} server limit. ` +
+        'Submit a new request with lower maxRows, fewer columns, or a restrictive non-overlapping key-range WHERE clause.',
+      limitBytes: err.limitBytes,
+      retryable: false,
+      requestId: err.requestId ?? getCurrentContext()?.requestId,
+      ...(config.targetId ? { target: config.targetId } : {}),
+    });
+  }
+  if (
+    tool === 'SAPActivate' &&
+    args.action === 'publish_srvb' &&
+    (err instanceof AdtNetworkError || (err instanceof AdtApiError && (err.statusCode === 429 || err.isServerError)))
+  ) {
+    const detail = config.minimalErrors
+      ? err instanceof AdtApiError
+        ? formatMinimalAdtError(err)
+        : 'Publish request failed. Use the request ID to correlate server-side logs.'
+      : message;
+    return `${detail}\nPublish completion is unconfirmed. Use SAPRead to verify publication state before another publish.`;
+  }
+  if (err instanceof AdtApiError) {
+    if (
+      tool === 'SAPNavigate' &&
+      args.action === 'relations' &&
+      err.statusCode >= 300 &&
+      err.statusCode < 400 &&
+      err.statusCode !== 304
+    ) {
+      return 'Bounded live relations do not follow HTTP redirects. Use an authenticated SAP session or a direct ADT destination; check SAML/SSO and reverse-proxy routing. Do not disable TLS verification.';
+    }
+    if (isPossibleDataPreviewWafBlock(err, tool, args)) {
+      return formatPossibleDataPreviewWafBlock(err, config.minimalErrors);
+    }
+    if (err.diagnosticsOmitted) {
+      const detail = config.minimalErrors ? formatMinimalAdtError(err) : message;
+      const statusHint =
+        err.isUnauthorized || err.isForbidden
+          ? ' Ask the operator to check SAP authentication, authorizations, and session state.'
+          : '';
+      return `${detail}\n\nHint: ARC-1 omitted the diagnostic for credential safety. Inspect the full message in SAP; retrying cannot recover omitted detail.${statusHint}`;
+    }
+    if (config.minimalErrors) return formatMinimalAdtError(err);
+
+    // Append additional SAP messages (line numbers, secondary errors) if available
+    const enriched = enrichWithSapDetails(err, message);
+    const argType = canonicalTablType(String(args.type ?? '').toUpperCase());
+    // Pass the detected SAP_BASIS release so the 423 lock-handle hint can specialize
+    // (< 7.51 → point at abapfs_extensions; see issue #293). cachedFeatures is set by the
+    // startup probe; config.abapRelease is the manual SAP_ABAP_RELEASE override fallback.
+    const abapRelease = getCachedFeatures()?.abapRelease ?? config.abapRelease;
+    const classification = classifySapDomainError(err.statusCode, err.responseBody, err.path, abapRelease);
+
+    if (classification) {
+      const transactionLine = classification.transaction ? `\nSAP Transaction: ${classification.transaction}` : '';
+      return `${enriched}\n\nHint: ${classification.hint}${transactionLine}`;
+    }
+
+    if (err.isNotFound) {
+      if (err.resourceExistenceAfterDelete === 'exists') {
+        return (
+          `${enriched}\n\n` +
+          "Hint: ARC-1 confirmed this object still existed after SAP rejected DELETE, so this 404 means SAP's delete handler rejected the operation rather than that the object was absent."
+        );
+      }
+      if (err.resourceExistenceAfterDelete === 'unknown') {
+        const name = String(args.name ?? '');
+        return `${enriched}\n\nHint: SAP returned 404 after DELETE, but ARC-1 could not determine whether the object still exists because the follow-up metadata check failed. Use SAPSearch with query "${name}" to verify the current object state before retrying DELETE.`;
+      }
+      const diagnosticsHint = buildDiagnosticsNotFoundHint(tool, args);
+      if (diagnosticsHint) {
+        return `${enriched}\n\nHint: ${diagnosticsHint}`;
+      }
+      const name = String(args.name ?? '');
+      const type = String(args.type ?? '');
+      return `${enriched}\n\nHint: Object "${name}" (type ${type}) was not found. Use SAPSearch with query "${name}" to verify the name exists and check the correct type.`;
+    }
+    if (err.isUnauthorized || err.isForbidden) {
+      if (config.cookieFile || config.cookieString) {
+        return (
+          `${enriched}\n\n` +
+          'Hint: SAP cookies have expired. Ask the user to re-extract cookies ' +
+          'with `arc1-cli extract-cookies`. The next SAP call after extraction ' +
+          'will automatically reload the fresh cookies — no restart needed.'
+        );
+      }
+      return `${enriched}\n\nHint: Authorization error. Check SAP_CLIENT (default: '100'), SAP_USER, and SAP_PASSWORD. The configured SAP user may lack permissions for this object.`;
+    }
+    // Transport / corrNr specific hints
+    const transportHint = getTransportHint(err);
+    if (transportHint) {
+      return `${enriched}\n\nHint: ${transportHint}`;
+    }
+    if (tool === 'SAPRead' && argType === 'TABLE_CONTENTS' && err.statusCode === 400) {
+      const combined = `${err.message}\n${err.responseBody ?? ''}`;
+      if (hasSqlParserSignature(combined)) {
+        return (
+          `${enriched}\n\nHint: TABLE_CONTENTS sqlFilter must be a condition expression only ` +
+          '(no WHERE, no SELECT, no semicolon). Examples: ' +
+          `sqlFilter="MANDT = '100'" or sqlFilter="MATNR LIKE 'Z%'".`
+        );
+      }
+    }
+    if (tool === 'SAPRead' && argType === 'TABLE_QUERY' && err.statusCode === 400) {
+      const combined = `${err.message}\n${err.responseBody ?? ''}`;
+      if (/is invalid here|due to grammar/i.test(combined)) {
+        return (
+          `${enriched}\n\nHint: TABLE_QUERY parser error — check field names match the actual column names ` +
+          'exposed by the table/CDS view (use SAPRead(type="DDLS", include="elements") to inspect CDS view fields). ' +
+          'Also verify value formats (e.g. FiscalPeriod is C(2,0) so use "01" not "001").'
+        );
+      }
+    }
+    const behaviorPoolHint = getBehaviorPoolSaveFailureHint(err, args);
+    if (behaviorPoolHint) {
+      return `${enriched}\n\nHint: ${behaviorPoolHint}`;
+    }
+    const writeInfrastructureHint = getWriteInfrastructureHint(err, tool, args);
+    if (writeInfrastructureHint) {
+      return `${enriched}\n\nHint: ${writeInfrastructureHint}`;
+    }
+    // Save hint — applies to create/update/batch_create/edit_method/edit_unit/add_unit, not delete.
+    // Delete failures on DDIC types have different remediation (dependency resolution, not annotation fixes).
+    const action = String(args.action ?? '').toLowerCase();
+    const isSaveAction =
+      action === '' ||
+      action === 'create' ||
+      action === 'update' ||
+      action === 'batch_create' ||
+      action === 'edit_method' ||
+      action === 'edit_unit' ||
+      action === 'add_unit';
+    if ((err.statusCode === 400 || err.statusCode === 409) && DDIC_SAVE_HINT_TYPES.has(argType) && isSaveAction) {
+      return (
+        `${enriched}\n\nHint: DDIC save failed. Check the diagnostic details above for specific field or annotation errors. ` +
+        'Common fixes: add missing @AbapCatalog annotations, fix field type names, check key field definitions.'
+      );
+    }
+    // Server errors (500, 502, 503, etc.)
+    if (err.isServerError) {
+      // Detect syntax errors in dependent objects (e.g., BDEF syntax errors blocking SRVB activation)
+      const syntaxMatch = err.message.match(/[Ss]yntax error in program (\S+)/);
+      if (syntaxMatch) {
+        const program = syntaxMatch[1].replace(/=+\w*$/, ''); // Strip "====BD" padding
+        return `${enriched}\n\nHint: A dependent object has syntax errors that block this operation. The program "${program}" has syntax errors — fix those first, then retry. Use SAPRead to inspect the object, or SAPDiagnose(action="dumps") for details.`;
+      }
+      return `${enriched}\n\nHint: SAP application server error (${err.statusCode}). This is often transient — wait 10-30 seconds and retry. If the error persists, check SAPDiagnose(action="dumps") for short dumps, or verify the SAP system is responding via SAPRead(type="SYSTEM").`;
+    }
+    return enriched;
+  }
+
+  if (err instanceof AdtSafetyError) {
+    // Minimal mode is a CLIENT disclosure control only: it strips the direct root, the matched rule,
+    // the dependency path and the configuration variable name, while keeping the stable code,
+    // executed=false, the decision id and a safe alternative. The audit event still records the
+    // complete normalized decision either way.
+    if (err instanceof DataSourcePolicyError) return err.clientMessage(config.minimalErrors);
+    const argType = canonicalTablType(String(args.type ?? '').toUpperCase());
+    if (tool === 'SAPRead' && argType === 'TABLE_CONTENTS') {
+      return (
+        `${message}\n\nHint: TABLE_CONTENTS is blocked by safety configuration or missing data scope. ` +
+        'Set SAP_ALLOW_DATA_PREVIEW=true at the server level and, in authenticated HTTP mode, ' +
+        'ensure the token includes data (or sql) scope.'
+      );
+    }
+    return message;
+  }
+
+  if (err instanceof AdtNetworkError) {
+    if (tool === 'SAPRead' && String(args.type ?? '').toUpperCase() === 'SYSTEM') {
+      return (
+        `${message}\n\nHint: Connectivity probe failed. Fix connectivity first, then retry ` +
+        'SAPRead(type="SYSTEM") before running any batch or parallel tool calls.'
+      );
+    }
+    return (
+      `${message}\n\nHint: Cannot reach the SAP system. Run SAPRead(type="SYSTEM") once as a connectivity ` +
+      'probe before retrying batch/parallel calls.'
+    );
+  }
+
+  return message;
+}
+
+function formatMinimalAdtError(err: AdtApiError): string {
+  const classification = classifySapDomainError(err.statusCode, err.responseBody, err.path);
+  const category = classification ? ` Category: ${classification.category}.` : '';
+  return (
+    `ADT API error: status ${err.statusCode}.${category}\n\n` +
+    'Hint: Detailed SAP error text is hidden because ARC1_MINIMAL_ERRORS=true. ' +
+    'Use the request ID to correlate server-side audit and SAP-native logs.'
+  );
+}
+
+function buildDiagnosticsNotFoundHint(tool: string, args: Record<string, unknown>): string | undefined {
+  if (tool !== 'SAPDiagnose') return undefined;
+
+  const action = String(args.action ?? '');
+  const id = String(args.id ?? '').trim();
+  const detailUrl = String(args.detailUrl ?? '').trim();
+
+  if (action === 'dumps' && id) {
+    return `Dump ID "${id}" was not found. Re-list dumps with SAPDiagnose(action="dumps", maxResults=50), then retry with a fresh ID from that list.`;
+  }
+
+  if (action === 'traces' && id) {
+    return `Trace ID "${id}" was not found. Re-list traces with SAPDiagnose(action="traces") and retry using an existing trace ID.`;
+  }
+
+  if (action === 'gateway_errors' && (detailUrl || id)) {
+    return 'Gateway error detail was not found. Re-list SAPDiagnose(action="gateway_errors") and reuse a current detailUrl from the list output.';
+  }
+
+  return undefined;
+}
+
+function buildAuditResultPreview(toolName: string, args: Record<string, unknown>, fullText: string): string {
+  if (toolName === 'SAPCustomizing' || (toolName === 'SAP' && args.action === 'customizing'))
+    return '[REDACTED customising result]';
+  const maxLen = 500;
+  const truncate = (value: string): string => (value.length > maxLen ? `${value.slice(0, maxLen)}...` : value);
+
+  if (toolName !== 'SAPDiagnose') return truncate(fullText);
+
+  const action = String(args.action ?? '');
+  const isDetailDump = action === 'dumps' && Boolean(args.id);
+  const isDetailGateway =
+    action === 'gateway_errors' && (Boolean(args.detailUrl) || (Boolean(args.id) && Boolean(args.errorType)));
+
+  if (!isDetailDump && !isDetailGateway) return truncate(fullText);
+
+  try {
+    const payload = JSON.parse(fullText) as Record<string, unknown>;
+    if (isDetailDump) {
+      const sections =
+        payload.sections && typeof payload.sections === 'object' ? (payload.sections as Record<string, unknown>) : {};
+      const compact = {
+        id: payload.id,
+        error: payload.error,
+        program: payload.program,
+        user: payload.user,
+        timestamp: payload.timestamp,
+        selectedSectionIds: payload.selectedSectionIds,
+        sections: Object.fromEntries(
+          Object.entries(sections).map(([key, value]) => {
+            if (typeof value === 'string') return [key, `[omitted ${value.length} chars]`];
+            return [key, '[omitted]'];
+          }),
+        ),
+        formattedText:
+          typeof payload.formattedText === 'string' ? `[omitted ${payload.formattedText.length} chars]` : undefined,
+      };
+      return truncate(JSON.stringify(compact));
+    }
+
+    if (isDetailGateway && payload.sourceCode && typeof payload.sourceCode === 'object') {
+      const sourceCode = payload.sourceCode as Record<string, unknown>;
+      const lines = Array.isArray(sourceCode.lines) ? sourceCode.lines.length : 0;
+      const compact = {
+        type: payload.type,
+        shortText: payload.shortText,
+        transactionId: payload.transactionId,
+        username: payload.username,
+        dateTime: payload.dateTime,
+        sourceCode: `[omitted ${lines} lines]`,
+        callStackCount: Array.isArray(payload.callStack) ? payload.callStack.length : 0,
+      };
+      return truncate(JSON.stringify(compact));
+    }
+
+    return truncate(JSON.stringify(payload));
+  } catch {
+    return truncate(fullText);
+  }
+}
+
+function resultTextForAuditPreview(toolName: string, content: ToolResult['content']): string {
+  if (content.length <= 1) return content[0]?.text ?? '';
+  // Detailed diagnostic previews parse their JSON before removing large sections.
+  if (toolName === 'SAPDiagnose') return content.map((item) => item.text).join('');
+
+  // Other previews never inspect beyond 500 characters. Avoid concatenating a
+  // potentially large multi-block result merely to truncate it immediately.
+  let prefix = '';
+  for (const item of content) {
+    prefix += item.text.slice(0, 501 - prefix.length);
+    if (prefix.length >= 501) break;
+  }
+  return prefix;
+}
+
+/** Enrich error message with additional SAP XML diagnostic detail (extra messages, properties) */
+function enrichWithSapDetails(err: AdtApiError, message: string): string {
+  if (!err.responseBody) return message;
+
+  const extraMessages = AdtApiError.extractAllMessages(err.responseBody);
+  const props = AdtApiError.extractProperties(err.responseBody);
+
+  const parts: string[] = [message];
+
+  if (extraMessages.length > 0) {
+    parts.push(`\nAdditional detail:\n${extraMessages.map((m) => `  - ${m}`).join('\n')}`);
+  }
+
+  const ddicDiagnostics = AdtApiError.formatDdicDiagnostics(err.responseBody);
+  if (ddicDiagnostics) {
+    parts.push(ddicDiagnostics);
+    // Skip raw Properties dump — DDIC diagnostics already include the structured
+    // T100KEY details (message ID, number, variables, line). Showing both would
+    // triplicate the same information.
+  } else {
+    // Surface line/column info from properties if present (non-DDIC errors only)
+    const lineInfo = props.LINE || props['T100KEY-NO'];
+    if (lineInfo || Object.keys(props).length > 0) {
+      const propStr = Object.entries(props)
+        .slice(0, 5) // Limit to avoid overwhelming output
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
+      if (propStr) parts.push(`Properties: ${propStr}`);
+    }
+  }
+
+  return parts.join('\n');
+}
+
+/** Detect transport/corrNr failure signatures and return a remediation hint, or undefined if not transport-related. */
+function getTransportHint(err: AdtApiError): string | undefined {
+  const body = (err.responseBody ?? '').toLowerCase();
+  // Use the clean SAP error message, NOT err.message which includes the URL path.
+  // The URL path contains `corrNr=<id>` when a transport IS provided, causing false positives
+  // if we check for "corrnr" in the full message string.
+  const cleanMsg = AdtApiError.extractCleanMessage(err.responseBody ?? '').toLowerCase();
+  const combined = `${cleanMsg} ${body}`;
+
+  // Missing or invalid transport/correction number
+  if (
+    combined.includes('correction number') ||
+    combined.includes('corrnr') ||
+    (combined.includes('transport request') &&
+      (combined.includes('missing') || combined.includes('required') || combined.includes('invalid')))
+  ) {
+    return 'A transport/correction number is required but was not provided or is invalid. Provide an explicit "transport" parameter with a valid transport request ID, or check SE09 in SAP GUI that an open transport exists for your user and target package.';
+  }
+
+  // Transport not found or not modifiable
+  if (
+    combined.includes('e070') ||
+    (combined.includes('transport') &&
+      (combined.includes('not found') || combined.includes('does not exist') || combined.includes('not modifiable')))
+  ) {
+    return 'The specified transport request was not found or is not modifiable. Verify the transport ID in SE09, ensure it is not yet released, and that it belongs to the correct user and target package.';
+  }
+
+  // Package / transport layer mismatch
+  if (
+    combined.includes('transport layer') ||
+    (combined.includes('package') &&
+      combined.includes('transport') &&
+      (combined.includes('mismatch') || combined.includes('not assigned') || combined.includes('no transport layer')))
+  ) {
+    return 'The target package has no transport layer or a transport layer mismatch. Check that the package is configured for transport in SE80/TDEVC, or use a local package ($TMP) if no transport is needed.';
+  }
+
+  // Authorization for transport operations
+  if (
+    combined.includes('s_transprt') ||
+    (combined.includes('transport') && (combined.includes('no authorization') || combined.includes('not authorized')))
+  ) {
+    return 'The SAP user lacks transport authorization (S_TRANSPRT). Contact your SAP basis administrator to grant the required transport permissions.';
+  }
+
+  return undefined;
+}
+
+function inferBdefNameFromBehaviorPoolSource(source: string): string | undefined {
+  const match = source.match(/\bfor\s+behavior\s+of\s+([A-Za-z_][\w/]+)/i);
+  return match?.[1];
+}
+
+function getBehaviorPoolSaveFailureHint(err: AdtApiError, args: Record<string, unknown>): string | undefined {
+  const type = normalizeObjectType(String(args.type ?? ''));
+  if (type !== 'CLAS') return undefined;
+
+  const name = String(args.name ?? '');
+  const source = String(args.source ?? '');
+  const clean = AdtApiError.extractCleanMessage(err.responseBody ?? '').toLowerCase();
+  const body = (err.responseBody ?? '').toLowerCase();
+  const isGenericSaveFailure =
+    clean.includes('an error occured during the save operation') ||
+    clean.includes('an error occurred during the save operation') ||
+    body.includes('an error occured during the save operation') ||
+    body.includes('an error occurred during the save operation');
+  if (!isGenericSaveFailure) return undefined;
+
+  const looksLikeBehaviorPool = /\bfor\s+behavior\s+of\b/i.test(source) || /^zbp_/i.test(name) || /^ybp_/i.test(name);
+  if (!looksLikeBehaviorPool) return undefined;
+
+  const inferredBdef = inferBdefNameFromBehaviorPoolSource(source);
+  const bdefHint = inferredBdef ? `, bdefName="${inferredBdef}"` : ', bdefName="<interface_bdef_name>"';
+
+  return (
+    `Behavior-pool class save failed on handler declarations. Use ` +
+    `SAPWrite(action="scaffold_rap_handlers", type="CLAS", name="${name}"${bdefHint}) ` +
+    `to list missing RAP handler signatures, then rerun with autoApply=true to inject declarations. ` +
+    `If SAP still rejects the full-class write, use ADT quick-fix to stamp signatures and continue with SAPWrite(action="edit_method").`
+  );
+}
+
+function classifyError(err: unknown): string {
+  if (err instanceof AdtRequestBudgetError || err instanceof AdtAnalysisDeadlineError) return err.name;
+  if (err instanceof AdtResponseLimitError) return 'AdtResponseLimitError';
+  if (err instanceof AdtApiError) {
+    const classification = classifySapDomainError(err.statusCode, err.responseBody, err.path);
+    return classification ? `AdtApiError:${classification.category}` : 'AdtApiError';
+  }
+  if (err instanceof AdtNetworkError) return 'AdtNetworkError';
+  if (err instanceof DataSourcePolicyError) return `DataSourcePolicyError:${err.code}`;
+  if (err instanceof AdtSafetyError) return 'AdtSafetyError';
+  if (err instanceof Error) return err.constructor.name;
+  return 'Unknown';
+}
+
+// ─── Tool registry (FEAT-61) ─────────────────────────────────────────
+// The 12 built-ins register through the same ToolRegistry that plugin (Custom_*) tools use. Each
+// built-in `invoke` is a thin adapter over its existing handler — the shared pipeline (rate-limit,
+// scope, deny, Zod, audit) stays in handleToolCall; the registry only owns the inner dispatch that
+// used to be a `switch`. See docs/research/2026-06-17-extension-framework-spec.md §4.
+let _toolRegistry: ToolRegistry | undefined;
+
+/** The process-wide tool registry, lazily seeded with the built-ins. Exported for tests. */
+export function getToolRegistry(): ToolRegistry {
+  if (_toolRegistry) return _toolRegistry;
+  const r = new ToolRegistry();
+  const reg = (name: string, invoke: RegistryEntry['invoke']): void => {
+    const policy = getActionPolicy(name);
+    if (!policy) throw new Error(`Built-in tool '${name}' has no ACTION_POLICY entry`);
+    r.register({ name, source: 'builtin', policy, invoke });
+  };
+  reg('SAPRead', (ctx) => handleSAPRead(ctx.client, ctx.args, ctx.cache, ctx.cacheSecurity, ctx.config.minimalErrors));
+  reg('SAPSearch', (ctx) => handleSAPSearch(ctx.client, ctx.args, ctx.config.minimalErrors));
+  reg('SAPQuery', (ctx) => handleSAPQuery(ctx.client, ctx.args, ctx.config.minimalErrors));
+  reg('SAPWrite', (ctx) => handleSAPWrite(ctx.client, ctx.args, ctx.config, ctx.cache, ctx.cacheSecurity));
+  reg('SAPActivate', (ctx) =>
+    handleSAPActivate(ctx.client, ctx.args, ctx.cache, ctx.cacheSecurity, ctx.config.ppEnabled),
+  );
+  reg('SAPNavigate', async (ctx) =>
+    ctx.args.action === 'relations'
+      ? (await import('./live-relations.js')).handleLiveRelations(ctx.client, ctx.config, ctx.args, ctx.cacheSecurity)
+      : handleSAPNavigate(ctx.client, ctx.args, ctx.config.minimalErrors),
+  );
+  reg('SAPLint', (ctx) => handleSAPLint(ctx.client, ctx.args, ctx.config));
+  reg('SAPDiagnose', (ctx) => handleSAPDiagnose(ctx.client, ctx.args, ctx.config.minimalErrors));
+  reg('SAPCustomizing', (ctx) => handleSAPCustomizing(ctx.client, ctx.args, ctx.config));
+  reg('SAPTransport', (ctx) => handleSAPTransport(ctx.client, ctx.args, ctx.config));
+  reg('SAPGit', (ctx) => handleSAPGit(ctx.client, ctx.args, ctx.authInfo));
+  reg('SAPContext', (ctx) => handleSAPContext(ctx.client, ctx.args, ctx.cache, ctx.cacheSecurity));
+  reg('SAPManage', (ctx) => handleSAPManage(ctx.client, ctx.config, ctx.args, ctx.cache, ctx.isPerUserClient));
+  reg('SAP', async (ctx) => {
+    const expanded = expandHyperfocusedArgs(ctx.args);
+    if ('error' in expanded) return errorResult(expanded.error);
+    return handleToolCall(
+      ctx.client,
+      ctx.config,
+      expanded.toolName,
+      expanded.expandedArgs,
+      ctx.authInfo,
+      ctx.server,
+      ctx.cache,
+      ctx.isPerUserClient,
+      undefined,
+      ctx.requestId,
+    );
+  });
+  _toolRegistry = r;
+  return r;
+}
+
+export interface MultiTargetSapFailure {
+  code:
+    | 'CLOUD_CONNECTOR_ACCESS_DENIED'
+    | 'SAP_SERVICE_INACTIVE'
+    | 'SAP_AUTHENTICATION_FAILED'
+    | 'SAP_AUTHORIZATION_DENIED'
+    | 'SAP_REQUEST_FAILED';
+  event?:
+    | 'cloud_connector_access_denied'
+    | 'sap_service_unavailable'
+    | 'sap_authentication_failed'
+    | 'sap_authorization_failed';
+  message: string;
+  retryable?: boolean;
+}
+
+/** Match only the verified plain-text response from the BTP Connectivity proxy. */
+function isCloudConnectorAccessDenied(error: AdtApiError): boolean {
+  if (error.statusCode !== 403 || !error.path.startsWith('/sap/bc/adt')) return false;
+  const body = (error.responseBody ?? '').trim().toLowerCase();
+  return (
+    body.startsWith('access denied to system ') &&
+    body.includes('ensure to expose the system correctly in your cloud connector')
+  );
+}
+
+/** Convert post-PP SAP failures into safe target-aware errors; ambiguous 403 stays authentication. */
+export function classifyMultiTargetSapError(
+  error: AdtApiError | AdtNetworkError,
+  target: string,
+  toolName: string,
+  identity: 'per-user' | 'shared' = 'per-user',
+): MultiTargetSapFailure | undefined {
+  if (error instanceof AdtNetworkError) {
+    return {
+      code: 'SAP_REQUEST_FAILED',
+      message: `ARC-1 could not reach SAP target ${target} while running ${toolName}. Check Cloud Connector and SAP availability, then try again now.`,
+    };
+  }
+  if (isCloudConnectorAccessDenied(error)) {
+    return {
+      code: 'CLOUD_CONNECTOR_ACCESS_DENIED',
+      event: 'cloud_connector_access_denied',
+      message:
+        identity === 'shared'
+          ? `Cloud Connector does not expose or allow target ${target}. Ask the BTP/Cloud Connector administrator to make the destination virtual host and port match the reviewed Basic OnPremise mapping and allow the required ADT paths. Do not retry automatically; retry only after the administrator confirms the repair.`
+          : `Cloud Connector does not expose or allow target ${target}. Ask the BTP/Cloud Connector administrator to make the destination virtual host and port match the Principal Propagation HTTPS/X.509 mapping and allow the required ADT paths. Do not retry automatically; retry only after the administrator confirms the repair.`,
+    };
+  }
+  const classification = classifySapDomainError(error.statusCode, error.responseBody, error.path);
+  if (classification?.category === 'icf-service-inactive') {
+    return {
+      code: 'SAP_SERVICE_INACTIVE',
+      event: 'sap_service_unavailable',
+      message: `An SAP service required by ${toolName} is inactive for target ${target}. Ask the SAP administrator to activate it. Do not retry automatically; retry only after the administrator confirms the repair.`,
+    };
+  }
+  if (classification?.category === 'authorization') {
+    return {
+      code: 'SAP_AUTHORIZATION_DENIED',
+      event: 'sap_authorization_failed',
+      message:
+        identity === 'shared'
+          ? `SAP denied this operation for the shared technical user on target ${target}. Ask an SAP administrator to grant only the required read authorization before trying again.`
+          : `SAP denied this operation for the propagated user on target ${target}. Grant the required SAP authorization, then try again now.`,
+      retryable: identity !== 'shared',
+    };
+  }
+  if (error.statusCode === 401 || (error.statusCode === 403 && identity === 'per-user')) {
+    return {
+      code: 'SAP_AUTHENTICATION_FAILED',
+      event: 'sap_authentication_failed',
+      message:
+        identity === 'shared'
+          ? `SAP rejected the shared technical credentials for target ${target}. ARC-1 will not retry this credential generation for 15 minutes to reduce account-lockout risk. An administrator should update the destination User/Password; an unchanged credential may be attempted once again after the block expires or ARC-1 restarts.`
+          : `SAP authentication failed for target ${target} after principal propagation. Fix the user mapping, login, or PP setup, then try again now.`,
+      retryable: identity !== 'shared',
+    };
+  }
+  if (error.statusCode === 403) {
+    return {
+      code: 'SAP_REQUEST_FAILED',
+      message: `Target ${target} returned an unclassified forbidden response while running ${toolName}. ARC-1 did not treat it as a rejected shared credential generation. Ask an administrator to check SAP service authorization and Cloud Connector configuration. Do not retry automatically; retry only after the administrator confirms the repair.`,
+      retryable: true,
+    };
+  }
+  if (error.isServerError) {
+    return {
+      code: 'SAP_REQUEST_FAILED',
+      message: `SAP target ${target} returned a server error while running ${toolName}. Retry once; if it persists, check SAP health and short dumps.`,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * Handle an MCP tool call.
+ *
+ * @param authInfo - Authenticated user context from MCP SDK (XSUAA/OIDC/API key).
+ *   When present, scope enforcement is active. When absent (stdio, no auth),
+ *   all tools are allowed (backward compatibility).
+ * @param server - MCP Server instance for elicitation support.
+ */
+export async function handleToolCall(
+  client: AdtClient,
+  config: ServerConfig,
+  toolName: string,
+  args: Record<string, unknown>,
+  authInfo?: AuthInfo,
+  _server?: Server,
+  cachingLayer?: CachingLayer,
+  isPerUserClient?: boolean,
+  mcpRateLimiter?: McpRateLimiter,
+  requestId?: string,
+  /** Request-local guard that may replace a handler result before the terminal audit event. */
+  postDispatchResult?: () => ToolResult | undefined,
+  /** MCP caller cancellation; nested dispatch inherits it through RequestContext. */
+  signal?: AbortSignal,
+): Promise<ToolResult> {
+  const reqId = requestId ?? generateRequestId();
+  const start = Date.now();
+
+  // Build user context for audit logging
+  const user = authInfo?.extra?.userName as string | undefined;
+  const clientId = authInfo?.clientId;
+  const identity = config.targetId ? (config.ppEnabled ? 'per-user' : 'shared') : undefined;
+  // For plugin (Custom_*) tools, tag every audit event with the contributing plugin (spec §9).
+  const pluginName = getToolRegistry().get(toolName)?.pluginName;
+  // Which agent acted, for audit attribution. The MCP handshake identifies the client precisely,
+  // but only on a persistent connection (stdio) — stateless HTTP builds a fresh Server per request
+  // that never saw `initialize`, so there we inherit the User-Agent captured at the HTTP edge.
+  const inherited = getCurrentContext();
+  const clientAgent = formatClientInfo(_server?.getClientVersion()) ?? inherited?.clientAgent;
+
+  // Emit tool_call_start audit event. clientAgent is explicit here because the request context
+  // below opens after this event — on stdio there is no outer context to inherit it from.
+  logger.emitAudit({
+    timestamp: new Date().toISOString(),
+    level: 'info',
+    event: 'tool_call_start',
+    destination: config.targetId ? undefined : config.destinationName,
+    target: config.targetId,
+    identity,
+    requestId: reqId,
+    user,
+    clientId,
+    clientAgent,
+    tool: toolName,
+    pluginName,
+    args:
+      toolName === 'SAPCustomizing' || (toolName === 'SAP' && args.action === 'customizing')
+        ? { action: args.action, payload: '[REDACTED customising input]' }
+        : sanitizeArgs(args),
+  });
+
+  // ─── Layer 2: per-user MCP tool-call rate limit ─────────────────────
+  // Applied immediately so we don't waste any work on denied calls. Stdio mode
+  // (no authInfo) is exempt — there's no user identity to key on. On denial we
+  // return an MCP tool error (not HTTP 429) so the LLM client surfaces it as a
+  // tool failure and the agent loop backs off via its own retry policy.
+  // See docs_page/rate-limiting.md (Layer 2). Cost weighting per tool is deferred
+  // to v2 — every consume call counts as one point.
+  if (mcpRateLimiter && authInfo) {
+    // Walks the most-specific identity claim first (userName → email → sub →
+    // preferred_username → clientId) so OIDC users sharing one `azp` clientId
+    // don't collapse into a single bucket. See resolveRateLimitUserKey.
+    const userKey = resolveRateLimitUserKey(authInfo);
+    const decision = await mcpRateLimiter.consume(userKey, toolName);
+    if (!decision.allowed) {
+      const retryAfter = Math.ceil(decision.retryAfterMs / 1000);
+      logger.emitAudit({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        event: 'mcp_rate_limited',
+        requestId: reqId,
+        clientId,
+        clientAgent,
+        user: userKey,
+        target: config.targetId,
+        identity,
+        tool: toolName,
+        limitPerMinute: decision.limitPerMinute,
+        retryAfterMs: decision.retryAfterMs,
+      });
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: toolJson({
+              error: 'rate_limited',
+              retryAfter,
+              message: `Rate limit exceeded (${decision.limitPerMinute}/min per user). Retry after ${retryAfter} seconds.`,
+            }),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Unified scope enforcement via ACTION_POLICY — routes through action/type-aware lookup.
+  // For SAPRead, the policy key is Tool.{type}; for other action-bearing tools, Tool.{action};
+  // for tools without an action/type enum (SAPSearch, SAPQuery), the tool-level default applies.
+  // For SAPSearch.tadir_lookup with source='db'|'both', synthesize a sub-action key so the
+  // sql-scoped policy entry kicks in (otherwise viewer-only profiles could piggyback on the
+  // ADT info-system route to issue freestyle SQL).
+  //
+  // SECURITY (privilege-escalation hardening): the scope key is derived from the SAME
+  // normalized value the handler ultimately dispatches on. `normalizeTypeArgsForValidation`
+  // upper-cases + slash-collapses `type` and coerces non-string inputs via String(), so a
+  // caller cannot evade the per-type scope gate by sending a value that misses the policy key
+  // here yet is canonicalized into a privileged type just before Zod runs. Two such bypasses
+  // existed when this lookup read the RAW `args`: an array (`type: ["TABLE_CONTENTS"]` —
+  // typeof "object" → undefined key → base `read`) and a lowercase string
+  // (`type: "table_contents"` — no `SAPRead.table_contents` key → base `read`), both of which
+  // were then normalized into the data-scoped `TABLE_CONTENTS` for the handler. Normalizing
+  // first closes the array, case, and slash-form variants in one place (and keeps the
+  // SAP_DENY_ACTIONS match below consistent with the canonical form). The normalized object is
+  // reused for Zod validation below so canonicalization happens exactly once.
+  // Runs BEFORE Zod validation so scope errors don't leak schema details to unauthorized callers.
+  const normalizedArgs = normalizeTypeArgsForValidation(toolName, args);
+  const actionOrType = invocationPolicyKey(toolName, normalizedArgs);
+  // Built-in policy from ACTION_POLICY; plugin (Custom_*) policy from the registry (FEAT-61).
+  // Kept here (not inside getActionPolicy) so validate-action-policy.ts stays built-ins-only.
+  const policy = getActionPolicy(toolName, actionOrType) ?? getToolRegistry().get(toolName)?.policy;
+
+  if (authInfo && policy) {
+    if (!hasRequiredScope(authInfo, policy.scope)) {
+      logger.emitAudit({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        event: 'auth_scope_denied',
+        requestId: reqId,
+        user,
+        clientId,
+        clientAgent,
+        target: config.targetId,
+        identity,
+        tool: toolName,
+        requiredScope: policy.scope,
+        availableScopes: authInfo.scopes,
+      });
+      const actionLabel = actionOrType
+        ? `${toolName}(${toolName === 'SAPRead' ? 'type' : 'action'}="${actionOrType}")`
+        : toolName;
+      return errorResult(
+        `Insufficient scope: '${policy.scope}' required for ${actionLabel}. Your scopes: [${authInfo.scopes.join(', ')}]`,
+      );
+    }
+  }
+
+  // Server-level denyActions (SAP_DENY_ACTIONS) — blocks before any per-user scope allows it.
+  const { isActionDenied } = await import('../server/deny-actions.js');
+  if (isActionDenied(toolName, actionOrType, config.denyActions ?? [])) {
+    logger.emitAudit({
+      timestamp: new Date().toISOString(),
+      level: 'warn',
+      event: 'safety_blocked',
+      requestId: reqId,
+      user,
+      clientId,
+      clientAgent,
+      target: config.targetId,
+      identity,
+      operation: `${toolName}${actionOrType ? `.${actionOrType}` : ''}`,
+      reason: 'Action denied by SAP_DENY_ACTIONS',
+    });
+    return errorResult(
+      `Action '${toolName}${actionOrType ? `.${actionOrType}` : ''}' is denied by server policy (SAP_DENY_ACTIONS).`,
+    );
+  }
+
+  // Validate tool arguments with Zod schema (runs AFTER scope + deny check).
+  const isBtp = config.systemType === 'btp';
+  const schema = getToolSchema(toolName, isBtp);
+  if (schema) {
+    // Reuse the normalized args computed for the scope-key derivation above —
+    // re-normalizing would be redundant (the transform is idempotent) and risks
+    // the two paths drifting.
+    args = normalizedArgs;
+    const parsed = schema.safeParse(args);
+    if (!parsed.success) {
+      const validationError = formatZodError(parsed.error, toolName);
+      logger.emitAudit({
+        timestamp: new Date().toISOString(),
+        level: 'warn',
+        event: 'safety_blocked',
+        requestId: reqId,
+        user,
+        clientId,
+        clientAgent,
+        target: config.targetId,
+        identity,
+        operation: toolName,
+        reason: 'Input validation failed',
+      });
+      return errorResult(validationError);
+    }
+    args = parsed.data as Record<string, unknown>;
+  }
+
+  const inheritedDataResultScope = inherited?.dataResultScope;
+  const dataResultScope = inheritedDataResultScope ?? client.createDataResultScope();
+  const ownsDataResultScope = inheritedDataResultScope === undefined;
+
+  // Run within request context so HTTP-level logs get the requestId
+  return requestContext.run(
+    {
+      requestId: reqId,
+      user,
+      tool: toolName,
+      destination: config.targetId ? undefined : config.destinationName,
+      target: config.targetId,
+      identity,
+      clientAgent,
+      signal: signal ?? inherited?.signal,
+      dataResultScope,
+      // Carried forward from the HTTP edge so the outbound SAP call keeps the caller's trace.
+      traceparent: inherited?.traceparent,
+      tracestate: inherited?.tracestate,
+    },
+    async () => {
+      const cacheSecurity = buildCacheSecurityContext(authInfo, isPerUserClient);
+      try {
+        // FEAT-61: inner dispatch is owned by the ToolRegistry (built-ins + plugin Custom_* tools).
+        // The shared pipeline above (rate-limit, scope, deny, Zod, audit) is unchanged; the registry
+        // only replaces the former `switch (toolName)`. See extension-framework-spec.md §4.
+        const entry = getToolRegistry().get(toolName);
+        let result: ToolResult;
+        // Plugin (Custom_*) tools are out of scope for hyperfocused mode (spec §1): hidden from
+        // tools/list AND not directly invocable, so a client that knows a Custom_ name can't reach a
+        // plugin tool here either. Built-ins (incl. the `SAP` wrapper) dispatch normally.
+        if (!entry || (config.toolMode === 'hyperfocused' && entry.source === 'plugin')) {
+          result = errorResult(`Unknown tool: ${toolName}`);
+        } else {
+          const dispatchCtx: ToolDispatchContext = {
+            client,
+            config,
+            args,
+            cache: cachingLayer,
+            authInfo,
+            isPerUserClient,
+            cacheSecurity,
+            server: _server,
+            requestId: reqId,
+          };
+          result = await entry.invoke(dispatchCtx);
+        }
+
+        const guardedResult = postDispatchResult?.();
+        if (guardedResult) result = guardedResult;
+
+        const durationMs = Date.now() - start;
+        const resultSize = result.content.reduce((bytes, item) => bytes + item.text.length, 0);
+        const resultPreview = buildAuditResultPreview(
+          toolName,
+          args,
+          resultTextForAuditPreview(toolName, result.content),
+        );
+
+        logger.emitAudit({
+          timestamp: new Date().toISOString(),
+          level: result.isError ? 'error' : 'info',
+          event: 'tool_call_end',
+          destination: config.targetId ? undefined : config.destinationName,
+          target: config.targetId,
+          identity,
+          requestId: reqId,
+          user,
+          clientId,
+          tool: toolName,
+          pluginName,
+          durationMs,
+          status: result.isError ? 'error' : 'success',
+          errorMessage: result.isError
+            ? toolName === 'SAPCustomizing'
+              ? '[REDACTED customising error]'
+              : result.content[0]?.text
+            : undefined,
+          errorClass: result.isError ? 'result-path' : undefined,
+          resultSize,
+          resultPreview,
+        });
+
+        return result;
+      } catch (err) {
+        if (err instanceof AdtError && err.creationOutcome === 'unknown') {
+          try {
+            if (toolName === 'SAPWrite' && args.type && args.name) {
+              invalidateInactiveList(cachingLayer, client, cacheSecurity);
+              cachingLayer?.invalidate(canonicalTablType(String(args.type)), String(args.name), 'all');
+            }
+            if (toolName === 'SAPManage' && args.action === 'create_package') client.invalidatePackageHierarchy();
+          } catch {
+            // Best-effort cleanup must not replace the creation error or prevent its audit event.
+          }
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        const auditErrorMessage =
+          toolName === 'SAPCustomizing'
+            ? '[REDACTED customising error]'
+            : err instanceof AdtApiError && (err.statusCode === 401 || err.statusCode === 403)
+              ? `SAP HTTP ${err.statusCode} authentication/authorization failure (response details suppressed)`
+              : message;
+        const durationMs = Date.now() - start;
+
+        if (err instanceof AdtResponseLimitError) {
+          logger.emitAudit({
+            timestamp: new Date().toISOString(),
+            level: 'warn',
+            event: 'data_response_limited',
+            destination: config.targetId ? undefined : config.destinationName,
+            target: config.targetId,
+            identity,
+            requestId: reqId,
+            user,
+            clientId,
+            tool: toolName,
+            limitBytes: err.limitBytes,
+            observedBytes: err.observedBytes,
+            endpointFamily: err.endpointFamily,
+            queueWaitMs: dataResultScope.queueWaitMs,
+          });
+        }
+
+        logger.emitAudit({
+          timestamp: new Date().toISOString(),
+          level: 'error',
+          event: 'tool_call_end',
+          destination: config.targetId ? undefined : config.destinationName,
+          target: config.targetId,
+          identity,
+          requestId: reqId,
+          user,
+          clientId,
+          tool: toolName,
+          pluginName,
+          durationMs,
+          status: 'error',
+          errorClass: classifyError(err),
+          errorMessage: auditErrorMessage,
+        });
+
+        if (config.targetId && (err instanceof AdtApiError || err instanceof AdtNetworkError)) {
+          const failure = classifyMultiTargetSapError(
+            err,
+            config.targetId,
+            toolName,
+            config.ppEnabled ? 'per-user' : 'shared',
+          );
+          if (failure) {
+            if (failure.event) {
+              logger.emitAudit({
+                timestamp: new Date().toISOString(),
+                level: 'warn',
+                event: failure.event,
+                requestId: reqId,
+                user,
+                clientId,
+                target: config.targetId,
+                identity,
+                tool: toolName,
+                errorCode: failure.code,
+              });
+            }
+            return errorResult(
+              toolJson({
+                error: failure.code,
+                message: failure.message,
+                target: config.targetId,
+                identity,
+                requestId: reqId,
+                retryable: failure.retryable ?? true,
+              }),
+            );
+          }
+        }
+
+        return errorResult(formatErrorForLLM(err, message, toolName, args, config));
+      } finally {
+        if (ownsDataResultScope) dataResultScope.release();
+      }
+    },
+  );
+}
+
+// ─── Individual Tool Handlers ────────────────────────────────────────
+
+/** Check if the connected system is BTP ABAP Environment */
+
+/** Return whether the SAP ADT discovery feed advertises the /sap/bc/adt/ddic/tables
+ *  collection (the transparent-table editor endpoint). Absent on NW 7.50/7.51 —
+ *  SAP added it in NW 7.52 along with the new database-table editor. When the
+ *  discovery cache is empty (e.g. probe never ran, tests that bypass SAPManage),
+ *  returns `undefined` so callers can decide whether to default-allow.
+ *  See issue #285. */

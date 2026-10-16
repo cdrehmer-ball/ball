@@ -1,0 +1,1664 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  API_KEY_PROFILES,
+  parseApiKeys,
+  parseArgs,
+  resolveConfig,
+  SYSTEM_LABEL_MAX_LENGTH,
+  validateConfig,
+} from '../../../src/server/config.js';
+import { DEFAULT_CONFIG } from '../../../src/server/types.js';
+
+describe('parseArgs', () => {
+  // Save and restore env to avoid test pollution
+  const savedEnv = { ...process.env };
+
+  beforeEach(() => {
+    // Clear supported ARC-1 env vars for clean test state.
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('SAP_') || key.startsWith('TEST_SAP_') || key.startsWith('ARC1_')) {
+        delete process.env[key];
+      }
+    }
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  it('returns defaults when no args or env vars', () => {
+    const config = parseArgs([]);
+    expect(config.url).toBe('');
+    expect(config.client).toBe('100');
+    expect(config.language).toBe('EN');
+    expect(config.gzipDataPreviewBody).toBe(false);
+    expect(config.transport).toBe('stdio');
+    expect(config.allowWrites).toBe(false);
+    expect(config.allowFreeSQL).toBe(false);
+    expect(config.allowDataPreview).toBe(false);
+    expect(config.allowTransportWrites).toBe(false);
+    expect(config.allowGitWrites).toBe(false);
+    expect(config.blockedDataSources).toEqual([]);
+    expect(config.denyActions).toEqual([]);
+    expect(config.schemaNullableOptionals).toBe('auto');
+    expect(config.multiTargetAllowBasicAuth).toBe(false);
+    expect(config.verbose).toBe(false);
+  });
+
+  it('parses the default-off multi-target Basic authentication option and warns when it is inert', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      process.env.ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH = 'true';
+      const { config, sources } = resolveConfig([]);
+      expect(config.multiTargetAllowBasicAuth).toBe(true);
+      expect(sources.multiTargetAllowBasicAuth).toEqual({ env: 'ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH' });
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH=true has no effect without ARC1_MULTI_TARGET_ENDPOINTS=true',
+        ),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it.each(['ARC1_CACHE_WARMUP', 'ARC1_CACHE_WARMUP_PACKAGES'])('rejects retired env var %s', (name) => {
+    process.env[name] = 'false';
+    expect(() => parseArgs([])).toThrow(/Removed ARC-1 configuration/);
+  });
+
+  it.each(['--cache-warmup=false', '--cache-warmup-packages=Z*'])('rejects retired CLI flag %s', (flag) => {
+    expect(() => parseArgs([flag])).toThrow(/Removed ARC-1 configuration/);
+  });
+
+  it('rejects the unreleased SAP_BTP_DESTINATIONS prototype variable with a migration hint', () => {
+    process.env.SAP_BTP_DESTINATIONS = 'S4D,S4Q';
+    expect(() => parseArgs([])).toThrow(/ARC1_MULTI_TARGET_ENDPOINTS/);
+  });
+
+  it('parses CLI flags (--flag value)', () => {
+    const config = parseArgs(['--url', 'http://sap:8000', '--user', 'admin', '--password', 'secret']);
+    expect(config.url).toBe('http://sap:8000');
+    expect(config.username).toBe('admin');
+    expect(config.password).toBe('secret');
+  });
+
+  it('parses CLI flags (--flag=value)', () => {
+    const config = parseArgs(['--url=http://sap:8000', '--client=100']);
+    expect(config.url).toBe('http://sap:8000');
+    expect(config.client).toBe('100');
+  });
+
+  it('reads from environment variables', () => {
+    process.env.SAP_URL = 'http://env:8000';
+    process.env.SAP_USER = 'envuser';
+    process.env.SAP_CLIENT = '200';
+    const config = parseArgs([]);
+    expect(config.url).toBe('http://env:8000');
+    expect(config.username).toBe('envuser');
+    expect(config.client).toBe('200');
+  });
+
+  it('throws end-to-end on a non-3-digit client', () => {
+    expect(() => parseArgs(['--client', '10'])).toThrow(/Invalid SAP_CLIENT '10'/);
+  });
+
+  it('accepts a zero-padded 3-digit client', () => {
+    expect(parseArgs(['--client', '010']).client).toBe('010');
+  });
+
+  it('CLI flags take precedence over env vars', () => {
+    process.env.SAP_URL = 'http://env:8000';
+    const config = parseArgs(['--url', 'http://cli:9000']);
+    expect(config.url).toBe('http://cli:9000');
+  });
+
+  it('parses boolean flags', () => {
+    const config = parseArgs(['--allow-writes', 'true', '--verbose', 'true']);
+    expect(config.allowWrites).toBe(true);
+    expect(config.verbose).toBe(true);
+  });
+
+  it('parses ARC1_LOG_LEVEL and keeps SAP_VERBOSE as a debug alias', () => {
+    process.env.ARC1_LOG_LEVEL = 'warn';
+    expect(parseArgs([]).logLevel).toBe('warn');
+    process.env.SAP_VERBOSE = 'true';
+    expect(parseArgs([]).logLevel).toBe('debug');
+  });
+
+  it('parses boolean env vars', () => {
+    process.env.SAP_ALLOW_WRITES = 'true';
+    process.env.SAP_ALLOW_FREE_SQL = '1';
+    const config = parseArgs([]);
+    expect(config.allowWrites).toBe(true);
+    expect(config.allowFreeSQL).toBe(true);
+  });
+
+  it('parses SAP_GZIP_DATAPREVIEW_BODY and lets the CLI override it', () => {
+    process.env.SAP_GZIP_DATAPREVIEW_BODY = 'true';
+
+    const fromEnv = resolveConfig([]);
+    expect(fromEnv.config.gzipDataPreviewBody).toBe(true);
+    expect(fromEnv.sources.gzipDataPreviewBody).toEqual({ env: 'SAP_GZIP_DATAPREVIEW_BODY' });
+
+    const fromCli = resolveConfig(['--gzip-datapreview-body', 'false']);
+    expect(fromCli.config.gzipDataPreviewBody).toBe(false);
+    expect(fromCli.sources.gzipDataPreviewBody).toEqual({ flag: '--gzip-datapreview-body' });
+  });
+
+  it('normalizes, deduplicates, and source-attributes the experimental data-source blocklist', () => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = ' usr02,SCARR,usr02 ';
+    const fromEnv = resolveConfig([]);
+    expect(fromEnv.config.blockedDataSources).toEqual(['USR02', 'SCARR']);
+    expect(fromEnv.sources.blockedDataSources).toEqual({ env: 'SAP_BLOCKED_DATA_SOURCES' });
+
+    const fromCli = resolveConfig(['--blocked-data-sources', '/dmo/i_flight,spfli']);
+    expect(fromCli.config.blockedDataSources).toEqual(['/DMO/I_FLIGHT', 'SPFLI']);
+    expect(fromCli.sources.blockedDataSources).toEqual({ flag: '--blocked-data-sources' });
+  });
+
+  // Unset / empty / ASCII-whitespace-only are the documented OFF values. They must stay off so the
+  // shipped Dockerfile and MTA descriptors can carry a visible `""` default and operators keep a
+  // one-field rollback.
+  it.each([
+    ['empty string', ''],
+    ['single space', ' '],
+    ['tabs and newlines', ' \t\n '],
+  ])('treats %s as off', (_label, value) => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = value;
+    const { config, sources } = resolveConfig([]);
+    expect(config.blockedDataSources).toEqual([]);
+    // Still attributed to the environment: the operator DID set it, to the off value.
+    expect(sources.blockedDataSources).toEqual({ env: 'SAP_BLOCKED_DATA_SOURCES' });
+  });
+
+  // Once the value is active every field is mandatory. The prototype used .filter(Boolean), so a
+  // stray separator silently shortened the list and `,` silently disabled the whole control.
+  it.each([
+    ['separator only', ','],
+    ['repeated separators only', ',,,'],
+    ['leading comma', ',USR02'],
+    ['trailing comma', 'USR02,'],
+    ['repeated inner comma', 'USR02,,PA0002'],
+    ['whitespace-only field', 'USR02, ,PA0002'],
+  ])('fails startup on %s rather than silently dropping fields', (_label, value) => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = value;
+    expect(() => resolveConfig([])).toThrow(/SAP_BLOCKED_DATA_SOURCES entry #\d+ of \d+ is empty/);
+  });
+
+  it.each([
+    ['wildcard', 'SCARR*'],
+    ['embedded space', 'SCARR SPFLI'],
+    ['statement injection', 'SCARR;DELETE'],
+    ['type prefix', 'TABL:SCARR'],
+    ['negation', '!SCARR'],
+    ['quoting', "'SCARR'"],
+    ['punctuation only: slash', '/'],
+    ['punctuation only: dollar', '$'],
+    ['punctuation only: underscores', '___'],
+    ['non-ASCII that would case-fold into a valid name', 'u\u017Fr02'],
+    ['over the length limit', 'Z'.repeat(129)],
+  ])('fails fast on invalid blocked source: %s', (_label, value) => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = value;
+    expect(() => resolveConfig([])).toThrow(/SAP_BLOCKED_DATA_SOURCES/);
+  });
+
+  it('names the offending token position and source without dumping the environment', () => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = 'USR02,SCARR*,PA0002';
+    process.env.SAP_PASSWORD = 'super-secret-value';
+    try {
+      resolveConfig([]);
+      expect.unreachable('should have thrown');
+    } catch (error) {
+      const message = (error as Error).message;
+      expect(message).toContain('SAP_BLOCKED_DATA_SOURCES');
+      expect(message).toContain('#2 of 3');
+      expect(message).toContain('SCARR*');
+      expect(message).not.toContain('super-secret-value');
+    }
+  });
+
+  it('reports the CLI flag rather than the env var when the flag is the active source', () => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = 'USR02';
+    expect(() => resolveConfig(['--blocked-data-sources', 'USR02,'])).toThrow(/--blocked-data-sources/);
+  });
+
+  it('CLI takes precedence over the environment', () => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = 'USR02,PA0002';
+    const { config, sources } = resolveConfig(['--blocked-data-sources', 'SCARR']);
+    expect(config.blockedDataSources).toEqual(['SCARR']);
+    expect(sources.blockedDataSources).toEqual({ flag: '--blocked-data-sources' });
+  });
+
+  it('a blank higher-precedence CLI value turns a non-empty environment value off', () => {
+    process.env.SAP_BLOCKED_DATA_SOURCES = 'USR02,PA0002';
+    const { config, sources } = resolveConfig(['--blocked-data-sources', '']);
+    expect(config.blockedDataSources).toEqual([]);
+    expect(sources.blockedDataSources).toEqual({ flag: '--blocked-data-sources' });
+  });
+
+  it('parses --allow-git-writes flag', () => {
+    const config = parseArgs(['--allow-git-writes', 'true']);
+    expect(config.allowGitWrites).toBe(true);
+  });
+
+  it('parses SAP_ALLOW_GIT_WRITES env var', () => {
+    process.env.SAP_ALLOW_GIT_WRITES = '1';
+    const config = parseArgs([]);
+    expect(config.allowGitWrites).toBe(true);
+  });
+
+  it('parses ARC1_MINIMAL_ERRORS env var', () => {
+    process.env.ARC1_MINIMAL_ERRORS = 'true';
+    const config = parseArgs([]);
+    expect(config.minimalErrors).toBe(true);
+  });
+
+  it('defaults minimal errors off for stdio transport', () => {
+    const config = parseArgs([]);
+    expect(config.transport).toBe('stdio');
+    expect(config.minimalErrors).toBe(false);
+  });
+
+  it('defaults minimal errors on for HTTP transport', () => {
+    const config = parseArgs(['--transport', 'http-streamable', '--api-keys', 'test-key:viewer']);
+    expect(config.transport).toBe('http-streamable');
+    expect(config.minimalErrors).toBe(true);
+  });
+
+  it('allows HTTP deployments to explicitly opt into detailed errors', () => {
+    process.env.ARC1_MINIMAL_ERRORS = 'false';
+    const config = parseArgs(['--transport', 'http-streamable', '--api-keys', 'test-key:viewer']);
+    expect(config.transport).toBe('http-streamable');
+    expect(config.minimalErrors).toBe(false);
+  });
+
+  it('parses ARC1_SCHEMA_NULLABLE_OPTIONALS env var', () => {
+    process.env.ARC1_SCHEMA_NULLABLE_OPTIONALS = 'on';
+    const config = parseArgs([]);
+    expect(config.schemaNullableOptionals).toBe('on');
+  });
+
+  it('--schema-nullable-optionals takes precedence over ARC1_SCHEMA_NULLABLE_OPTIONALS', () => {
+    process.env.ARC1_SCHEMA_NULLABLE_OPTIONALS = 'on';
+    const config = parseArgs(['--schema-nullable-optionals', 'off']);
+    expect(config.schemaNullableOptionals).toBe('off');
+  });
+
+  it('rejects invalid ARC1_SCHEMA_NULLABLE_OPTIONALS values', () => {
+    process.env.ARC1_SCHEMA_NULLABLE_OPTIONALS = 'nullable';
+    expect(() => parseArgs([])).toThrow(/Invalid ARC1_SCHEMA_NULLABLE_OPTIONALS/);
+  });
+
+  it('--minimal-errors takes precedence over ARC1_MINIMAL_ERRORS env var', () => {
+    process.env.ARC1_MINIMAL_ERRORS = 'false';
+    const config = parseArgs(['--minimal-errors', 'true']);
+    expect(config.minimalErrors).toBe(true);
+  });
+
+  it('--minimal-errors=false overrides the HTTP minimal-error default', () => {
+    const config = parseArgs([
+      '--transport',
+      'http-streamable',
+      '--api-keys',
+      'test-key:viewer',
+      '--minimal-errors',
+      'false',
+    ]);
+    expect(config.minimalErrors).toBe(false);
+  });
+
+  it('defaults ppStrict to true when principal propagation is enabled', () => {
+    process.env.SAP_PP_ENABLED = 'true';
+    const config = parseArgs([]);
+    expect(config.ppEnabled).toBe(true);
+    expect(config.ppStrict).toBe(true);
+    expect(config.ppStrictExplicit).toBe(false);
+  });
+
+  it('parses explicit mixed-auth mode with SAP_PP_STRICT=false', () => {
+    process.env.SAP_PP_ENABLED = 'true';
+    process.env.SAP_PP_STRICT = 'false';
+    const config = parseArgs([]);
+    expect(config.ppEnabled).toBe(true);
+    expect(config.ppStrict).toBe(false);
+    expect(config.ppStrictExplicit).toBe(true);
+  });
+
+  it('ignores empty SAP_PP_STRICT and keeps the PP-enabled fail-closed default', () => {
+    process.env.SAP_PP_ENABLED = 'true';
+    process.env.SAP_PP_STRICT = '';
+    const config = parseArgs([]);
+    expect(config.ppEnabled).toBe(true);
+    expect(config.ppStrict).toBe(true);
+    expect(config.ppStrictExplicit).toBe(false);
+  });
+
+  it('--pp-strict takes precedence over SAP_PP_STRICT env var', () => {
+    process.env.SAP_PP_ENABLED = 'true';
+    process.env.SAP_PP_STRICT = 'false';
+    const config = parseArgs(['--pp-strict', 'true']);
+    expect(config.ppStrict).toBe(true);
+    expect(config.ppStrictExplicit).toBe(true);
+  });
+
+  // An mtaext override turns PP off but cannot unset the base mta.yaml
+  // SAP_PP_STRICT=true — startup must not crash on the stranded no-op.
+  it('starts up when PP is disabled while SAP_PP_STRICT=true is left over', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      process.env.SAP_PP_ENABLED = 'false';
+      process.env.SAP_PP_STRICT = 'true';
+      const config = parseArgs([]);
+      expect(config.ppEnabled).toBe(false);
+      expect(stderrSpy.mock.calls.flat().join(' ')).toContain('SAP_PP_STRICT=true has no effect');
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('defaults allowGitWrites to false without explicit configuration', () => {
+    const config = parseArgs([]);
+    expect(config.allowGitWrites).toBe(false);
+  });
+
+  it('--allow-git-writes takes precedence over SAP_ALLOW_GIT_WRITES env', () => {
+    process.env.SAP_ALLOW_GIT_WRITES = 'false';
+    const config = parseArgs(['--allow-git-writes', 'true']);
+    expect(config.allowGitWrites).toBe(true);
+  });
+
+  it('parses transport type with explicit no-auth opt-in', () => {
+    const config = parseArgs(['--transport', 'http-streamable', '--allow-http-no-auth', 'true']);
+    expect(config.transport).toBe('http-streamable');
+    expect(config.allowHttpNoAuth).toBe(true);
+  });
+
+  it('parses ARC1_ALLOW_HTTP_NO_AUTH env var', () => {
+    process.env.ARC1_ALLOW_HTTP_NO_AUTH = 'true';
+    const config = parseArgs(['--transport', 'http-streamable']);
+    expect(config.allowHttpNoAuth).toBe(true);
+  });
+
+  it('defaults unknown transport to stdio', () => {
+    const config = parseArgs(['--transport', 'invalid']);
+    expect(config.transport).toBe('stdio');
+  });
+
+  it('defaults serverName to arc-1', () => {
+    const config = parseArgs([]);
+    expect(config.serverName).toBe('arc-1');
+  });
+
+  it('parses ARC1_SERVER_NAME env var', () => {
+    process.env.ARC1_SERVER_NAME = 'arc1-erp';
+    try {
+      const config = parseArgs([]);
+      expect(config.serverName).toBe('arc1-erp');
+    } finally {
+      delete process.env.ARC1_SERVER_NAME;
+    }
+  });
+
+  it('parses --server-name flag over ARC1_SERVER_NAME env', () => {
+    process.env.ARC1_SERVER_NAME = 'arc1-erp';
+    try {
+      const config = parseArgs(['--server-name', 'arc1-bw']);
+      expect(config.serverName).toBe('arc1-bw');
+    } finally {
+      delete process.env.ARC1_SERVER_NAME;
+    }
+  });
+
+  it('defaults systemLabel to empty', () => {
+    expect(parseArgs([]).systemLabel).toBe('');
+  });
+
+  it('parses ARC1_SYSTEM_LABEL env var', () => {
+    process.env.ARC1_SYSTEM_LABEL = 'ERP production (read-only)';
+    expect(parseArgs([]).systemLabel).toBe('ERP production (read-only)');
+  });
+
+  it('parses --system-label flag over ARC1_SYSTEM_LABEL env', () => {
+    process.env.ARC1_SYSTEM_LABEL = 'ERP development';
+    expect(parseArgs(['--system-label', 'ERP quality assurance']).systemLabel).toBe('ERP quality assurance');
+  });
+
+  it('normalizes a system label to one trimmed line', () => {
+    const config = parseArgs(['--system-label', '  ＥＲＰ\tproduction\n(read-only)\u007f  ']);
+    expect(config.systemLabel).toBe('ERP production (read-only)');
+  });
+
+  it('normalizes a blank system label to the empty default', () => {
+    process.env.ARC1_SYSTEM_LABEL = ' \n\t ';
+    expect(parseArgs([]).systemLabel).toBe('');
+  });
+
+  it('rejects a system label over the model-context budget', () => {
+    expect(() => parseArgs(['--system-label', 'x'.repeat(SYSTEM_LABEL_MAX_LENGTH + 1)])).toThrow(
+      `ARC1_SYSTEM_LABEL must be at most ${SYSTEM_LABEL_MAX_LENGTH} characters`,
+    );
+  });
+
+  it('parses --port flag and overrides httpAddr port', () => {
+    const config = parseArgs(['--port', '9090']);
+    expect(config.httpAddr).toBe('0.0.0.0:9090');
+  });
+
+  it('parses ARC1_HTTP_ADDR env var', () => {
+    process.env.ARC1_HTTP_ADDR = '127.0.0.1:19081';
+    try {
+      const config = parseArgs([]);
+      expect(config.httpAddr).toBe('127.0.0.1:19081');
+    } finally {
+      delete process.env.ARC1_HTTP_ADDR;
+    }
+  });
+
+  it('parses SAP_HTTP_ADDR env var as legacy-compatible alias', () => {
+    process.env.SAP_HTTP_ADDR = '127.0.0.1:19082';
+    try {
+      const config = parseArgs([]);
+      expect(config.httpAddr).toBe('127.0.0.1:19082');
+    } finally {
+      delete process.env.SAP_HTTP_ADDR;
+    }
+  });
+
+  it('prefers ARC1_HTTP_ADDR over SAP_HTTP_ADDR when both are set', () => {
+    process.env.ARC1_HTTP_ADDR = '127.0.0.1:19081';
+    process.env.SAP_HTTP_ADDR = '127.0.0.1:19082';
+    try {
+      const config = parseArgs([]);
+      expect(config.httpAddr).toBe('127.0.0.1:19081');
+    } finally {
+      delete process.env.ARC1_HTTP_ADDR;
+      delete process.env.SAP_HTTP_ADDR;
+    }
+  });
+
+  it('ARC1_PORT env var overrides httpAddr port', () => {
+    process.env.ARC1_PORT = '7070';
+    try {
+      const config = parseArgs([]);
+      expect(config.httpAddr).toBe('0.0.0.0:7070');
+    } finally {
+      delete process.env.ARC1_PORT;
+    }
+  });
+
+  it('--port takes precedence over ARC1_PORT', () => {
+    process.env.ARC1_PORT = '7070';
+    try {
+      const config = parseArgs(['--port', '9090']);
+      expect(config.httpAddr).toBe('0.0.0.0:9090');
+    } finally {
+      delete process.env.ARC1_PORT;
+    }
+  });
+
+  it('--port preserves custom host from --http-addr', () => {
+    const config = parseArgs(['--http-addr', '127.0.0.1:8080', '--port', '9999']);
+    expect(config.httpAddr).toBe('127.0.0.1:9999');
+  });
+
+  it('throws on invalid --port value', () => {
+    expect(() => parseArgs(['--port', 'notanumber'])).toThrow(/Invalid port/);
+    expect(() => parseArgs(['--port', '99999'])).toThrow(/Invalid port/);
+    expect(() => parseArgs(['--port', '0'])).toThrow(/Invalid port/);
+  });
+
+  it('keeps the read-only UI disabled by default', () => {
+    const config = parseArgs([]);
+    expect(config.uiMode).toBe('off');
+    expect(config.uiAddr).toBe('127.0.0.1:8711');
+    expect(config.uiOpen).toBe(false);
+  });
+
+  it('maps bare --ui to local mode for stdio', () => {
+    const config = parseArgs(['--ui']);
+    expect(config.uiMode).toBe('local');
+  });
+
+  it('maps ARC1_UI=true to web mode for HTTP transport', () => {
+    process.env.ARC1_UI = 'true';
+    const config = parseArgs(['--transport', 'http-streamable', '--api-keys', 'admin-secret:admin']);
+    expect(config.uiMode).toBe('web');
+  });
+
+  it('parses UI bind address, port override, and open flag', () => {
+    const config = parseArgs([
+      '--ui',
+      'local',
+      '--ui-addr',
+      'localhost:9000',
+      '--ui-port',
+      '9001',
+      '--ui-open',
+      'true',
+    ]);
+    expect(config.uiMode).toBe('local');
+    expect(config.uiAddr).toBe('localhost:9001');
+    expect(config.uiOpen).toBe(true);
+  });
+
+  it('rejects web UI mode on stdio transport', () => {
+    expect(() => parseArgs(['--ui', 'web'])).toThrow(/requires SAP_TRANSPORT=http-streamable/);
+  });
+
+  it('rejects web UI mode without HTTP authentication', () => {
+    expect(() => parseArgs(['--transport', 'http-streamable', '--allow-http-no-auth', 'true', '--ui', 'web'])).toThrow(
+      /ARC1_UI=web requires HTTP authentication/,
+    );
+  });
+
+  it('rejects non-loopback local UI addresses', () => {
+    expect(() => parseArgs(['--ui', 'local', '--ui-addr', '0.0.0.0:8711'])).toThrow(/must bind to a loopback/);
+  });
+
+  it('throws on invalid UI port value', () => {
+    expect(() => parseArgs(['--ui', 'local', '--ui-port', '99999'])).toThrow(/Invalid UI port/);
+  });
+
+  it('parses feature toggles', () => {
+    const config = parseArgs([
+      '--feature-abapgit',
+      'on',
+      '--feature-gcts',
+      'off',
+      '--feature-rap',
+      'off',
+      '--feature-flp',
+      'on',
+    ]);
+    expect(config.featureAbapGit).toBe('on');
+    expect(config.featureGcts).toBe('off');
+    expect(config.featureRap).toBe('off');
+    expect(config.featureFlp).toBe('on');
+  });
+
+  it('parses SAP_FEATURE_GCTS env var', () => {
+    process.env.SAP_FEATURE_GCTS = 'on';
+    const config = parseArgs([]);
+    expect(config.featureGcts).toBe('on');
+  });
+
+  it('defaults unknown feature toggle to auto', () => {
+    const config = parseArgs(['--feature-abapgit', 'invalid']);
+    expect(config.featureAbapGit).toBe('auto');
+  });
+
+  it('parses allowed packages as comma-separated list', () => {
+    process.env.SAP_ALLOWED_PACKAGES = 'Z*,$TMP,YFOO';
+    const config = parseArgs([]);
+    expect(config.allowedPackages).toEqual(['Z*', '$TMP', 'YFOO']);
+  });
+
+  it('defaults allowedPackages to [$TMP] when not configured', () => {
+    const config = parseArgs([]);
+    expect(config.allowedPackages).toEqual(['$TMP']);
+  });
+
+  it('--allowed-packages overrides the $TMP default', () => {
+    process.env.SAP_ALLOWED_PACKAGES = 'Z*,$TMP';
+    const config = parseArgs([]);
+    expect(config.allowedPackages).toEqual(['Z*', '$TMP']);
+  });
+
+  it('keeps the $TMP default when SAP_ALLOWED_PACKAGES is empty (fail closed, NOT unrestricted)', () => {
+    // "" or ",," (shell-expanded unset $VARs, or a cleared install-dialog field) must NOT become []
+    // — [] means "all packages allowed" in safety.ts. Empty falls back to the safe $TMP default;
+    // unrestricted stays an explicit opt-in via '*'.
+    process.env.SAP_ALLOWED_PACKAGES = ',,';
+    expect(parseArgs([]).allowedPackages).toEqual(['$TMP']);
+    process.env.SAP_ALLOWED_PACKAGES = '';
+    expect(parseArgs([]).allowedPackages).toEqual(['$TMP']);
+  });
+
+  it('filters empty entries but keeps valid ones', () => {
+    process.env.SAP_ALLOWED_PACKAGES = 'Z*,,$TMP,';
+    const config = parseArgs([]);
+    expect(config.allowedPackages).toEqual(['Z*', '$TMP']);
+  });
+
+  it('still allows explicit unrestricted writes via *', () => {
+    process.env.SAP_ALLOWED_PACKAGES = '*';
+    expect(parseArgs([]).allowedPackages).toEqual(['*']);
+  });
+
+  it('keeps the SAP_CLIENT / SAP_LANGUAGE defaults when the env value is empty', () => {
+    // A cleared install-dialog field sends "" — it must fall back to the default, not override it.
+    // An empty client would otherwise drop the sap-client param and log on to the system default.
+    process.env.SAP_CLIENT = '';
+    process.env.SAP_LANGUAGE = '';
+    const config = parseArgs([]);
+    expect(config.client).toBe('100');
+    expect(config.language).toBe('EN');
+  });
+
+  describe('legacy config migration errors', () => {
+    it('throws migration error for SAP_READ_ONLY', () => {
+      process.env.SAP_READ_ONLY = 'true';
+      expect(() => parseArgs([])).toThrow(/SAP_READ_ONLY.*Replaced by SAP_ALLOW_WRITES/);
+    });
+
+    it('throws migration error for SAP_BLOCK_DATA', () => {
+      process.env.SAP_BLOCK_DATA = 'true';
+      expect(() => parseArgs([])).toThrow(/SAP_BLOCK_DATA.*Replaced by SAP_ALLOW_DATA_PREVIEW/);
+    });
+
+    it('throws migration error for SAP_BLOCK_FREE_SQL', () => {
+      process.env.SAP_BLOCK_FREE_SQL = 'true';
+      expect(() => parseArgs([])).toThrow(/SAP_BLOCK_FREE_SQL.*Replaced by SAP_ALLOW_FREE_SQL/);
+    });
+
+    it('throws migration error for SAP_ENABLE_TRANSPORTS', () => {
+      process.env.SAP_ENABLE_TRANSPORTS = 'true';
+      expect(() => parseArgs([])).toThrow(/SAP_ENABLE_TRANSPORTS.*Replaced by SAP_ALLOW_TRANSPORT_WRITES/);
+    });
+
+    it('throws migration error for SAP_ENABLE_GIT', () => {
+      process.env.SAP_ENABLE_GIT = 'true';
+      expect(() => parseArgs([])).toThrow(/SAP_ENABLE_GIT.*Replaced by SAP_ALLOW_GIT_WRITES/);
+    });
+
+    it('throws migration error for SAP_ALLOWED_OPS', () => {
+      process.env.SAP_ALLOWED_OPS = 'RSQ';
+      expect(() => parseArgs([])).toThrow(/SAP_ALLOWED_OPS.*Op-code allowlist was removed/);
+    });
+
+    it('throws migration error for SAP_DISALLOWED_OPS', () => {
+      process.env.SAP_DISALLOWED_OPS = 'D';
+      expect(() => parseArgs([])).toThrow(/SAP_DISALLOWED_OPS.*Op-code blocklist was removed/);
+    });
+
+    it('throws migration error for ARC1_PROFILE', () => {
+      process.env.ARC1_PROFILE = 'developer';
+      expect(() => parseArgs([])).toThrow(/ARC1_PROFILE.*Server-side profile presets were removed/);
+    });
+
+    it('throws migration error for ARC1_API_KEY', () => {
+      process.env.ARC1_API_KEY = 'abc';
+      expect(() => parseArgs([])).toThrow(/ARC1_API_KEY.*Single API-key mode was removed/);
+    });
+
+    it('throws migration error for --read-only flag', () => {
+      expect(() => parseArgs(['--read-only', 'true'])).toThrow(/--read-only.*SAP_ALLOW_WRITES/);
+    });
+
+    it('throws migration error for --profile flag', () => {
+      expect(() => parseArgs(['--profile', 'developer'])).toThrow(/--profile.*profile presets were removed/);
+    });
+
+    it('migration error message points to updating.md', () => {
+      process.env.SAP_READ_ONLY = 'true';
+      expect(() => parseArgs([])).toThrow(/docs_page\/updating\.md/);
+    });
+  });
+
+  it('parses cookie auth options', () => {
+    const config = parseArgs(['--cookie-file', '/path/cookies.txt', '--cookie-string', 'a=b; c=d']);
+    expect(config.cookieFile).toBe('/path/cookies.txt');
+    expect(config.cookieString).toBe('a=b; c=d');
+  });
+
+  it('parses --disable-saml and --pp-allow-shared-cookies flags', () => {
+    const config = parseArgs(['--disable-saml', 'true', '--pp-allow-shared-cookies', 'true']);
+    expect(config.disableSaml2).toBe(true);
+    expect(config.ppAllowSharedCookies).toBe(true);
+  });
+
+  it('parses SAP_DISABLE_SAML and SAP_PP_ALLOW_SHARED_COOKIES env vars', () => {
+    process.env.SAP_DISABLE_SAML = 'true';
+    process.env.SAP_PP_ALLOW_SHARED_COOKIES = '1';
+    const config = parseArgs([]);
+    expect(config.disableSaml2).toBe(true);
+    expect(config.ppAllowSharedCookies).toBe(true);
+  });
+
+  it('defaults xsuaaAuth to false', () => {
+    const config = parseArgs([]);
+    expect(config.xsuaaAuth).toBe(false);
+  });
+
+  it('parses --xsuaa-auth flag', () => {
+    const config = parseArgs(['--xsuaa-auth', 'true']);
+    expect(config.xsuaaAuth).toBe(true);
+  });
+
+  it('parses SAP_XSUAA_AUTH env var', () => {
+    process.env.SAP_XSUAA_AUTH = 'true';
+    const config = parseArgs([]);
+    expect(config.xsuaaAuth).toBe(true);
+  });
+
+  // --- Extensions (FEAT-61) ---
+
+  it('defaults extension flags: plugins empty, execute + raw-writes false', () => {
+    const config = parseArgs([]);
+    expect(config.plugins).toEqual([]);
+    expect(config.allowPluginExecute).toBe(false);
+    expect(config.allowPluginRawWrites).toBe(false);
+  });
+
+  it('parses ARC1_PLUGINS as a trimmed, empty-filtered CSV of absolute paths', () => {
+    process.env.ARC1_PLUGINS = ' /abs/a/dist/index.js , ,/abs/b.tool.json ';
+    expect(parseArgs([]).plugins).toEqual(['/abs/a/dist/index.js', '/abs/b.tool.json']);
+  });
+
+  it('--plugins flag overrides ARC1_PLUGINS', () => {
+    process.env.ARC1_PLUGINS = '/abs/env.js';
+    expect(parseArgs(['--plugins', '/abs/flag.js']).plugins).toEqual(['/abs/flag.js']);
+  });
+
+  it('parses SAP_ALLOW_PLUGIN_EXECUTE=true; "false"/"" stay false (no coerce footgun)', () => {
+    process.env.SAP_ALLOW_PLUGIN_EXECUTE = 'true';
+    expect(parseArgs([]).allowPluginExecute).toBe(true);
+    process.env.SAP_ALLOW_PLUGIN_EXECUTE = 'false';
+    expect(parseArgs([]).allowPluginExecute).toBe(false);
+    process.env.SAP_ALLOW_PLUGIN_EXECUTE = '';
+    expect(parseArgs([]).allowPluginExecute).toBe(false);
+  });
+
+  it('parses SAP_ALLOW_PLUGIN_RAW_WRITES=true; "false"/"" stay false (no coerce footgun)', () => {
+    process.env.SAP_ALLOW_PLUGIN_RAW_WRITES = 'true';
+    expect(parseArgs([]).allowPluginRawWrites).toBe(true);
+    process.env.SAP_ALLOW_PLUGIN_RAW_WRITES = 'false';
+    expect(parseArgs([]).allowPluginRawWrites).toBe(false);
+    process.env.SAP_ALLOW_PLUGIN_RAW_WRITES = '';
+    expect(parseArgs([]).allowPluginRawWrites).toBe(false);
+    expect(parseArgs(['--allow-plugin-raw-writes', 'true']).allowPluginRawWrites).toBe(true);
+  });
+
+  // --- BTP ABAP Environment (service key) ---
+
+  it('defaults BTP service key fields', () => {
+    const config = parseArgs([]);
+    expect(config.btpServiceKey).toBeUndefined();
+    expect(config.btpServiceKeyFile).toBeUndefined();
+    expect(config.btpOAuthCallbackPort).toBe(0);
+  });
+
+  it('parses --btp-service-key flag', () => {
+    const config = parseArgs(['--btp-service-key', '{"uaa":{}}']);
+    expect(config.btpServiceKey).toBe('{"uaa":{}}');
+  });
+
+  it('parses SAP_BTP_SERVICE_KEY env var', () => {
+    process.env.SAP_BTP_SERVICE_KEY = '{"uaa":{"url":"x"}}';
+    const config = parseArgs([]);
+    expect(config.btpServiceKey).toBe('{"uaa":{"url":"x"}}');
+  });
+
+  it('parses --btp-service-key-file flag', () => {
+    const config = parseArgs(['--btp-service-key-file', '/path/to/key.json']);
+    expect(config.btpServiceKeyFile).toBe('/path/to/key.json');
+  });
+
+  it('parses SAP_BTP_SERVICE_KEY_FILE env var', () => {
+    process.env.SAP_BTP_SERVICE_KEY_FILE = '/path/to/key.json';
+    const config = parseArgs([]);
+    expect(config.btpServiceKeyFile).toBe('/path/to/key.json');
+  });
+
+  it('parses --btp-oauth-callback-port flag', () => {
+    const config = parseArgs(['--btp-oauth-callback-port', '3001']);
+    expect(config.btpOAuthCallbackPort).toBe(3001);
+  });
+
+  it('parses SAP_BTP_OAUTH_CALLBACK_PORT env var', () => {
+    process.env.SAP_BTP_OAUTH_CALLBACK_PORT = '4001';
+    const config = parseArgs([]);
+    expect(config.btpOAuthCallbackPort).toBe(4001);
+  });
+
+  // --- System Type Detection ---
+
+  it('defaults systemType to auto', () => {
+    const config = parseArgs([]);
+    expect(config.systemType).toBe('auto');
+  });
+
+  it('parses --system-type btp flag', () => {
+    const config = parseArgs(['--system-type', 'btp']);
+    expect(config.systemType).toBe('btp');
+  });
+
+  it('parses --system-type onprem flag', () => {
+    const config = parseArgs(['--system-type', 'onprem']);
+    expect(config.systemType).toBe('onprem');
+  });
+
+  it('parses SAP_SYSTEM_TYPE env var', () => {
+    process.env.SAP_SYSTEM_TYPE = 'btp';
+    const config = parseArgs([]);
+    expect(config.systemType).toBe('btp');
+  });
+
+  it('defaults unknown system type to auto', () => {
+    const config = parseArgs(['--system-type', 'invalid']);
+    expect(config.systemType).toBe('auto');
+  });
+
+  it('CLI --system-type takes precedence over SAP_SYSTEM_TYPE env', () => {
+    process.env.SAP_SYSTEM_TYPE = 'onprem';
+    const config = parseArgs(['--system-type', 'btp']);
+    expect(config.systemType).toBe('btp');
+  });
+
+  // --- ABAP Release Override ---
+
+  it('defaults abapRelease to undefined', () => {
+    const config = parseArgs([]);
+    expect(config.abapRelease).toBeUndefined();
+  });
+
+  it('parses --abap-release flag', () => {
+    const config = parseArgs(['--abap-release', '758']);
+    expect(config.abapRelease).toBe('758');
+  });
+
+  it('parses SAP_ABAP_RELEASE env var', () => {
+    process.env.SAP_ABAP_RELEASE = '750';
+    const config = parseArgs([]);
+    expect(config.abapRelease).toBe('750');
+  });
+
+  it('CLI --abap-release takes precedence over SAP_ABAP_RELEASE env', () => {
+    process.env.SAP_ABAP_RELEASE = '750';
+    const config = parseArgs(['--abap-release', '7.58']);
+    expect(config.abapRelease).toBe('7.58');
+  });
+
+  // --- allowDataPreview (replaces blockData) ---
+
+  it('parses --allow-data-preview flag', () => {
+    const config = parseArgs(['--allow-data-preview', 'true']);
+    expect(config.allowDataPreview).toBe(true);
+  });
+
+  it('parses SAP_ALLOW_DATA_PREVIEW env var', () => {
+    process.env.SAP_ALLOW_DATA_PREVIEW = '1';
+    const config = parseArgs([]);
+    expect(config.allowDataPreview).toBe(true);
+  });
+
+  it('defaults allowDataPreview to false', () => {
+    const config = parseArgs([]);
+    expect(config.allowDataPreview).toBe(false);
+  });
+
+  // --- maxConcurrent ---
+
+  it('defaults maxConcurrent to 10', () => {
+    const config = parseArgs([]);
+    expect(config.maxConcurrent).toBe(10);
+  });
+
+  it('parses --max-concurrent flag', () => {
+    const config = parseArgs(['--max-concurrent', '5']);
+    expect(config.maxConcurrent).toBe(5);
+  });
+
+  it('parses ARC1_MAX_CONCURRENT env var', () => {
+    process.env.ARC1_MAX_CONCURRENT = '20';
+    const config = parseArgs([]);
+    expect(config.maxConcurrent).toBe(20);
+  });
+
+  it('clamps maxConcurrent to minimum 1', () => {
+    const config = parseArgs(['--max-concurrent', '0']);
+    expect(config.maxConcurrent).toBe(1);
+  });
+
+  it('clamps invalid maxConcurrent to 1', () => {
+    const config = parseArgs(['--max-concurrent', 'notanumber']);
+    expect(config.maxConcurrent).toBe(1);
+  });
+
+  it('--max-concurrent takes precedence over ARC1_MAX_CONCURRENT', () => {
+    process.env.ARC1_MAX_CONCURRENT = '20';
+    const config = parseArgs(['--max-concurrent', '3']);
+    expect(config.maxConcurrent).toBe(3);
+  });
+
+  // --- Data-result safety envelope ---
+
+  it('defaults the data response budget to 2 MiB and data-result concurrency to 2', () => {
+    const config = parseArgs([]);
+    expect(config.maxDataPreviewResponseBytes).toBe(2 * 1024 * 1024);
+    expect(config.maxConcurrentDataResults).toBe(2);
+  });
+
+  it('parses data-result limits with CLI precedence over environment', () => {
+    process.env.ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES = '3000000';
+    process.env.ARC1_MAX_CONCURRENT_DATA_RESULTS = '3';
+    const { config, sources } = resolveConfig([
+      '--max-datapreview-response-bytes',
+      '4000000',
+      '--max-concurrent-data-results',
+      '4',
+    ]);
+    expect(config.maxDataPreviewResponseBytes).toBe(4_000_000);
+    expect(config.maxConcurrentDataResults).toBe(4);
+    expect(sources.maxDataPreviewResponseBytes).toEqual({ flag: '--max-datapreview-response-bytes' });
+    expect(sources.maxConcurrentDataResults).toEqual({ flag: '--max-concurrent-data-results' });
+  });
+
+  it.each([
+    ['ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES', '0'],
+    ['ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES', '-1'],
+    ['ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES', '1.5'],
+    ['ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES', ' 10'],
+    ['ARC1_MAX_CONCURRENT_DATA_RESULTS', 'not-a-number'],
+    ['ARC1_MAX_CONCURRENT_DATA_RESULTS', String(Number.MAX_SAFE_INTEGER + 1)],
+  ])('rejects invalid positive-integer setting %s=%s', (name, value) => {
+    process.env[name] = value;
+    expect(() => parseArgs([])).toThrow(/positive base-10 integer|safe-integer range/);
+  });
+
+  // --- Rate limiting (Layer 1 + Layer 2) ---
+
+  it('defaults authRateLimit to 20 (Layer 1 on) and rateLimit to 0 (Layer 2 off)', () => {
+    // ADR-0004: Layer 2 ships disabled by default — operators with multi-user
+    // deployments opt in via ARC1_RATE_LIMIT>0. Layer 1 stays on at 20/min/IP.
+    const config = parseArgs([]);
+    expect(config.authRateLimit).toBe(20);
+    expect(config.mcpHttpRateLimit).toBeUndefined();
+    expect(config.rateLimit).toBe(0);
+  });
+
+  it('parses --auth-rate-limit flag', () => {
+    const config = parseArgs(['--auth-rate-limit', '50']);
+    expect(config.authRateLimit).toBe(50);
+  });
+
+  it('parses ARC1_AUTH_RATE_LIMIT env var', () => {
+    process.env.ARC1_AUTH_RATE_LIMIT = '30';
+    const config = parseArgs([]);
+    expect(config.authRateLimit).toBe(30);
+  });
+
+  it('ARC1_AUTH_RATE_LIMIT=0 disables Layer 1', () => {
+    process.env.ARC1_AUTH_RATE_LIMIT = '0';
+    const config = parseArgs([]);
+    expect(config.authRateLimit).toBe(0);
+  });
+
+  it('parses an explicit shared MCP HTTP/IP rate limit including 0', () => {
+    process.env.ARC1_MCP_HTTP_RATE_LIMIT = '3000';
+    expect(parseArgs([]).mcpHttpRateLimit).toBe(3000);
+    process.env.ARC1_MCP_HTTP_RATE_LIMIT = '0';
+    expect(parseArgs([]).mcpHttpRateLimit).toBe(0);
+  });
+
+  it('keeps the derived MCP HTTP/IP limit when its override is invalid', () => {
+    process.env.ARC1_MCP_HTTP_RATE_LIMIT = '-1';
+    expect(parseArgs([]).mcpHttpRateLimit).toBeUndefined();
+  });
+
+  it('parses --rate-limit flag', () => {
+    const config = parseArgs(['--rate-limit', '120']);
+    expect(config.rateLimit).toBe(120);
+  });
+
+  it('parses ARC1_RATE_LIMIT env var', () => {
+    process.env.ARC1_RATE_LIMIT = '90';
+    const config = parseArgs([]);
+    expect(config.rateLimit).toBe(90);
+  });
+
+  it('ARC1_RATE_LIMIT=0 disables Layer 2', () => {
+    process.env.ARC1_RATE_LIMIT = '0';
+    const config = parseArgs([]);
+    expect(config.rateLimit).toBe(0);
+  });
+
+  it('invalid ARC1_AUTH_RATE_LIMIT falls back to default 20', () => {
+    process.env.ARC1_AUTH_RATE_LIMIT = 'notanumber';
+    const config = parseArgs([]);
+    expect(config.authRateLimit).toBe(20);
+  });
+
+  it('invalid ARC1_RATE_LIMIT falls back to default 0 (Layer 2 disabled)', () => {
+    process.env.ARC1_RATE_LIMIT = '-5';
+    const config = parseArgs([]);
+    expect(config.rateLimit).toBe(0);
+  });
+
+  it('--auth-rate-limit takes precedence over ARC1_AUTH_RATE_LIMIT', () => {
+    process.env.ARC1_AUTH_RATE_LIMIT = '99';
+    const config = parseArgs(['--auth-rate-limit', '7']);
+    expect(config.authRateLimit).toBe(7);
+  });
+
+  // --- oauthDcrTtlSeconds ---
+
+  it('defaults oauthDcrTtlSeconds to 0 (never expire)', () => {
+    const config = parseArgs([]);
+    expect(config.oauthDcrTtlSeconds).toBe(0);
+  });
+
+  it('parses --oauth-dcr-ttl-seconds flag', () => {
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', '3600']);
+    expect(config.oauthDcrTtlSeconds).toBe(3600);
+  });
+
+  it('parses ARC1_OAUTH_DCR_TTL_SECONDS env var', () => {
+    process.env.ARC1_OAUTH_DCR_TTL_SECONDS = '7200';
+    const config = parseArgs([]);
+    expect(config.oauthDcrTtlSeconds).toBe(7200);
+  });
+
+  it('clamps positive oauthDcrTtlSeconds to a 60-second floor', () => {
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', '5']);
+    expect(config.oauthDcrTtlSeconds).toBe(60);
+  });
+
+  it('clamps oauthDcrTtlSeconds to a 90-day ceiling', () => {
+    const ninetyOneDays = 91 * 24 * 60 * 60;
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', String(ninetyOneDays)]);
+    expect(config.oauthDcrTtlSeconds).toBe(90 * 24 * 60 * 60);
+  });
+
+  it('explicit 0 disables TTL (bypasses 60-second floor)', () => {
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', '0']);
+    expect(config.oauthDcrTtlSeconds).toBe(0);
+  });
+
+  it('negative values are normalized to 0 (TTL disabled)', () => {
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', '-1']);
+    expect(config.oauthDcrTtlSeconds).toBe(0);
+  });
+
+  it('keeps default oauthDcrTtlSeconds when value is not parseable', () => {
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', 'notanumber']);
+    expect(config.oauthDcrTtlSeconds).toBe(0);
+  });
+
+  it('--oauth-dcr-ttl-seconds takes precedence over ARC1_OAUTH_DCR_TTL_SECONDS', () => {
+    process.env.ARC1_OAUTH_DCR_TTL_SECONDS = '7200';
+    const config = parseArgs(['--oauth-dcr-ttl-seconds', '3600']);
+    expect(config.oauthDcrTtlSeconds).toBe(3600);
+  });
+
+  // --- dcrSigningSecret ---
+
+  it('dcrSigningSecret is undefined by default (falls back to XSUAA clientsecret in xsuaa.ts)', () => {
+    const config = parseArgs([]);
+    expect(config.dcrSigningSecret).toBeUndefined();
+  });
+
+  it('parses --dcr-signing-secret flag', () => {
+    const config = parseArgs(['--dcr-signing-secret', 'super-stable-hmac-key']);
+    expect(config.dcrSigningSecret).toBe('super-stable-hmac-key');
+  });
+
+  it('parses ARC1_DCR_SIGNING_SECRET env var', () => {
+    process.env.ARC1_DCR_SIGNING_SECRET = 'env-derived-hmac-key';
+    const config = parseArgs([]);
+    expect(config.dcrSigningSecret).toBe('env-derived-hmac-key');
+  });
+
+  it('--dcr-signing-secret takes precedence over ARC1_DCR_SIGNING_SECRET', () => {
+    process.env.ARC1_DCR_SIGNING_SECRET = 'env-value';
+    const config = parseArgs(['--dcr-signing-secret', 'flag-value']);
+    expect(config.dcrSigningSecret).toBe('flag-value');
+  });
+
+  // --- API_KEY_PROFILES ---
+
+  it('API_KEY_PROFILES contains all 7 expected profiles', () => {
+    expect(Object.keys(API_KEY_PROFILES).sort()).toEqual([
+      'admin',
+      'developer',
+      'developer-data',
+      'developer-sql',
+      'viewer',
+      'viewer-data',
+      'viewer-sql',
+    ]);
+  });
+
+  it('API_KEY_PROFILES.viewer has read-only scopes and restrictive safety', () => {
+    expect(API_KEY_PROFILES.viewer.scopes).toEqual(['read']);
+    expect(API_KEY_PROFILES.viewer.safety.allowWrites).toBe(false);
+    expect(API_KEY_PROFILES.viewer.safety.allowDataPreview).toBe(false);
+    expect(API_KEY_PROFILES.viewer.safety.allowFreeSQL).toBe(false);
+  });
+
+  it('API_KEY_PROFILES.developer includes transports and git scopes', () => {
+    expect(API_KEY_PROFILES.developer.scopes).toContain('read');
+    expect(API_KEY_PROFILES.developer.scopes).toContain('write');
+    expect(API_KEY_PROFILES.developer.scopes).toContain('transports');
+    expect(API_KEY_PROFILES.developer.scopes).toContain('git');
+    expect(API_KEY_PROFILES.developer.safety.allowWrites).toBe(true);
+    expect(API_KEY_PROFILES.developer.safety.allowTransportWrites).toBe(true);
+    expect(API_KEY_PROFILES.developer.safety.allowGitWrites).toBe(true);
+    expect(API_KEY_PROFILES.developer.safety.allowedPackages).toEqual(['$TMP']);
+  });
+
+  it('API_KEY_PROFILES.admin has all 7 scopes', () => {
+    expect(API_KEY_PROFILES.admin.scopes.sort()).toEqual([
+      'admin',
+      'data',
+      'git',
+      'read',
+      'sql',
+      'transports',
+      'write',
+    ]);
+  });
+
+  it('API_KEY_PROFILES.developer-sql allows SQL and data preview', () => {
+    expect(API_KEY_PROFILES['developer-sql'].scopes).toContain('sql');
+    expect(API_KEY_PROFILES['developer-sql'].scopes).toContain('data');
+    expect(API_KEY_PROFILES['developer-sql'].safety.allowFreeSQL).toBe(true);
+    expect(API_KEY_PROFILES['developer-sql'].safety.allowDataPreview).toBe(true);
+  });
+
+  // --- Multi-key API keys ---
+
+  it('parses ARC1_API_KEYS env var', () => {
+    process.env.ARC1_API_KEYS = 'key1:viewer,key2:developer';
+    const config = parseArgs([]);
+    expect(config.apiKeys).toEqual([
+      { key: 'key1', profile: 'viewer' },
+      { key: 'key2', profile: 'developer' },
+    ]);
+  });
+
+  it('parses --api-keys flag', () => {
+    const config = parseArgs(['--api-keys', 'abc:viewer-data,def:developer-sql']);
+    expect(config.apiKeys).toEqual([
+      { key: 'abc', profile: 'viewer-data' },
+      { key: 'def', profile: 'developer-sql' },
+    ]);
+  });
+
+  it('--api-keys flag takes precedence over ARC1_API_KEYS env', () => {
+    process.env.ARC1_API_KEYS = 'env-key:viewer';
+    const config = parseArgs(['--api-keys', 'cli-key:developer']);
+    expect(config.apiKeys).toEqual([{ key: 'cli-key', profile: 'developer' }]);
+  });
+
+  it('apiKeys is undefined when not configured', () => {
+    const config = parseArgs([]);
+    expect(config.apiKeys).toBeUndefined();
+  });
+
+  // --- resolveConfig (per-field source attribution) ---
+
+  it('resolveConfig returns per-field sources (default when unset)', () => {
+    const { sources } = resolveConfig([]);
+    expect(sources.allowWrites).toBe('default');
+    expect(sources.gzipDataPreviewBody).toBe('default');
+    expect(sources.blockedDataSources).toBe('default');
+    expect(sources.allowedPackages).toBe('default');
+    expect(sources.schemaNullableOptionals).toBe('default');
+  });
+
+  it('resolveConfig reports env source for env-set fields', () => {
+    process.env.SAP_ALLOW_WRITES = 'true';
+    process.env.ARC1_SCHEMA_NULLABLE_OPTIONALS = 'on';
+    const { sources } = resolveConfig([]);
+    expect(sources.allowWrites).toEqual({ env: 'SAP_ALLOW_WRITES' });
+    expect(sources.schemaNullableOptionals).toEqual({ env: 'ARC1_SCHEMA_NULLABLE_OPTIONALS' });
+  });
+
+  it('resolveConfig reports flag source for CLI-set fields', () => {
+    const { sources } = resolveConfig(['--allow-writes', 'true', '--schema-nullable-optionals', 'off']);
+    expect(sources.allowWrites).toEqual({ flag: '--allow-writes' });
+    expect(sources.schemaNullableOptionals).toEqual({ flag: '--schema-nullable-optionals' });
+  });
+
+  it('resolveConfig returns both config and sources', () => {
+    const result = resolveConfig(['--allow-writes', 'true']);
+    expect(result.config.allowWrites).toBe(true);
+    expect(result.sources.allowWrites).toEqual({ flag: '--allow-writes' });
+  });
+});
+
+// ─── parseApiKeys ───────────────────────────────────────────────────
+
+describe('parseApiKeys', () => {
+  it('parses single key:profile pair', () => {
+    expect(parseApiKeys('mykey:viewer')).toEqual([{ key: 'mykey', profile: 'viewer' }]);
+  });
+
+  it('parses multiple key:profile pairs', () => {
+    expect(parseApiKeys('k1:viewer,k2:developer,k3:viewer-sql')).toEqual([
+      { key: 'k1', profile: 'viewer' },
+      { key: 'k2', profile: 'developer' },
+      { key: 'k3', profile: 'viewer-sql' },
+    ]);
+  });
+
+  it('trims whitespace', () => {
+    expect(parseApiKeys(' k1:viewer , k2:developer ')).toEqual([
+      { key: 'k1', profile: 'viewer' },
+      { key: 'k2', profile: 'developer' },
+    ]);
+  });
+
+  it('handles key with colons (e.g. base64)', () => {
+    // Last colon splits key from profile — keys may contain colons
+    expect(parseApiKeys('abc:def:ghi:viewer')).toEqual([{ key: 'abc:def:ghi', profile: 'viewer' }]);
+  });
+
+  it('throws on missing colon separator', () => {
+    expect(() => parseApiKeys('keyonly')).toThrow(/entry at position 1.*'key:profile' format/);
+  });
+
+  it('throws on empty key', () => {
+    expect(() => parseApiKeys(':viewer')).toThrow(/entry at position 1.*non-empty key/);
+  });
+
+  it('throws on invalid profile name', () => {
+    expect(() => parseApiKeys('mykey:nonexistent')).toThrow(/entry at position 1.*Valid profiles:/);
+  });
+
+  it.each([
+    ['first-secret-key', 1, ['first-secret-key']],
+    ['valid-key:viewer,second-secret-key', 2, ['valid-key', 'second-secret-key']],
+    ['third-secret-key:secret-profile-name', 1, ['third-secret-key', 'secret-profile-name']],
+  ])('never includes caller material in an invalid entry error for %s', (raw, position, sentinels) => {
+    let message = '';
+    try {
+      parseApiKeys(raw);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(message).toContain(`entry at position ${position}`);
+    expect(message).toContain("'key:profile' format");
+    for (const sentinel of sentinels) expect(message).not.toContain(sentinel);
+  });
+
+  it('throws on empty string', () => {
+    expect(() => parseApiKeys('')).toThrow(/no valid entries/);
+  });
+
+  it('skips empty segments from trailing comma', () => {
+    expect(parseApiKeys('k1:viewer,')).toEqual([{ key: 'k1', profile: 'viewer' }]);
+  });
+
+  it('accepts all valid profile names', () => {
+    const profiles = ['viewer', 'viewer-data', 'viewer-sql', 'developer', 'developer-data', 'developer-sql'];
+    for (const p of profiles) {
+      expect(parseApiKeys(`testkey:${p}`)).toEqual([{ key: 'testkey', profile: p }]);
+    }
+  });
+});
+
+// ─── validateConfig ─────────────────────────────────────────────────
+
+describe('validateConfig', () => {
+  const validMultiTargetConfig = {
+    ...DEFAULT_CONFIG,
+    multiTargetEndpoints: true,
+    transport: 'http-streamable' as const,
+    xsuaaAuth: true,
+    dcrSigningSecret: 'stable-test-secret',
+    cacheMode: 'none' as const,
+  };
+
+  it('accepts the conservative multi-target prerequisite set', () => {
+    expect(() => validateConfig(validMultiTargetConfig)).not.toThrow();
+  });
+
+  it.each([
+    [{ transport: 'stdio' as const }, /SAP_TRANSPORT=http-streamable/],
+    [{ xsuaaAuth: false }, /SAP_XSUAA_AUTH=true/],
+    [{ cacheMode: 'memory' as const }, /ARC1_CACHE=none/],
+    [{ toolMode: 'hyperfocused' as const }, /ARC1_TOOL_MODE=standard/],
+    [{ uiMode: 'web' as const }, /ARC1_UI=off/],
+    [{ plugins: ['/tmp/plugin.js'] }, /does not support ARC1_PLUGINS/],
+    [{ cookieString: 'cookie' }, /does not support shared cookies/],
+    [{ ppAllowSharedCookies: true }, /does not support shared cookies/],
+    [{ btpServiceKey: '{}' }, /not a BTP service key/],
+    [{ url: 'https://direct.example' }, /does not support a direct SAP_URL/],
+    [{ username: 'direct-user' }, /does not support a direct SAP_URL/],
+  ])('rejects an unsafe or incompatible multi-target prerequisite %#', (override, expected) => {
+    expect(() => validateConfig({ ...validMultiTargetConfig, ...override })).toThrow(expected);
+  });
+
+  it('throws when oidcIssuer is set without oidcAudience', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        oidcIssuer: 'https://login.microsoftonline.com/tenant/v2.0',
+      }),
+    ).toThrow('SAP_OIDC_AUDIENCE is required when SAP_OIDC_ISSUER is set');
+  });
+
+  it('throws when oidcAudience is set without oidcIssuer', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        oidcAudience: 'api://arc-1',
+      }),
+    ).toThrow('SAP_OIDC_ISSUER is required when SAP_OIDC_AUDIENCE is set');
+  });
+
+  it('throws when oidcScopes is set without oidcIssuer — nothing would advertise them', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        oidcScopes: ['api://arc-1/access_as_user'],
+      }),
+    ).toThrow('SAP_OIDC_ISSUER is required when SAP_OIDC_SCOPES is set');
+  });
+
+  it('accepts config with both oidcIssuer and oidcAudience', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        oidcIssuer: 'https://login.microsoftonline.com/tenant/v2.0',
+        oidcAudience: 'api://arc-1',
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts config with neither oidcIssuer nor oidcAudience', () => {
+    expect(() => validateConfig({ ...DEFAULT_CONFIG })).not.toThrow();
+  });
+
+  it('warns but does not throw when ppStrict is true without ppEnabled', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          ppStrict: true,
+          ppEnabled: false,
+        }),
+      ).not.toThrow();
+      expect(stderrSpy.mock.calls.flat().join(' ')).toContain('SAP_PP_STRICT=true has no effect');
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('accepts ppStrict with ppEnabled', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        ppStrict: true,
+        ppEnabled: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it('throws when ppEnabled is combined with cookieFile without opt-in', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        ppEnabled: true,
+        cookieFile: '/tmp/cookies.txt',
+      }),
+    ).toThrow('SAP_PP_ENABLED=true is incompatible with SAP_COOKIE_FILE / SAP_COOKIE_STRING');
+  });
+
+  it('throws when ppEnabled is combined with cookieString without opt-in', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        ppEnabled: true,
+        cookieString: 'SAP_SESSIONID=abc',
+      }),
+    ).toThrow('SAP_PP_ENABLED=true is incompatible with SAP_COOKIE_FILE / SAP_COOKIE_STRING');
+  });
+
+  it('accepts ppEnabled with cookies when SAP_PP_ALLOW_SHARED_COOKIES=true', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        ppEnabled: true,
+        cookieFile: '/tmp/cookies.txt',
+        ppAllowSharedCookies: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it('throws when btpServiceKey is combined with cookies', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        btpServiceKey: '{"uaa":{"url":"https://uaa.example.com"}}',
+        cookieFile: '/tmp/cookies.txt',
+      }),
+    ).toThrow('SAP_BTP_SERVICE_KEY is incompatible with SAP_COOKIE_FILE / SAP_COOKIE_STRING');
+  });
+
+  it('throws when btpServiceKey is combined with ppEnabled', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        btpServiceKey: '{"uaa":{"url":"https://uaa.example.com"}}',
+        ppEnabled: true,
+      }),
+    ).toThrow('SAP_BTP_SERVICE_KEY (BTP ABAP) is incompatible with SAP_PP_ENABLED=true');
+  });
+
+  it('warns to stderr (without throwing) when disableSaml2=true on btp system', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          disableSaml2: true,
+          systemType: 'btp',
+        }),
+      ).not.toThrow();
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining('SAP_DISABLE_SAML=true on a BTP system usually breaks login'),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('warns to stderr (without throwing) when SAP TLS verification is disabled', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          insecure: true,
+        }),
+      ).not.toThrow();
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining('SAP_INSECURE=true disables SAP TLS certificate verification'),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('warns to stderr (without throwing) when dcrSigningSecret is set with xsuaaAuth=false', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          dcrSigningSecret: 'some-stable-secret',
+          xsuaaAuth: false,
+        }),
+      ).not.toThrow();
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining('ARC1_DCR_SIGNING_SECRET is set but SAP_XSUAA_AUTH=false'),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('warns to stderr (without throwing) when xsuaaAuth=true on HTTP transport but dcrSigningSecret is unset', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        validateConfig({
+          ...DEFAULT_CONFIG,
+          transport: 'http-streamable',
+          xsuaaAuth: true,
+        }),
+      ).not.toThrow();
+      expect(stderrSpy).toHaveBeenCalledWith(
+        expect.stringContaining('SAP_XSUAA_AUTH=true without ARC1_DCR_SIGNING_SECRET'),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('does not warn about a missing dcrSigningSecret on stdio transport (XSUAA inert; CLI runs validateConfig per command)', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'stdio',
+        xsuaaAuth: true,
+      });
+      expect(stderrSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('SAP_XSUAA_AUTH=true without ARC1_DCR_SIGNING_SECRET'),
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('does not warn about dcrSigningSecret when xsuaaAuth=true', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        dcrSigningSecret: 'some-stable-secret',
+        xsuaaAuth: true,
+      });
+      expect(stderrSpy).not.toHaveBeenCalledWith(expect.stringContaining('ARC1_DCR_SIGNING_SECRET'));
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('does not warn when dcrSigningSecret is unset', () => {
+    const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        xsuaaAuth: false,
+      });
+      expect(stderrSpy).not.toHaveBeenCalledWith(expect.stringContaining('ARC1_DCR_SIGNING_SECRET'));
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  it('parseArgs fails with oidcIssuer but no oidcAudience', () => {
+    process.env.SAP_OIDC_ISSUER = 'https://example.com';
+    expect(() => parseArgs([])).toThrow('SAP_OIDC_AUDIENCE is required');
+  });
+
+  it('parses SAP_OIDC_SCOPES from comma or whitespace separated values, and defaults discovery on', () => {
+    process.env.SAP_OIDC_ISSUER = 'https://example.com';
+    process.env.SAP_OIDC_AUDIENCE = 'api://arc-1';
+    process.env.SAP_OIDC_SCOPES = 'api://arc-1/access_as_user, api://arc-1/read';
+    expect(parseArgs([]).oidcScopes).toEqual(['api://arc-1/access_as_user', 'api://arc-1/read']);
+    expect(parseArgs([]).oidcDiscovery).toBe(true);
+
+    process.env.SAP_OIDC_SCOPES = 'api://arc-1/access_as_user api://arc-1/read';
+    expect(parseArgs([]).oidcScopes).toEqual(['api://arc-1/access_as_user', 'api://arc-1/read']);
+  });
+
+  it('honors the SAP_OIDC_DISCOVERY opt-out (Entra AADSTS9010010 escape hatch)', () => {
+    process.env.SAP_OIDC_ISSUER = 'https://example.com';
+    process.env.SAP_OIDC_AUDIENCE = 'api://arc-1';
+    process.env.SAP_OIDC_DISCOVERY = 'false';
+    expect(parseArgs([]).oidcDiscovery).toBe(false);
+    expect(parseArgs(['--oidc-discovery', 'true']).oidcDiscovery).toBe(true);
+  });
+
+  it.each(['100', '000', '999', '010', '001'])('accepts the 3-digit client %s', (client) => {
+    expect(() => validateConfig({ ...DEFAULT_CONFIG, client })).not.toThrow();
+  });
+
+  it.each(['10', '1', '0', '1000', '00', 'abc', '10a', ' 100'])('throws on the malformed client %s', (client) => {
+    expect(() => validateConfig({ ...DEFAULT_CONFIG, client })).toThrow(/Invalid SAP_CLIENT/);
+  });
+
+  it('skips client validation when empty (resolveConfig substitutes the default)', () => {
+    expect(() => validateConfig({ ...DEFAULT_CONFIG, client: '' })).not.toThrow();
+  });
+
+  it('validateConfig rejects invalid schemaNullableOptionals values', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        schemaNullableOptionals: 'nullable' as any,
+      }),
+    ).toThrow(/Invalid ARC1_SCHEMA_NULLABLE_OPTIONALS/);
+  });
+
+  it('throws when HTTP transport has no authentication and no explicit unsafe opt-in', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+      }),
+    ).toThrow('HTTP transport requires ARC-1 authentication');
+  });
+
+  it('accepts HTTP transport without authentication only with explicit unsafe opt-in', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+        allowHttpNoAuth: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts HTTP transport with API key authentication', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+        apiKeys: [{ key: 'viewer-secret', profile: 'viewer' }],
+      }),
+    ).not.toThrow();
+  });
+
+  it('throws when web UI is enabled without HTTP auth', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+        uiMode: 'web',
+        allowHttpNoAuth: true,
+      }),
+    ).toThrow('ARC1_UI=web requires HTTP authentication');
+  });
+
+  it('throws when web UI is enabled with API keys but no admin key', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+        uiMode: 'web',
+        apiKeys: [{ key: 'viewer-secret', profile: 'viewer' }],
+      }),
+    ).toThrow('ARC1_UI=web requires HTTP authentication');
+  });
+
+  it('accepts web UI with an admin API key configured', () => {
+    expect(() =>
+      validateConfig({
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable',
+        uiMode: 'web',
+        apiKeys: [{ key: 'admin-secret', profile: 'admin' }],
+      }),
+    ).not.toThrow();
+  });
+});

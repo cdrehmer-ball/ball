@@ -1,0 +1,375 @@
+# BTP Destination Reference
+
+Use this page to choose and configure the BTP destination consumed by ARC-1. It is a property
+reference, not a second Principal Propagation procedure. For Cloud Connector certificates, SAP
+trust, CERTRULE, SU01, ICM/SICF, and end-to-end testing, follow
+[Principal Propagation Setup](principal-propagation-setup.md).
+
+For the ordered application deployment, start with
+[BTP Cloud Foundry Deployment](btp-cloud-foundry-deployment.md). For experimental many-system
+routing, follow [Multi-System Setup](multi-target-setup.md).
+
+## Authentication modes
+
+| Destination/auth mode | SAP identity | Proxy | Recommended use |
+|---|---|---|---|
+| `BasicAuthentication` | Shared technical SAP user | Usually `OnPremise` | Single-target startup/shared operation; default-off multi-target exception |
+| `PrincipalPropagation` | Human XSUAA user mapped to SAP | `OnPremise` | Recommended on-premise per-user path |
+| `OAuth2UserTokenExchange` | Human user exchanged into BTP ABAP | `Internet` | Same-subaccount BTP ABAP Environment |
+| `OAuth2SAMLBearerAssertion` | Human user exchanged through configured trust | `Internet` | Supported cloud/cross-subaccount topology |
+| `SAMLAssertion` | Human user through the destination's SAML assertion | `Internet` | S/4HANA Public Cloud setup described in its guide |
+
+Multi-target v1 accepts only `OnPremise` `PrincipalPropagation`, or explicitly permitted
+`BasicAuthentication`, and always requires XSUAA. It does not accept API keys, direct OIDC, cloud
+targets, or cross-subaccount/SaaS discovery.
+
+## Destination level and visibility
+
+BTP has global-account, subaccount, and service-instance destination scopes. ARC-1 multi-target v1
+discovers **subaccount-level** candidates only. It reads instance-level destination names solely to
+detect shadowing: if an instance destination has the same name as a subaccount candidate, ARC-1
+quarantines the candidate rather than rely on normal lookup precedence.
+
+Create multi-target destinations in **BTP Cockpit → the intended subaccount → Connectivity →
+Destinations**. A destination created only for one service instance does not become a target.
+
+Subaccount visibility also means that another suitable application in the same subaccount may be
+able to resolve the destination. A second CF space is not a hard destination-inventory boundary.
+Use separate subaccounts where that inventory requires strong isolation.
+
+## Single-target destinations
+
+### Shared Basic `/mcp`
+
+Create an HTTP destination:
+
+```properties
+Name=A4H_100_BASIC
+Type=HTTP
+URL=http://a4h-basic:50000
+ProxyType=OnPremise
+Authentication=BasicAuthentication
+User=<least-privileged-sap-user>
+Password=<managed-secret>
+sap-client=100
+```
+
+Under `modules[].properties` for `arc1-mcp-server` in the customer's `mta-overrides.mtaext`, point
+the application at it and explicitly disable the PP defaults inherited from the base MTA:
+
+```yaml
+SAP_BTP_DESTINATION: "A4H_100_BASIC"
+SAP_PP_ENABLED: "false"
+SAP_PP_STRICT: "false"
+```
+
+The tracked
+[single-Basic profile](btp-cloud-foundry-deployment.md#single-target-read-only-shared-basic-profile)
+provides the complete read-only extension and destination template. ARC-1 resolves this destination
+at startup for the single target. Use internal HTTPS between Cloud Connector and SAP even if the
+destination uses the virtual `http://` URL.
+
+Use a Cloud Connector mapping with principal type **None**. Have Basis verify that the ADT ICF
+service accepts HTTP Basic for the selected SAP client and technical user; a destination password
+alone cannot make an SSO-only service accept Basic. This topology does not need a PP destination
+or user-certificate mapping in CERTRULE.
+
+This is a shared SAP identity. XSUAA can still identify the MCP caller to ARC-1, but SAP audit sees
+the technical user. Use a dedicated least-privileged user; never use an administrator's account or
+`SAP_ALL` merely for convenience.
+
+### Per-user PP `/mcp`
+
+The current single-target on-premise topology uses two explicit destinations:
+
+```properties
+# Startup target/feature discovery
+Name=A4H_100_STARTUP
+Type=HTTP
+URL=http://a4h-basic:50000
+ProxyType=OnPremise
+Authentication=BasicAuthentication
+User=<least-privileged-startup-user>
+Password=<managed-secret>
+sap-client=100
+```
+
+```properties
+# Authenticated MCP requests
+Name=A4H_100_PP
+Type=HTTP
+URL=http://a4h-pp:50100
+ProxyType=OnPremise
+Authentication=PrincipalPropagation
+sap-client=100
+```
+
+Configure:
+
+```yaml
+SAP_BTP_DESTINATION: "A4H_100_STARTUP"
+SAP_BTP_PP_DESTINATION: "A4H_100_PP"
+SAP_PP_ENABLED: "true"
+SAP_PP_STRICT: "true"
+```
+
+The Basic destination initializes the single target before an end-user JWT exists. It is not a PP
+fallback. Strict mode rejects non-JWT tool callers and a failed JWT PP request never changes to the
+shared identity. The two destinations may use different Cloud Connector virtual mappings/location
+IDs, but they must represent the intended same SAP system/client.
+
+Complete the certificate chain and mapping using
+[Principal Propagation Setup](principal-propagation-setup.md).
+
+### Startup user authorizations
+
+For **single-target PP with `SAP_PP_ENABLED=true` and explicit `SAP_PP_STRICT=true`**,
+the startup destination supplies the technical identity for feature discovery.
+JWT tool calls use the propagated user; they never fall back to this technical user.
+This separation does not describe non-PP deployments or mixed API-key mode. Multi-target
+PP has its own per-target discovery flow and needs no startup Basic destination.
+
+An `STAUTHTRACE` on SAP_BASIS 750 found the following display-only role
+sufficient for the enabled startup probes. Treat it as a tested starting point,
+not a universal minimum for every release or feature configuration:
+
+| Object | Field | Observed value |
+|---|---|---|
+| `S_ADT_RES` | `URI` | `/sap/bc/adt/*` |
+| `S_DEVELOP` | `ACTVT` | `03` |
+| `S_DEVELOP` | `DEVCLASS`, `OBJTYPE`, `OBJNAME`, `P_GROUP` | `*` |
+
+`S_ADT_RES` has only the `URI` field, not an `ACTVT` field; it controls allowed
+resource prefixes. A read implemented as HTTP POST does not imply create/change
+permission. Backend activities are checked separately through `S_DEVELOP` and
+other authorization objects; use the trace to identify them. See SAP's
+[Role and Authorization Concept](https://help.sap.com/docs/SAP_NETWEAVER_AS_ABAP_FOR_SOH_740/c238d694b825421f940829321ffa326a/4ec2c02e6e391014adc9fffe4e204223.html).
+
+The `S_DEVELOP` wildcards permit broad repository display, subject to other SAP
+authorization checks. Anyone who obtains the startup credential can exercise that
+access outside ARC-1; protect the destination password accordingly. In that trace,
+the generic ADT check used empty object fields and the BSP probe checked application display permissions.
+Have the SAP authorization owner validate any narrower role against the probes your
+release runs. An overly narrow role can mark features unavailable in the shared
+startup cache and restrict the tool surface for propagated users until the next
+probe/restart. After correcting the role, restart ARC-1 and verify the surface.
+Endpoint availability is not proof that every operation is authorized.
+
+The trace also contained denied checks for `S_USER_GRP`, `S_TRANSPRT`, `S_SYS_RWBO`,
+`S_ADMI_FCD`, `S_DYNLGPTS` and change/execute activities. Do not grant these merely to
+make a startup trace clean: some checks are optional or occur inside an endpoint
+that still returns usable discovery information.
+
+To verify, filter `STAUTHTRACE` to the technical user, record all checks, start ARC-1,
+then stop the trace and compare the denied checks with `SAPManage(action="features")`,
+which returns cached probe results without a SAP call. Individual probe logs require
+`SAP_VERBOSE=true`; they are not visible at the default INFO level.
+Use a propagated developer account to verify the actual tools separately. `SU53`
+shows only the last failed check and cannot replace this trace. Keep write and
+execute permissions out of this startup-only role.
+
+## Multi-target destination
+
+Create one subaccount destination per SAP system/client. PP is the recommended template:
+
+```properties
+Name=ARC1_A4H_100_PP
+Type=HTTP
+URL=http://a4h-pp:50100
+ProxyType=OnPremise
+Authentication=PrincipalPropagation
+sap-sysid=A4H
+sap-client=100
+Description=A4H development client 100
+arc1.enabled=true
+```
+
+Optional target-local policy:
+
+```properties
+arc1.allow_data_preview=true
+arc1.allow_free_sql=true
+```
+
+Those properties only narrow/opt into capabilities beneath the application ceiling. Data preview
+requires `SAP_ALLOW_DATA_PREVIEW=true`; freestyle SQL independently requires
+`SAP_ALLOW_FREE_SQL=true`, plus its matching XSUAA user scope and SAP authorization. No destination
+property can enable writes in multi-target v1.
+
+If the physical SAP SID/client is reused in the same ARC-1 registry, use a public alias:
+
+```properties
+sap-sysid=A4H
+sap-client=001
+arc1.target_alias=A4H-2025
+```
+
+The public target becomes `A4H-2025/001`; the real SAP identity remains `A4H/001`. Aliases are
+3–32 uppercase letters/digits with internal hyphens and must start with a letter. Every public target
+must be unique.
+
+For the shared Basic exception, change only the authentication/credential fields and enable the
+application-level ceiling described in [Multi-System Setup](multi-target-setup.md):
+
+```properties
+Authentication=BasicAuthentication
+User=<dedicated-read-only-technical-user>
+Password=<managed-secret>
+Preemptive=true
+```
+
+Any Basic target forces the whole multi-target application to exactly one non-rolling process.
+Basic is never a fallback for PP. Use a separate principal-type-None Cloud Connector mapping and
+internal HTTPS; verify the ADT ICF service accepts HTTP Basic for this user.
+
+## Multi-target field contract
+
+Property names are case-sensitive.
+
+| Property | Contract |
+|---|---|
+| `Name` | Required; 1–200 letters, digits, `_`, `.`, or `-`; destination identity, not public route |
+| `Type` | Exactly `HTTP` |
+| `URL` | Valid `http://` or `https://` virtual URL |
+| `ProxyType` | Exactly `OnPremise` in v1 |
+| `Authentication` | `PrincipalPropagation`, or explicitly permitted `BasicAuthentication` |
+| `sap-sysid` | Required real SID: exactly 3 uppercase alphanumeric characters, starting with a letter |
+| `sap-client` | Required: exactly 3 digits; never inferred from URL or name |
+| `Description` | Strongly recommended factual one-line label; missing value warns and falls back |
+| `arc1.enabled` | Required ARC-1 opt-in marker: exact boolean `true` |
+| `arc1.target_alias` | Optional public system selector, 3–32 uppercase/digit/internal-hyphen characters |
+| `arc1.allow_data_preview` | Optional exact boolean; target-local data opt-in |
+| `arc1.allow_free_sql` | Optional exact boolean; target-local SQL opt-in |
+| `sap-language` | Optional two-letter language |
+| `CloudConnectorLocationId` | Optional standard routing property; never exposed raw in `SAPTargets` |
+| `User` / `Password` | Required only for Basic; resolved per protected request and never returned in diagnostics |
+| `Preemptive` | Basic only; omit or set `true` |
+
+Unknown/wrong-case `arc1.*` keys, malformed booleans, and any write/package/transport/Git property
+quarantine the destination. Enabled candidates count toward the 256 limit even when invalid. More
+than 256 enabled candidates disables the whole registry rather than serving a partial set.
+
+Duplicate destination names, duplicate public targets, duplicate Basic physical connections, and
+instance/subaccount name shadows fail closed. Review exact reason codes through the authenticated
+Admin `SAPTargets` tool; there is no HTTP `/targets` endpoint.
+
+Descriptions are shown to users/models. Keep them factual and free of prompts, instructions,
+credentials, internal incident notes, or token-bearing links.
+
+## Destination import/export
+
+BTP Cockpit can export selected destinations as JSON, YAML, or properties and import them again.
+This is useful for copying a reviewed field shape, but exported material can contain URLs,
+location IDs, users, passwords, certificates, or OAuth configuration.
+
+Before sharing or committing a template:
+
+1. remove `User`, `Password`, tokens, client secrets, certificates, and authentication headers;
+2. replace customer URLs, location IDs, and topology labels;
+3. review `sap-sysid`, `sap-client`, description, and every `arc1.*` key;
+4. create/import it at subaccount level; and
+5. restart ARC-1 and inspect Admin `SAPTargets` before giving users the route.
+
+Do not mass-clone a destination and rely on its name to select a client. `sap-client` is mandatory
+and every imported copy must be reviewed independently.
+
+## Cloud Connector Location ID
+
+If several Cloud Connectors attach to the subaccount, set:
+
+```properties
+CloudConnectorLocationId=LOC1
+```
+
+It must match the intended Cloud Connector. Single-target startup and PP destinations can have
+different location IDs. Multi-target Admin diagnostics expose only whether this property exists,
+not its raw value.
+
+## Cloud Connector URL Path Reference
+
+Use restrictive resource mappings:
+
+| URL path | Policy | Needed for |
+|---|---|---|
+| `/sap/bc/adt` | Path and all sub-paths | Core ADT operations in single-target and multi-target modes |
+| `/sap/bc/cts_abapvcs` | Path and all sub-paths | Optional single-target gCTS operations and the `SAP_FEATURE_GCTS=auto` probe |
+| `/sap/opu/odata/UI2/PAGE_BUILDER_CUST` | Path and all sub-paths | Optional single-target FLP management and the `SAP_FEATURE_FLP=auto` probe |
+| `/sap/opu/odata/UI5/ABAP_REPOSITORY_SRV` | Path and all sub-paths | Optional UI5 Repository metadata reads (`SAPRead` type `BSP_DEPLOY`) and the `SAP_FEATURE_UI5REPO=auto` probe |
+
+The three tracked profiles under `examples/btp/` set `SAP_FEATURE_GCTS=off`, `SAP_FEATURE_FLP=off`, and
+`SAP_FEATURE_UI5REPO=off`, so an ADT-only deployment needs only `/sap/bc/adt`. Without those
+overrides, `auto` sends GET requests to the feature endpoints even when users only request ADT
+operations. Single targets probe at startup; discovered multi-targets probe on demand during SAP
+tool calls. For an existing ADT-only deployment, set all three flags to `"off"` in the module's
+`.mtaext` properties and redeploy. When enabling an optional capability, add its exact resource
+path and change the associated flag to `auto` or `on` after approval. Multi-target v1 excludes
+`SAPGit` and `SAPManage`, so keep gCTS and FLP probes off there. Its optional `SAPRead` type
+`BSP_DEPLOY` uses the UI5 Repository path and is outside this initial ADT-only profile.
+
+A single-target optional probe returning 401/403/404 marks that feature unavailable; it does not
+by itself establish why the MCP connection failed. A 401/403 during single-Basic startup
+authentication/CSRF bootstrap blocks shared SAP tool calls and requires repair followed by a
+restart. Check the endpoint reported in the error: bootstrap starts at `/sap/bc/adt/core/discovery`
+and can use `/sap/bc/adt/discovery` on older systems. Discovered Basic targets have a separate
+[authentication guard](multi-target-administration.md#basic-shared-identity-controls)
+that can block the shared credentials after any SAP 401, including a feature probe. Diagnose the
+exact failed request path and layer before treating an error as an expected optional-feature miss.
+
+Do not expose `/` just to make troubleshooting easier. Cloud Connector path matching is
+case-sensitive. The internal Cloud Connector-to-SAP connection should use HTTPS with normal
+hostname/certificate verification.
+
+For PP, select strict user-certificate propagation with no system-certificate fallback. In newer
+Cloud Connector versions this is an X.509 mapping with the separate system-certificate-for-logon
+choice disabled; older versions may label it “X.509 Certificate (strict usage)” or represent it as
+`X509_RESTRICTED`.
+
+## BTP ABAP Environment
+
+For a same-subaccount BTP ABAP Environment, use the generated
+`OAuth2UserTokenExchange` destination described in
+[BTP ABAP Environment](btp-abap-environment.md). It uses `ProxyType=Internet`; no Connectivity
+service or Cloud Connector is required for that target.
+
+`OAuth2UserTokenExchange` is an identity-zone exchange and generally requires ARC-1 and the ABAP
+Environment in the same subaccount. Cross-subaccount designs need a different trust/authentication
+flow; do not “fix” them by copying a same-subaccount destination unchanged.
+
+## Restart behavior
+
+| Change | Action |
+|---|---|
+| Single-target destination name in app config | Update reviewed `.mtaext` and deploy |
+| Single-target destination content, including Basic credentials | Restart every app instance; it is resolved at startup |
+| Multi-target destination add/remove or non-secret field | `cf restart arc1-mcp-server` |
+| Multi-target Basic `User`/`Password` only | No restart; next protected request |
+| PP certificate mapping or SAP authorization | Retry; no ARC restart |
+
+Multi-target registry behavior is an ARC-1 startup-snapshot decision, not a Destination Service
+requirement. See [BTP Administration](btp-administration.md#change-and-restart-matrix) for the full
+change matrix.
+
+## Troubleshooting
+
+| Symptom | Likely boundary |
+|---|---|
+| Destination absent from multi registry | Wrong level, missing/wrong-case marker, invalid fields, duplicate/shadow, or over 256 |
+| `TARGET_CONFIG_CHANGED` | A non-secret field differs from startup; review and restart |
+| PP setup succeeds but SAP returns `401` | STRUST/trusted proxy/ICF/CERTRULE/SU01, not destination discovery |
+| SAP returns `403` after login | Propagated/technical user's SAP authorization |
+| Basic destination returns SSO HTML | ADT ICF does not accept Basic; ARC-1 rejects the login page |
+| Single-target ADT works but an optional probe reports `401`/`403`/`404` | Check that probe's mapping, service activation and SAP authorization; keep unused features `off` for ADT-only |
+| Single-target Basic password changed but call remains blocked | Verify the destination credentials and restart every app instance; this destination is resolved at startup |
+| Multi-target Basic password changed but call remains blocked | Verify both fields were saved; the next protected request detects a changed credential generation |
+| Connectivity exposure error | Virtual host/location/resource path mismatch |
+
+Use a request ID and diagnose from route → XSUAA → registry → Destination/Connectivity → Cloud
+Connector → SAP authentication → SAP authorization → ARC-1 policy. Do not widen all Cloud Connector
+paths or grant SAP/ARC-1 Admin to bypass a lower-layer error.
+
+## Official references
+
+- [SAP: Destination Service](https://help.sap.com/docs/connectivity/sap-btp-connectivity-cf/destination-service)
+- [SAP: Access Destinations Editor](https://help.sap.com/docs/connectivity/sap-btp-connectivity-cf/access-destinations-editor)
+- [SAP: Set Up Trust for Principal Propagation](https://help.sap.com/docs/connectivity/sap-btp-connectivity-cf/set-up-trust-for-principal-propagation)
+- [SAP: Configure Accessible Resources](https://help.sap.com/docs/connectivity/sap-btp-connectivity-cf/configure-accessible-resources)

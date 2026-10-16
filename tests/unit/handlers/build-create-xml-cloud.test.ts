@@ -1,0 +1,360 @@
+/**
+ * buildCreateXml — BTP/Steampunk cloud-mode corrections (G-3).
+ *
+ * Live-verified on BTP SAP_BASIS 919: the object-create simple transformations reject
+ * `adtcore:responsible` and the on-prem `adtcore:masterSystem`, and require
+ * `adtcore:abapLanguageVersion="cloudDevelopment"` (plus explicit class attributes for CLAS).
+ * On-prem output must be byte-for-byte unchanged.
+ */
+import { afterEach, describe, expect, it } from 'vitest';
+import type { AdtClient } from '../../../src/adt/client.js';
+import type { ResolvedFeatures } from '../../../src/adt/types.js';
+import { resetCachedFeatures, setCachedFeatures } from '../../../src/handlers/feature-cache.js';
+import {
+  buildCreateXml,
+  createContentTypeForType,
+  mergeMetadataWriteProperties,
+  resolveWriteSystemType,
+} from '../../../src/handlers/write-helpers.js';
+import type { ServerConfig } from '../../../src/server/types.js';
+
+describe('buildCreateXml — cloud mode (G-3)', () => {
+  describe('on-prem (cloud=false) is unchanged', () => {
+    it('CLAS keeps masterSystem + responsible and omits the cloud attributes', () => {
+      const xml = buildCreateXml('CLAS', 'ZCL_X', 'ZPKG', 'desc', undefined, 'EN', 'MARIAN', false);
+      expect(xml).toContain('adtcore:masterSystem="H00"');
+      expect(xml).toContain('adtcore:responsible="MARIAN"');
+      expect(xml).not.toContain('abapLanguageVersion');
+      expect(xml).not.toContain('class:final');
+    });
+
+    it('BDEF (RAP) keeps masterSystem + responsible and omits the cloud attributes', () => {
+      const xml = buildCreateXml('BDEF', 'ZBD_X', 'ZPKG', 'desc', undefined, 'EN', 'MARIAN', false);
+      expect(xml).toContain('adtcore:masterSystem="H00"');
+      expect(xml).toContain('adtcore:responsible="MARIAN"');
+      expect(xml).not.toContain('abapLanguageVersion');
+    });
+  });
+
+  describe('cloud (cloud=true)', () => {
+    it('CLAS drops masterSystem + responsible, adds cloud language version + class attributes', () => {
+      const xml = buildCreateXml('CLAS', 'ZCL_X', 'ZPKG', 'desc', undefined, 'EN', 'marian@zeis.de', true);
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible'); // cloud assigns the owner from the JWT
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+      expect(xml).toContain('class:final="true"');
+      expect(xml).toContain('class:visibility="public"');
+      expect(xml).toContain('class:category="generalObjectType"');
+    });
+
+    it('INTF drops masterSystem + responsible and adds the cloud language version', () => {
+      const xml = buildCreateXml('INTF', 'ZIF_X', 'ZPKG', 'desc', undefined, 'EN', 'marian@zeis.de', true);
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+      expect(xml).not.toContain('class:final'); // class attributes are CLAS-only
+    });
+
+    it('DDLS (CDS source) gets the cloud language version', () => {
+      const xml = buildCreateXml('DDLS', 'ZCDS_X', 'ZPKG', 'desc', undefined, 'EN', 'marian@zeis.de', true);
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+    });
+
+    it('DTEL (builder path) also drops masterSystem + responsible and adds the cloud language version', () => {
+      const xml = buildCreateXml(
+        'DTEL',
+        'ZDT_X',
+        'ZPKG',
+        'desc',
+        { typeKind: 'predefinedAbapType', dataType: 'CHAR', length: 10 },
+        'EN',
+        'marian@zeis.de',
+        true,
+      );
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+    });
+
+    it('BDEF (RAP behavior definition) drops masterSystem + responsible and adds the cloud language version', () => {
+      const xml = buildCreateXml('BDEF', 'ZBD_X', 'ZPKG', 'desc', undefined, 'EN', 'marian@zeis.de', true);
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+    });
+
+    it('SRVD (service definition) drops masterSystem + responsible and adds the cloud language version', () => {
+      const xml = buildCreateXml('SRVD', 'ZSRVD_X', 'ZPKG', 'desc', undefined, 'EN', 'marian@zeis.de', true);
+      expect(xml).not.toContain('masterSystem');
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+    });
+
+    it('SRVB (service binding) drops responsible and adds the cloud language version', () => {
+      const xml = buildCreateXml(
+        'SRVB',
+        'ZSB_X',
+        'ZPKG',
+        'desc',
+        { serviceDefinition: 'ZSRVD_X' },
+        'EN',
+        'marian@zeis.de',
+        true,
+      );
+      expect(xml).not.toContain('responsible');
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+    });
+
+    it('SRVB cloud body preserves the serviceDefinition ref through cloudify (B3 — update reuses this body)', () => {
+      // SRVB update is a full metadata-XML replace that reuses this exact builder; cloudify must drop the
+      // owner attrs but keep the <srvb:serviceDefinition> ref intact, or an update would orphan the binding.
+      const xml = buildCreateXml(
+        'SRVB',
+        'ZSB_X',
+        'ZPKG',
+        'desc',
+        { serviceDefinition: 'ZSRVD_X' },
+        'EN',
+        'marian@zeis.de',
+        true,
+      );
+      expect(xml).toContain('adtcore:abapLanguageVersion="cloudDevelopment"');
+      expect(xml).not.toContain('adtcore:responsible');
+      expect(xml).toContain('ZSRVD_X');
+    });
+  });
+});
+
+describe('resolveWriteSystemType (G-3, Codex #1)', () => {
+  const cfg = (systemType: string) => ({ systemType }) as unknown as ServerConfig;
+  const client = (usesBearerAuth: boolean) => ({ usesBearerAuth }) as unknown as AdtClient;
+  afterEach(() => resetCachedFeatures());
+
+  it('prefers the probed feature cache', () => {
+    setCachedFeatures({ systemType: 'btp' } as unknown as ResolvedFeatures);
+    expect(resolveWriteSystemType(cfg('auto'), client(false))).toBe('btp');
+  });
+
+  it('uses an explicit non-auto config when the probe has not resolved', () => {
+    expect(resolveWriteSystemType(cfg('onprem'), client(true))).toBe('onprem');
+  });
+
+  it('falls back to btp for bearer auth when unresolved — so BTP creates never emit on-prem XML', () => {
+    expect(resolveWriteSystemType(cfg('auto'), client(true))).toBe('btp');
+  });
+
+  it('returns undefined when unresolved and not bearer auth (on-prem)', () => {
+    expect(resolveWriteSystemType(cfg('auto'), client(false))).toBeUndefined();
+  });
+});
+
+describe('createContentTypeForType — cloud INTF content-type (review fix)', () => {
+  it('uses the v5 interfaces content-type for cloud INTF create', () => {
+    // application/* routes cloud INTF to an older ST that drops abapLanguageVersion → 500. Live-verified 919.
+    expect(createContentTypeForType('INTF', true)).toBe('application/vnd.sap.adt.oo.interfaces.v5+xml');
+  });
+
+  it('keeps application/* for on-prem INTF create (unchanged)', () => {
+    expect(createContentTypeForType('INTF', false)).toBe('application/*');
+    expect(createContentTypeForType('INTF')).toBe('application/*');
+  });
+
+  it('does not change CLAS (works with application/* on cloud)', () => {
+    expect(createContentTypeForType('CLAS', true)).toBe('application/*');
+  });
+
+  it('needs no cloud override for RAP types (live-verified 919: BDEF/SRVD/SRVB create 201 as-is)', () => {
+    expect(createContentTypeForType('BDEF', true)).toBe('application/vnd.sap.adt.blues.v1+xml');
+    expect(createContentTypeForType('SRVD', true)).toBe('application/*');
+    expect(createContentTypeForType('SRVB', true)).toBe('application/*');
+  });
+});
+
+describe('mergeMetadataWriteProperties — DOMA outputLength follows a length change (review fix)', () => {
+  const stubClient = (existing: Record<string, unknown>) =>
+    ({ getDomain: async () => existing }) as unknown as AdtClient;
+  const base = { description: 'd', package: 'P', dataType: 'CHAR', length: 10, outputLength: 10 };
+
+  it('defaults outputLength to a changed length when not provided (avoids SAP output-length warning)', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient(base), 'DOMA', 'ZDOMA', { length: 20 });
+    expect(merged.outputLength).toBe(20);
+    expect(merged.length).toBe(20);
+  });
+
+  it('keeps the existing outputLength when length is unchanged', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient({ ...base, outputLength: 8 }), 'DOMA', 'ZDOMA', {
+      description: 'new',
+    });
+    expect(merged.outputLength).toBe(8);
+  });
+
+  it('respects an explicit outputLength', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient(base), 'DOMA', 'ZDOMA', {
+      length: 20,
+      outputLength: 15,
+    });
+    expect(merged.outputLength).toBe(15);
+  });
+});
+
+describe('mergeMetadataWriteProperties — DTEL metadata preservation (#771)', () => {
+  const existing = {
+    name: 'ZDTEL',
+    description: 'Existing',
+    package: 'ZPKG',
+    dataType: 'CHAR',
+    length: '000004',
+    decimals: '000000',
+    typeKind: 'domain',
+    typeName: 'BUKRS',
+    shortLabel: 'CoCd',
+    shortLength: '06',
+    mediumLabel: '',
+    mediumLength: '20',
+    longLabel: '',
+    longLength: '40',
+    headingLabel: '',
+    headingLength: '55',
+    searchHelp: 'C_T001',
+    searchHelpParameter: 'BUKRS',
+    setGetParameter: 'BUK',
+    defaultComponentName: 'COMP_CODE',
+    deactivateInputHistory: true,
+    changeDocument: true,
+    leftToRightDirection: true,
+    deactivateBIDIFiltering: true,
+  };
+  const stubClient = { getDataElement: async () => existing } as unknown as AdtClient;
+
+  it('preserves stored lengths and input-history state on a description-only update', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', {});
+    expect(merged).toMatchObject({
+      shortLength: '06',
+      mediumLength: '20',
+      longLength: '40',
+      headingLength: '55',
+      deactivateInputHistory: true,
+    });
+  });
+
+  it('uses explicit values including zero', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', {
+      shortLength: 0,
+      deactivateInputHistory: false,
+    });
+    expect(merged.shortLength).toBe(0);
+    expect(merged.deactivateInputHistory).toBe(false);
+    expect(buildCreateXml('DTEL', 'ZDTEL', 'ZPKG', 'Existing', merged)).toContain(
+      '<dtel:deactivateInputHistory>false</dtel:deactivateInputHistory>',
+    );
+  });
+
+  it('lets the builder derive a new length when a label changes without an explicit length', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', { shortLabel: 'New' });
+    expect(merged.shortLabel).toBe('New');
+    expect(merged.shortLength).toBeUndefined();
+    expect(buildCreateXml('DTEL', 'ZDTEL', 'ZPKG', 'Existing', merged)).toContain(
+      '<dtel:shortFieldLength>03</dtel:shortFieldLength>',
+    );
+  });
+
+  it('preserves stored lengths when unchanged labels are re-sent', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', {
+      shortLabel: 'CoCd',
+      mediumLabel: '',
+      longLabel: '',
+      headingLabel: '',
+    });
+    expect(merged).toMatchObject({
+      shortLength: '06',
+      mediumLength: '20',
+      longLength: '40',
+      headingLength: '55',
+    });
+  });
+
+  it('keeps the search-help parameter, SET/GET parameter, change document and bidi flags', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', {});
+    const xml = buildCreateXml('DTEL', 'ZDTEL', 'ZPKG', 'Existing', merged);
+    expect(xml).toContain('<dtel:searchHelpParameter>BUKRS</dtel:searchHelpParameter>');
+    expect(xml).toContain('<dtel:setGetParameter>BUK</dtel:setGetParameter>');
+    expect(xml).toContain('<dtel:changeDocument>true</dtel:changeDocument>');
+    expect(xml).toContain('<dtel:leftToRightDirection>true</dtel:leftToRightDirection>');
+    expect(xml).toContain('<dtel:deactivateBIDIFiltering>true</dtel:deactivateBIDIFiltering>');
+  });
+
+  it('prefers explicit values, including false', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', {
+      setGetParameter: 'ZPA',
+      changeDocument: false,
+    });
+    expect(merged).toMatchObject({ setGetParameter: 'ZPA', changeDocument: false });
+  });
+
+  it('drops the stored search-help parameter when the search help changes', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', { searchHelp: 'ZSH_OTHER' });
+    expect(merged.searchHelp).toBe('ZSH_OTHER');
+    expect(merged.searchHelpParameter).toBeUndefined();
+  });
+
+  it('keeps the parameter when the same search help is re-sent in lower case', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient, 'DTEL', 'ZDTEL', { searchHelp: 'c_t001' });
+    expect(merged.searchHelpParameter).toBe('BUKRS');
+  });
+
+  it('aborts when existing metadata cannot be read', async () => {
+    const unreadableClient = {
+      getDataElement: async () => {
+        throw new Error('metadata read failed');
+      },
+    } as unknown as AdtClient;
+
+    await expect(mergeMetadataWriteProperties(unreadableClient, 'DTEL', 'ZDTEL', {})).rejects.toThrow(
+      'metadata read failed',
+    );
+  });
+});
+
+describe('mergeMetadataWriteProperties — SRVB update preserves binding fields (B3)', () => {
+  // Shape mirrors parseServiceBinding()'s JSON summary (what client.getSrvb returns).
+  const stubClient = (existing: Record<string, unknown>) =>
+    ({ getSrvb: async () => ({ source: JSON.stringify(existing) }) }) as unknown as AdtClient;
+  const existing = {
+    description: 'Binding',
+    package: 'ZPKG',
+    serviceDefinition: 'ZSRVD_DUMMY',
+    bindingType: 'ODATA',
+    odataVersion: 'V2',
+    bindingCategory: 'UI',
+    serviceVersion: '0001',
+  };
+
+  it('a description-only update preserves serviceDefinition/bindingType/version/odataVersion from the existing binding', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient(existing), 'SRVB', 'ZSB', {});
+    expect(merged.serviceDefinition).toBe('ZSRVD_DUMMY');
+    expect(merged.bindingType).toBe('ODATA');
+    expect(merged.version).toBe('0001'); // mapped from existing.serviceVersion
+    expect(merged.odataVersion).toBe('V2');
+    expect(merged.category).toBe('0'); // 'UI' → '0'
+  });
+
+  it('re-points serviceDefinition when supplied, keeping the other fields', async () => {
+    const merged = await mergeMetadataWriteProperties(stubClient(existing), 'SRVB', 'ZSB', {
+      serviceDefinition: 'ZSRVD_NEW',
+    });
+    expect(merged.serviceDefinition).toBe('ZSRVD_NEW');
+    expect(merged.odataVersion).toBe('V2');
+  });
+
+  it('maps a "Web API" binding category back to "1"', async () => {
+    const merged = await mergeMetadataWriteProperties(
+      stubClient({ ...existing, bindingCategory: 'Web API' }),
+      'SRVB',
+      'ZSB',
+      {},
+    );
+    expect(merged.category).toBe('1');
+  });
+});

@@ -1,0 +1,278 @@
+# ──────────────────────────────────────────────────────────────────────
+# MTA Extension Descriptor — Environment-Specific Overrides (TEMPLATE)
+#
+# This is a tracked template. Copy it to a real file (which is gitignored
+# by `.gitignore`) and fill in your landscape values:
+#
+#   cp mta-overrides.mtaext.example mta-overrides.mtaext
+#   # edit mta-overrides.mtaext
+#
+# Then build + deploy with the extension applied:
+#
+#   npm run btp:build-deploy-ext
+#   # or, manually:
+#   mbt build
+#   cf deploy mta_archives/arc1-mcp_<version>.mtar -e mta-overrides.mtaext
+#
+# Any property left commented uses the `mta.yaml` value unchanged. The base
+# descriptor has no fake SAP destination: configure the single-target
+# block below, or enable the experimental multi-target block and manage marked
+# destinations in the BTP Cockpit.
+#
+# IMPORTANT — an extension can ADD or OVERRIDE a property, but never remove one.
+# To turn a base-enabled feature OFF you must write the explicit off-value here;
+# commenting the line out or deleting it just falls back to the `mta.yaml` value.
+# (`SAP_FOO: ~` fails the deploy, and `cf unset-env` is undone by the next
+# `cf deploy` — an explicit value is the only durable override.)
+# ──────────────────────────────────────────────────────────────────────
+
+_schema-version: "3.1"
+ID: arc1-mcp-overrides
+extends: arc1-mcp
+
+modules:
+  - name: arc1-mcp-server
+    # If data-result limits are raised, size this per-process memory together
+    # with them. See docs_page/btp-administration.md#data-preview-ram-sizing.
+    # parameters:
+    #   memory: 1G
+    properties:
+      # ── Single-target /mcp (optional) ────────────────────────────────
+      # BasicAuth destination for startup feature probing
+      # SAP_BTP_DESTINATION: "my-basic-auth-destination"
+
+      # PrincipalPropagation destination for per-user requests (with JWT)
+      # SAP_BTP_PP_DESTINATION: "my-pp-destination"
+
+      # ── MCP server identity ──────────────────────────────────────────
+      # Server name advertised in the MCP initialize handshake (default arc-1).
+      # Set a unique name per instance when several ARC-1 deployments target
+      # different SAP systems, so clients can derive a target-specific tool
+      # prefix without numeric collision suffixes.
+      # ARC1_SERVER_NAME: "arc1-erp-dev"
+
+      # Optional model-facing label for clients that replace the handshake name
+      # with an opaque connector ID. Single line, max 160 characters; ignored by
+      # the target-aware instructions on multi-target endpoints.
+      # ARC1_SYSTEM_LABEL: "ERP development (read-only)"
+
+      # ── Principal propagation behaviour ──────────────────────────────
+      # The base MTA keeps single-target JWT calls on PP by default. Set false only
+      # for an intentional shared-identity/API-key deployment.
+      # SAP_PP_ENABLED: "false"
+
+      # The base MTA also keeps strict PP enabled: API-key/non-JWT tool calls
+      # are rejected. Set false for supported mixed PP/API-key operation;
+      # JWT calls use PP and API-key calls use the shared destination identity.
+      # Leaving this "true" while adding ARC1_API_KEYS means those API-key
+      # clients are rejected on every tool call.
+      # SAP_PP_STRICT: "false"
+
+      # ── Experimental multi-target v1 (alternative or side-by-side) ──
+      # Discovers subaccount destinations marked arc1.enabled=true. The routes
+      # are mutation-free regardless of single-target /mcp settings.
+      # ARC1_MULTI_TARGET_ENDPOINTS: "true"
+      # ARC1_CACHE: none
+      # Optional shared BasicAuthentication targets. PP remains recommended.
+      # If enabled, keep arc1-mcp-server parameters.instances at exactly 1;
+      # the base mta.yaml already does so.
+      # ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH: "true"
+      # Non-default shared-service limits for 1–5 active beta users.
+      # ARC1_AUTH_RATE_LIMIT: "30"
+      # ARC1_MCP_HTTP_RATE_LIMIT: "1000"
+      # ARC1_RATE_LIMIT: "120"
+
+      # ── Safety / Authorization ───────────────────────────────────────
+      # Enable object mutations (create, update, delete)
+      # SAP_ALLOW_WRITES: "true"
+
+      # Enable named table data preview (SELECT * FROM <table>)
+      # SAP_ALLOW_DATA_PREVIEW: "true"
+
+      # Enable freestyle SQL execution
+      # SAP_ALLOW_FREE_SQL: "true"
+
+      # Successful data-preview response allowance per complete tool call,
+      # counted after transfer decompression and before string conversion.
+      # Positive integer bytes; default 2097152 (2 MiB). Wide rows can hit it
+      # before the 10,000-row request ceiling.
+      # ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES: "2097152"
+
+      # Process-wide data-result calls admitted through fetch, parse, result
+      # serialization, and terminal audit. Positive integer; default 2.
+      # Raise the byte limit only after benchmarking, and normally lower this
+      # value proportionally so their product remains controlled. Change the
+      # module memory above in the same reviewed deployment when needed.
+      # ARC1_MAX_CONCURRENT_DATA_RESULTS: "2"
+
+      # Enable transport mutations (release, create, add to transport).
+      # Also requires SAP_ALLOW_WRITES=true.
+      # SAP_ALLOW_TRANSPORT_WRITES: "true"
+
+      # Enable abapGit / gCTS mutations (push, pull, clone). Also requires
+      # SAP_ALLOW_WRITES=true.
+      # SAP_ALLOW_GIT_WRITES: "true"
+
+      # Restrict writes to these packages (comma-separated, supports
+      # wildcards). Default in mta.yaml: "$TMP".
+      # SAP_ALLOWED_PACKAGES: "Z*,Y*,$TMP"
+
+      # Fine-grained per-action denial. Tool-qualified globs supported,
+      # e.g. "SAPGit.*,SAPWrite.delete". See docs/authorization.md.
+      # SAP_DENY_ACTIONS: "SAPGit.*"
+
+      # ── Networking / public URL ──────────────────────────────────────
+      # Override the public URL ARC-1 advertises in OAuth metadata (issuer,
+      # authorize/token/register endpoints). Required when ARC-1 is reached
+      # through a reverse proxy on a different hostname or under a base-path
+      # prefix than the bound CF route.
+      # ARC1_PUBLIC_URL: "https://gateway.example.com/arc1"
+      # IMPORTANT: XSUAA must also accept ARC-1's proxy callback on that exact
+      # public URL. Add an arc1-xsuaa resource override like the example near
+      # the bottom of this file. Never use a shared *.hana.ondemand.com or
+      # *.applicationstudio.cloud.sap wildcard.
+
+      # ── OAuth Dynamic Client Registration (DCR) ──────────────────────
+      # Lifetime of an OAuth DCR `client_id` in seconds. Default: "0" (never
+      # expire) — set in the base mta.yaml, because there is no per-client
+      # revocation at any TTL and some MCP clients (Eclipse Copilot, Copilot
+      # CLI) don't recover from `invalid_client`. Uncomment below ONLY to opt
+      # into a finite TTL; positive values are clamped to [60s, 90d].
+      # ARC1_OAUTH_DCR_TTL_SECONDS: "604800"   # e.g. 7 days
+
+      # NOTE: ARC1_DCR_SIGNING_SECRET is intentionally NOT listed here.
+      # The dedicated signing secret decouples DCR `client_id`s from the
+      # XSUAA `clientsecret` so cached client_ids survive `cf deploy` — but
+      # only if the secret itself survives `cf deploy`. Set it via:
+      #
+      #   cf set-env arc1-mcp-server ARC1_DCR_SIGNING_SECRET "$(openssl rand -base64 48)"
+      #   cf restage arc1-mcp-server
+      #
+      # Env vars set with `cf set-env` survive `cf deploy`. MTA properties
+      # under `modules[*].properties` are rewritten on every deploy, which
+      # would rotate the signing secret on each deploy and invalidate every
+      # cached client_id — defeating the whole purpose of having one.
+      # See docs_page/xsuaa-setup.md "Stable DCR signing key" for the full
+      # rationale.
+
+      # ── CORS ─────────────────────────────────────────────────────────
+      # Allow browser-based UIs to call /mcp directly. Not needed for
+      # native MCP clients (Claude Desktop, Cursor, VS Code, Copilot
+      # Studio). Comma-separated, exact origin match, no wildcards.
+      # ARC1_ALLOWED_ORIGINS: "https://my-app.cfapps.eu10.hana.ondemand.com"
+
+      # ── Read-only UI ─────────────────────────────────────────────────
+      # Experimental and off by default. For browser access on BTP CF, deploy
+      # with mta-ui-approuter.mtaext instead of uncommenting only this line:
+      #
+      #   npm run btp:build-deploy-ui-ext
+      #
+      # That extension enables ARC1_UI=web and activates the optional AppRouter,
+      # which performs XSUAA login and forwards an admin-scoped JWT to ARC-1.
+      # The deploy script writes an ignored mta-ui-deploy.mtaext by merging this
+      # file with the UI activation, so your destination/route/xsappname values
+      # stay in the same single extension descriptor passed to `cf deploy`.
+      # ARC1_UI: "web"
+
+      # ── Tool surface ─────────────────────────────────────────────────
+      # Tool mode: "standard" (12 tools) or "hyperfocused" (1 universal
+      # SAP tool, ~200 tokens — useful for token-tight clients).
+      # ARC1_TOOL_MODE: "standard"
+
+      # ── Diagnostics ──────────────────────────────────────────────────
+      # Attach full request/response bodies and headers to `http_request`
+      # audit events. Sensitive headers redacted, bodies truncated at
+      # 64KB. Not for production.
+      # ARC1_LOG_HTTP_DEBUG: "true"
+
+      # ── System Connection (rarely overridden) ────────────────────────
+      # Override system type detection. Default in mta.yaml is "auto"; set
+      # this only to force "btp" or "onprem".
+      # SAP_SYSTEM_TYPE: "btp"
+
+      # SAP client number (only when NOT using a destination)
+      # SAP_CLIENT: "100"
+
+      # SAP language
+      # SAP_LANGUAGE: "EN"
+
+      # Skip TLS certificate verification (default in mta.yaml: false).
+      # Override to "true" only for on-premise landscapes with self-signed
+      # certificates that you cannot get into the trust store.
+      # SAP_INSECURE: "true"
+
+    # ── Route host — pick your public URL (recommended) ──────────────
+    # Base mta.yaml sets NO host, so the deploy service assigns a globally
+    # unique but long auto-host (e.g.
+    # myorg-1a2b3c4d-dev-myspace-arc1-mcp-server.cfapps.<region>...). To deploy
+    # under a short URL you control — the one your MCP clients connect to — pin
+    # `host:` here. Add a `parameters:` block to the arc1-mcp-server module
+    # above (a sibling of `properties:`):
+    #       parameters:
+    #         host: arc1-mcp-prod    # -> https://arc1-mcp-prod.cfapps.<region>.../mcp
+    # The host must be lowercase letters/digits/hyphens (no spaces/underscores)
+    # AND free on the shared `cfapps.<region>.hana.ondemand.com` domain (it is
+    # first-come-first-served across ALL subaccounts in that region) — pick a
+    # customer/landscape-specific name like `arc1-mcp-teag` to avoid clashes.
+    #
+    # ── XSUAA xsappname (optional, independent of the route) ─────────
+    # Base mta.yaml derives the XSUAA `xsappname` from the CF space via
+    # `${space}` (unique within your subaccount — fine to leave as-is). Pin it
+    # only if your space name isn't a valid xsappname or you want a fixed name.
+    # Append this resource block (a sibling of `modules:`):
+    #       resources:
+    #         - name: arc1-xsuaa
+    #           parameters:
+    #             config:
+    #               xsappname: arc1-mcp-prod
+    #
+    # If ARC1_PUBLIC_URL points at a gateway/custom domain, the same resource
+    # override must replace XSUAA's upstream callback list with that exact URL.
+    # Extension maps merge recursively; this list replaces the base list while
+    # preserving the grants and token lifetimes from mta.yaml:
+    #               oauth2-configuration:
+    #                 redirect-uris:
+    #                   - https://gateway.example.com/arc1/oauth/callback
+    #                   - https://gateway.example.com/arc1/oauth/logged-out
+
+# ── Application logging (OFF by default — deprecated service) ───────────
+# SAP Application Logging Service is deprecated (SAP Note 3557260; removed from
+# Eligible Cloud Services 2025-07-31 — use SAP Cloud Logging instead), so the
+# base mta.yaml ships it with `active: false` and does NOT create it. ARC-1
+# logs to stderr regardless, so `cf logs` / `cf logs --recent` keep working.
+# To re-enable CF log aggregation on a subaccount that still offers the
+# service, uncomment this resource block (a sibling of `modules:`) to flip the
+# resource active:
+# resources:
+#   - name: arc1-application-logs
+#     active: true
+
+# ── BTP Audit Log (OFF by default — optional premium service) ─────────
+# The base descriptor contains the complete X.509 instance and binding config,
+# but keeps the resource inactive. After assigning Audit Log premium quota and
+# an owner for certificate rotation, enable it by adding this resource override
+# to the real mta-overrides.mtaext (merge with any existing `resources:` block):
+# resources:
+#   - name: arc1-auditlog
+#     active: true
+
+# ── Reusing a SHARED Destination / Connectivity instance ────────────────
+# The base mta.yaml declares `arc1-destination` / `arc1-connectivity` as
+# `org.cloudfoundry.managed-service`, and a managed instance is named after its
+# resource. If your landscape's instances are named differently, a deploy creates
+# ADDITIONAL instances rather than reusing them. Subaccount-level destinations
+# still resolve through a new instance, so this usually costs `lite` quota (the
+# deploy fails outright on a subaccount at its limit) — but ARC-1 does lose the
+# targets if the shared instance carries instance-level destinations. Check
+# `cf services` first. An extension cannot change a resource's `type` (mbt
+# rejects `type` in mta.ResourceExt) — it can only repoint a managed resource at
+# a named instance (a sibling of `modules:`):
+# resources:
+#   - name: arc1-destination
+#     parameters:
+#       service-name: my-shared-destination
+# That instance then stays MTA-MANAGED: the deploy creates it if absent, and
+# `cf undeploy --delete-services` would delete it. Use it only if this ARC-1
+# deployment is meant to own the instance. Binding one whose lifecycle belongs
+# to someone else needs `org.cloudfoundry.existing-service` in `mta.yaml`, which
+# this descriptor does not offer — that is a reviewed descriptor change.

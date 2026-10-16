@@ -1,0 +1,80 @@
+{
+  "xsappname": "arc1-mcp",
+  "tenant-mode": "dedicated",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.read",
+      "description": "Read SAP ABAP objects via MCP"
+    },
+    {
+      "name": "$XSAPPNAME.write",
+      "description": "Write SAP ABAP objects via MCP"
+    },
+    {
+      "name": "$XSAPPNAME.data",
+      "description": "Preview named table contents"
+    },
+    {
+      "name": "$XSAPPNAME.sql",
+      "description": "Execute freestyle SQL queries (implies data)"
+    },
+    {
+      "name": "$XSAPPNAME.transports",
+      "description": "Create, release, and manage CTS transport requests"
+    },
+    {
+      "name": "$XSAPPNAME.git",
+      "description": "Push, pull, and manage abapGit/gCTS repositories"
+    },
+    {
+      "name": "$XSAPPNAME.admin",
+      "description": "Administrative access to ARC-1 (implies all other scopes at runtime)"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "MCPViewer",
+      "description": "Read-only access to SAP via ARC-1 MCP",
+      "scope-references": ["$XSAPPNAME.read"]
+    },
+    {
+      "name": "MCPDeveloper",
+      "description": "Read, write, transport, and git access for developers",
+      "scope-references": [
+        "$XSAPPNAME.read",
+        "$XSAPPNAME.write",
+        "$XSAPPNAME.transports",
+        "$XSAPPNAME.git"
+      ]
+    },
+    {
+      "name": "MCPDataViewer",
+      "description": "Preview named table contents via ARC-1 MCP",
+      "scope-references": ["$XSAPPNAME.data"]
+    },
+    {
+      "name": "MCPSqlUser",
+      "description": "Execute freestyle SQL queries via ARC-1 MCP",
+      "scope-references": ["$XSAPPNAME.data", "$XSAPPNAME.sql"]
+    },
+    {
+      "name": "MCPAdmin",
+      "description": "Full administrative access to ARC-1 — admin scope implies all other scopes at runtime",
+      "scope-references": [
+        "$XSAPPNAME.read",
+        "$XSAPPNAME.write",
+        "$XSAPPNAME.data",
+        "$XSAPPNAME.sql",
+        "$XSAPPNAME.transports",
+        "$XSAPPNAME.git",
+        "$XSAPPNAME.admin"
+      ]
+    }
+  ],
+  "oauth2-configuration": {
+    "redirect-uris": ["http://localhost:*/oauth/callback", "http://localhost:*/oauth/logged-out"],
+    "grant-types": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:jwt-bearer"],
+    "token-validity": 3600,
+    "refresh-token-validity": 2592000
+  }
+}

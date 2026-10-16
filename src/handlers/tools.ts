@@ -1,0 +1,1778 @@
+import { customizingDefinition } from './customizing-schema.js';
+/** Intent-based tool schemas; BTP omits classic object types and adjusts descriptions. */
+
+import {
+  ATC_BATCH_MAX_OBJECTS,
+  ATC_BATCH_NAME_MAX_LENGTH,
+  ATC_BATCH_NAME_PATTERN,
+  ATC_BATCH_TYPES,
+} from '../adt/atc-batch.js';
+import { KTD_SHORT_TEXT_MAX_LENGTH } from '../adt/ddic-xml.js';
+import { TEXT_ELEMENT_PARTS } from '../adt/text-elements.js';
+import type { ResolvedFeatures } from '../adt/types.js';
+import { MAX_GREP_PATTERN_LENGTH } from '../context/grep.js';
+import type { ServerConfig } from '../server/types.js';
+import * as DtelFields from './data-element-fields.js';
+import { SAPDIAGNOSE_ADDITIONAL_INPUTS } from './diagnose-fields.js';
+import * as FuncProcessing from './function-processing.js';
+import { getHyperfocusedToolDefinition } from './hyperfocused.js';
+import { CLASS_WRITE_INCLUDES } from './object-types.js';
+import { addLiveRelationsDefinition } from './relation-tool.js';
+import { SAPWRITE_DESC_BTP, SAPWRITE_DESC_ONPREM } from './tool-descriptions.js';
+import {
+  ATC_BATCH_TYPES_BTP,
+  isGitToolVisible,
+  SAPCONTEXT_TYPES_BTP,
+  SAPCONTEXT_TYPES_ONPREM,
+  SAPREAD_TYPES_BTP,
+  SAPREAD_TYPES_ONPREM,
+  SAPWRITE_TYPES_BTP,
+  SAPWRITE_TYPES_ONPREM,
+} from './tool-registry.js';
+import { BATCH_CREATE_MAX_OBJECTS } from './write/batch-results.js';
+
+/** MCP tool behavior annotations (a subset of the spec; all optional, all advisory hints). */
+export interface ToolAnnotations {
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+  title?: string;
+}
+
+export interface ToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: ToolAnnotations;
+}
+
+export interface ToolDefinitionOptions {
+  nullableOptionals?: boolean;
+  discoveryMap?: ReadonlyMap<string, string[]>;
+}
+
+/**
+ * Read-only / destructive hints for standard tools, required by the Claude Desktop Extensions Directory.
+ * Hyperfocused mode stays unannotated because it can both read and write.
+ *
+ * Keep hints consistent with ACTION_POLICY; tool-annotations.test.ts derives expected values.
+ * SAPLint mutates formatter settings; SAPWrite/SAPTransport/SAPGit can delete or unlink objects.
+ */
+const TOOL_ANNOTATIONS: Record<string, ToolAnnotations> = {
+  // Read-only: every action is non-mutating.
+  SAPRead: { readOnlyHint: true },
+  SAPSearch: { readOnlyHint: true },
+  SAPNavigate: { readOnlyHint: true },
+  SAPQuery: { readOnlyHint: true },
+  SAPContext: { readOnlyHint: true },
+  // Mutating, non-destructive (no delete action).
+  // SAPDiagnose.apply_quickfix is a write/Update action, so the tool is not read-only.
+  SAPDiagnose: { readOnlyHint: false, destructiveHint: false },
+  SAPLint: { readOnlyHint: false, destructiveHint: false },
+  SAPActivate: { readOnlyHint: false, destructiveHint: false },
+  // Mutating AND destructive (delete / unlink / overwriting actions).
+  SAPWrite: { readOnlyHint: false, destructiveHint: true },
+  SAPTransport: { readOnlyHint: false, destructiveHint: true },
+  SAPGit: { readOnlyHint: false, destructiveHint: true },
+  SAPManage: { readOnlyHint: false, destructiveHint: true },
+};
+
+/** Check if tools should use BTP-adapted definitions */
+function isBtpMode(config: ServerConfig): boolean {
+  return config.systemType === 'btp';
+}
+
+const SAPREAD_DESC_ONPREM =
+  'Read SAP ABAP source, metadata or syntax-check results. For purpose, explanations, specs, reviews or pre-change context, prefer SAPContext first. DDIC metadata: omit format (default text); structured is CLAS-only for ordinary reads. ' +
+  'Types: PROG, CLAS, INTF, FUNC, FUGR (expand_includes=true for all include sources), INCL, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD/KTD (KTD aliases SKTD), TABL (covers both transparent tables AND DDIC structures — no separate STRU type), TTYP, VIEW, DOMA, DTEL, TRAN, TABLE_CONTENTS (single-column filter), TABLE_QUERY (multi-column WHERE via the freestyle endpoint; gated by allowDataPreview; CDS views need SAP_BASIS 752+), DEVC, SOBJ (BOR — method param reads one method), SYSTEM, COMPONENTS, MSAG, TEXT_ELEMENTS, VARIANTS, BSP, BSP_DEPLOY, API_STATE (contract states C0-C4; objectType for non-class), INACTIVE_OBJECTS (no name; pending-activation list), AUTH, FEATURE_TOGGLE, ENHO, VERSIONS, VERSION_SOURCE. AUTH/FEATURE_TOGGLE/ENHO/VERSIONS/VERSION_SOURCE are on-prem only. ' +
+  'SYNTAX: read-only SAP check (objectType+name, optional source for unsaved text). CLAS: method="*" for signatures, method="NAME" for one body, or grep. Global class declaration/implementation: MAIN (omit include). definitions/implementations contain local helpers. ' +
+  'grep: case-insensitive regex; returns matching lines, context and line numbers, with owning class/method for CLAS.';
+
+const SAPREAD_DESC_BTP =
+  'Read SAP ABAP source, metadata or syntax-check results (BTP ABAP Environment). For purpose, explanations, specs, reviews or pre-change context, prefer SAPContext first. DDIC metadata: omit format (default text); structured is CLAS-only for ordinary reads. ' +
+  'Types: CLAS, INTF, FUNC (released/custom only), FUGR (released/custom only), DDLS (primary data model on BTP), DCLS, DDLX, BDEF, SRVD, SRVB, SKTD/KTD (KTD aliases SKTD), TABL (custom tables AND structures — no separate STRU type), DOMA, DTEL, TABLE_CONTENTS (custom tables + released CDS only; standard tables blocked), TABLE_QUERY (multi-column WHERE on custom tables + released CDS; needs SAP_BASIS 752+), DEVC, SYSTEM, COMPONENTS, MSAG (custom only), BSP, BSP_DEPLOY, API_STATE (contract states C0-C4; objectType for non-class), INACTIVE_OBJECTS (no name; pending-activation list). PROG/INCL/VIEW/TRAN/TEXT_ELEMENTS/VARIANTS and VERSIONS/VERSION_SOURCE are not available on BTP (use CLAS with IF_OO_ADT_CLASSRUN for console apps, DDLS for data models). ' +
+  'SYNTAX: read-only SAP check (objectType+name, optional source for unsaved text). CLAS: method="*" for signatures, method="NAME" for one body, or grep. Global class declaration/implementation: MAIN (omit include). definitions/implementations contain local helpers. ' +
+  'grep: case-insensitive regex; returns matching lines, context and line numbers, with owning class/method for CLAS.';
+
+// ─── SAPContext Types ───────────────────────────────────────────────
+
+const SAPCONTEXT_DESC_ONPREM =
+  'Primary tool for understanding ABAP/CDS objects before specs, reviews, explanations, or changes — use instead of SAPRead when the user asks what an object does. Returns intent first (the object KTD when available) then compressed dependency contracts. Use SAPRead after SAPContext for exact source/method bodies/grep/drafts.\n\n' +
+  "Decision rule — pick the action from the user's question:\n" +
+  '- "What breaks if I change <CDS>?" / "Who consumes <I_*>?" / "Blast radius" → action="impact" (DDLS only).\n' +
+  '- "Which includes/appends extend <TABL>?" → action="structure", type="TABL".\n' +
+  '- "What does <object> do?" / "Explain" / "deps before editing" → action="deps" (default); type+name required.\n' +
+  '- "Find all callers of <object>" → action="usages" (live SAP where-used lookup).\n\n' +
+  'impact (CDS blast-radius): upstream AST deps + downstream where-used, classified into RAP buckets (projectionViews, bdefs, serviceDefinitions, serviceBindings, accessControls, metadataExtensions, abapConsumers, documentation, tables, other) + sibling-consistency hints. Use this instead of text-scanning DDDDLSRC/ACMDCLSRC with SAPQuery (it filters the noise). Optional includeIndirect, siblingCheck, siblingMaxCandidates.\n' +
+  'deps: target KTD when available + selected dependency contracts, derived from source (not SAP-native relationships or a complete inventory). Counts distinguish root candidates from recursive attempts. Standard helper names are filtered. For CDS, includes dependency DDL/field catalogs for cl_cds_test_environment.\n' +
+  'structure (TABL only): the DDIC include/append tree.\n\n' +
+  'Non-CDS reverse-lookup: SAPNavigate(references); CDS: impact. Full detail: docs_page SAPContext.';
+
+const SAPCONTEXT_DESC_BTP =
+  'Primary tool for understanding ABAP/CDS objects before specs, reviews, explanations, or changes (BTP ABAP Environment) — use instead of SAPRead when the user asks what an object does. Returns intent first (object KTD when available) then compressed dependency contracts.\n\n' +
+  "Decision rule — pick the action from the user's question:\n" +
+  '- "What breaks if I change <CDS>?" / "Who consumes <I_*>?" / "Blast radius" → action="impact" (DDLS only).\n' +
+  '- "Which includes/appends extend <TABL>?" → action="structure", type="TABL".\n' +
+  '- "What does <object> do?" / "Explain" / "deps before editing" → action="deps" (default); type+name required.\n\n' +
+  '- "Find all callers of <object>" → action="usages" (live SAP where-used lookup).\n\n' +
+  'impact (CDS blast-radius): upstream AST deps + downstream where-used classified into RAP buckets (projectionViews, bdefs, serviceDefinitions, serviceBindings, accessControls, metadataExtensions, abapConsumers, documentation, tables, other) + sibling-consistency hints; filters the noise that text-scanning with SAPQuery produces. Optional includeIndirect, siblingCheck, siblingMaxCandidates.\n' +
+  'deps: target KTD when available + selected dependency contracts, derived from source (not SAP-native relationships or a complete inventory). Counts distinguish root candidates from recursive attempts. On BTP, CL_ABAP_*/IF_ABAP_* and custom Z/Y are included.\n' +
+  'structure (TABL only): the DDIC include/append tree.\n\n' +
+  'Full detail: docs_page SAPContext.';
+
+// ─── SAPQuery ───────────────────────────────────────────────────────
+
+const SAPQUERY_DIALECT_GUIDE =
+  'ADT freestyle ABAP SQL: one read-only SELECT. Use AS aliases, alias~field/alias~*, ASCENDING/DESCENDING, single-quoted literals (no @/:/? parameters), and maxRows (not TOP/LIMIT/OFFSET/FETCH). JOINs, GROUP BY, aggregates, UNION and subqueries work. CTEs, FULL JOIN, derived/window tables, INTERSECT/EXCEPT, comments, semicolons and schema prefixes do not. ARC-1 auto-chunks long literal IN-lists in plain projection SELECTs. ';
+
+const SAPQUERY_DESC_ONPREM =
+  'Query SAP tables with ABAP SQL; returns columns + rows. For reverse-engineering metadata: DD02L, DD03L, TADIR, TFDIR, SWOTLV. Unknown tables get suggestions. ' +
+  SAPQUERY_DIALECT_GUIDE +
+  'For CDS consumers, do not scan DDDDLSRC/ACMDCLSRC/DDLXSRC_SRC; use SAPContext(action="impact", type="DDLS").';
+
+const SAPQUERY_DESC_BTP =
+  'Query BTP ABAP Environment with ABAP SQL; returns columns + rows. ' +
+  SAPQUERY_DIALECT_GUIDE +
+  'BTP permits custom Z/Y tables and released CDS entities; standard tables are blocked. ' +
+  'Use released views such as I_LANGUAGE. Unknown tables get suggestions.';
+
+// ─── SAPSearch ──────────────────────────────────────────────────────
+
+const SAPSEARCH_DESC_ONPREM =
+  'Search for ABAP objects, exact object-directory entries, or source code. Modes:\n' +
+  '1. Object search (default): name pattern with wildcards (*); returns type, name, package, description, ADT URI.\n' +
+  '2. TADIR lookup (searchType="tadir_lookup"): exact cross-package lookup of one or more names (prefer over long SAPQuery TADIR IN-lists).\n' +
+  '3. Source code search (searchType="source_code"): full-text search across source (SAP_BASIS ≥ 7.51).\n' +
+  "Tips: BOR objects appear as SOBJ; the uri field feeds SAPNavigate, objectType feeds SAPRead/SAPWrite/SAPActivate. Searches object NAMES only — for field names use SAPRead(type='DDLS', include='elements') or SAPQuery on DD03L.";
+
+const SAPSEARCH_DESC_BTP =
+  'Search for ABAP objects, exact object-directory entries, or source code (BTP ABAP Environment). Three modes:\n' +
+  '1. Object search (default): Search by name pattern with wildcards. Returns released SAP objects and custom Z/Y objects. Classic programs, includes, and DDIC views are not searchable on BTP.\n' +
+  '2. TADIR lookup (searchType="tadir_lookup"): Exact object lookup for one or more names via ADT repository quick search.\n' +
+  '3. Source code search (searchType="source_code"): Full-text search within ABAP source code.\n\n' +
+  "Tips: On BTP, focus on classes (CL_*), interfaces (IF_*), CDS views (I_*), and custom Z/Y objects.\n\nNote: Searches object names only (classes, CDS views, etc.) — field/column names are not searchable here. To find fields by name, use SAPRead(type='DDLS', include='elements') for CDS views.";
+
+// ─── SAPTransport ───────────────────────────────────────────────────
+const SAPTRANSPORT_DESC_ONPREM =
+  'Manage CTS transport requests (SE09/SE10). Actions: list (current user, modifiable), get (tasks + objects), ' +
+  'create (always a Workbench (K) request — the package/target sets target & layer, not the request category; optional explicit target), ' +
+  'release, delete, remove_object (keep the request), reassign (change owner), release_recursive (tasks then parent), ' +
+  'check (does a package need a transport — type, name, package), history (legacy name: current object lock plus assignment candidates — type, name; not complete transport history; read-only, no write scope needed). ' +
+  'IDs look like A4HK900123. Status: D/L=modifiable, O/P=releasing, R/N=released.';
+
+const SAPTRANSPORT_DESC_BTP =
+  'Manage transport requests (BTP ABAP Environment, SE09/SE10). Actions: list (current user, modifiable), get (tasks + objects), ' +
+  'create (always a Workbench (K) request — the package/target sets target & layer; optional explicit target), ' +
+  'release, delete, remove_object (keep the request), reassign (change owner), release_recursive (tasks then parent), ' +
+  'check (does a package need a transport — type, name, package), history (legacy name: current object lock plus assignment candidates — type, name; not complete transport history; read-only). ' +
+  'On BTP, release triggers a gCTS push to the software-component Git repo; import is via Manage Software Components / cTMS, not this tool.';
+
+// ─── SAPManage ──────────────────────────────────────────────────────
+const SAPMANAGE_DESC_ONPREM =
+  'Probe and report SAP system capabilities. Use BEFORE operations that depend on optional features ' +
+  '(abapGit, RAP/CDS, AMDP, HANA, UI5/Fiori, CTS transports, FLP). Also handles package (DEVC) lifecycle.\n\n' +
+  'Actions:\n' +
+  '- "features": cached feature status (fast, no round-trip; id, available, mode, probedAt). "probe": re-probe now (feature probes + auth + discovery refresh). "cache_stats": object cache health.\n' +
+  '- "create_package" / "delete_package" / "change_package": DEVC lifecycle via ADT packages API.\n' +
+  '- FLP read: flp_list_catalogs, flp_list_groups, flp_list_tiles (catalogId). FLP write: flp_create_catalog, flp_create_group, flp_create_tile, flp_add_tile_to_group, flp_delete_catalog. Classic designer tile/target-mapping model, deprecated since S/4HANA 2023; Work Zone exposure v2 needs LADIs (SAPRead type=UIAD).\n' +
+  '- "set_api_state": release/revoke an object\'s API release contract (objectUri, or name+objectType; apiState defaults RELEASED, contract defaults C1 — C0 for SRVD, C3 for classic views). Write counterpart of SAPRead(type="API_STATE").\n\n' +
+  'Returns features + systemType ("onprem"/"btp"); "available: false" means do NOT attempt dependent operations.';
+
+const SAPMANAGE_DESC_BTP =
+  'Probe and report SAP system capabilities (BTP ABAP Environment). ' +
+  'Returns feature status and system type. Also handles package (DEVC) lifecycle operations.\n\n' +
+  'Actions:\n' +
+  '- "features": Get cached feature status from last probe.\n' +
+  '- "probe": Re-probe the SAP system now (feature probes + discovery refresh).\n' +
+  '- "cache_stats": Show request-driven object cache health.\n' +
+  '- "create_package": Create a package (DEVC) via ADT packages API.\n' +
+  '- "delete_package": Delete an existing package.\n' +
+  '- FLP actions: flp_list_catalogs, flp_list_groups, flp_list_tiles, flp_create_catalog, flp_create_group, flp_create_tile, flp_add_tile_to_group, flp_delete_catalog. Classic designer model, deprecated since S/4HANA 2023 (successor: SAPRead type=UIAD).\n' +
+  '- "set_api_state": Release (or revoke) an object\'s API release contract for ABAP Cloud / Clean Core ' +
+  '(requires "objectUri", or "name" + "objectType"; "apiState" defaults to RELEASED, "contract" defaults to C1 — pass C0 for SRVD, C3 for classic views). The write counterpart of SAPRead(type="API_STATE").\n\n' +
+  'Returns JSON with features and systemType="btp". On BTP, RAP/CDS and transports are always available. ' +
+  'abapGit, AMDP, UI5/BSP, and FLP customization may not be available depending on the BTP ABAP configuration.';
+
+const SAPMANAGE_ACTIONS_READ = [
+  'features',
+  'probe',
+  'cache_stats',
+  'flp_list_catalogs',
+  'flp_list_groups',
+  'flp_list_tiles',
+];
+const SAPMANAGE_ACTIONS_WRITE = [
+  'create_package',
+  'delete_package',
+  'change_package',
+  'flp_create_catalog',
+  'flp_create_group',
+  'flp_create_tile',
+  'flp_add_tile_to_group',
+  'flp_delete_catalog',
+  'set_api_state',
+];
+
+const SAPTRANSPORT_ACTIONS_READ = ['list', 'get', 'diff', 'check', 'history', 'layers', 'targets'];
+const SAPTRANSPORT_ACTIONS_WRITE = ['create', 'release', 'delete', 'remove_object', 'reassign', 'release_recursive'];
+
+const SAPGIT_ACTIONS_READ = ['list_repos', 'whoami', 'config', 'branches', 'history', 'objects', 'check'];
+const SAPGIT_ACTIONS_WRITE = [
+  'external_info',
+  'stage',
+  'clone',
+  'pull',
+  'push',
+  'switch_branch',
+  'create_branch',
+  'unlink',
+];
+
+const SAPGIT_DESC =
+  'Git reads and gated abapGit workflows. gCTS mutations are quarantined. ' +
+  'abapGit mutations need write/Git gates and allowedPackages ROOT/** or *; clone/pull evidence is unverified. external_info is gated HTTPS SAP egress.';
+
+// ─── SAPSearch Builder ─────────────────────────────────────────────
+
+/** Strip source_code-specific lines from a SAPSearch description when textSearch is unavailable */
+function stripSourceCodeLines(desc: string): string {
+  return desc
+    .split('\n')
+    .filter(
+      (line) =>
+        !line.includes('source_code') &&
+        !line.includes('Source code search') &&
+        !line.startsWith('2. Source code search') &&
+        !line.startsWith('3. Source code search'),
+    )
+    .join('\n')
+    .replace(
+      /, exact object-directory entries, or source code[^.]*\. Three modes:\n1\. Object search \(default\): /i,
+      '. ',
+    )
+    .replace(/ or search within source code[^.]*\. Two modes:\n1\. Object search \(default\): /i, '. ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function buildSAPSearchTool(btp: boolean, textSearchAvailable?: boolean): ToolDefinition {
+  // When textSearch is explicitly unavailable (probed and failed), hide source_code
+  const hideSourceCode = textSearchAvailable === false;
+
+  const baseDesc = btp ? SAPSEARCH_DESC_BTP : SAPSEARCH_DESC_ONPREM;
+  // Strip source_code lines from base description when hiding
+  const description = hideSourceCode ? stripSourceCodeLines(baseDesc) : baseDesc;
+
+  const properties: Record<string, unknown> = {
+    query: {
+      type: 'string',
+      description: hideSourceCode
+        ? 'Search pattern for object search, or comma/whitespace-separated names for tadir_lookup.'
+        : 'Search pattern. For object search: name pattern with wildcards (e.g., ZCL_ORDER*, Z*TEST*). For tadir_lookup: exact name or comma/whitespace-separated names. For source_code search: text string to find in source (e.g., cl_lsapi_manager, CALL FUNCTION).',
+    },
+    maxResults: {
+      type: 'number',
+      description: hideSourceCode
+        ? 'Maximum results (default 100)'
+        : 'Maximum results (default 100 for object, 50 for source_code)',
+    },
+  };
+
+  properties.searchType = {
+    type: 'string',
+    enum: hideSourceCode ? ['object', 'tadir_lookup'] : ['object', 'source_code', 'tadir_lookup'],
+    description: hideSourceCode
+      ? 'Search mode: "object" (default) searches by object name, "tadir_lookup" does exact cross-package object lookup.'
+      : 'Search mode: "object" (default) searches by object name, "source_code" searches within ABAP source code, "tadir_lookup" does exact cross-package object lookup.',
+  };
+  properties.names = {
+    type: 'array',
+    items: { type: 'string' },
+    description:
+      'For tadir_lookup: exact object names to resolve across packages. Prefer this over long SAPQuery TADIR IN-lists.',
+  };
+  properties.objectTypes = {
+    type: 'array',
+    items: { type: 'string' },
+    description: 'For tadir_lookup: optional ADT/TADIR type filters (e.g., TABL, DDLS, BDEF, SRVB, CLAS/OC).',
+  };
+  properties.objectType = {
+    type: 'string',
+    maxLength: 64,
+    description:
+      'Object search: SAP-side type filter before the result limit (e.g., UIAC, CLAS, CLAS/OC). Source search: type filter (e.g., PROG, CLAS, FUNC). For tadir_lookup: single type filter; use objectTypes for multiple.',
+  };
+  properties.source = {
+    type: 'string',
+    enum: ['adt', 'db', 'both'],
+    description:
+      'For tadir_lookup only: data source for the lookup. "adt" (default) uses the ADT info-system endpoint — workbench-resolvable objects only. ' +
+      '"db" issues SQL against table TADIR — also surfaces orphan/ghost rows from aborted create-delete cycles (requires sql scope and SAP_ALLOW_FREE_SQL=true). ' +
+      '"both" runs both paths and adds a "splitBrain" array listing names where the two sources disagree, plus a "warnings" array explaining each divergence (requires sql scope).',
+  };
+
+  if (!hideSourceCode) {
+    properties.packageName = { type: 'string', description: 'For source_code search: filter by package name' };
+  }
+
+  return {
+    name: 'SAPSearch',
+    description,
+    inputSchema: {
+      type: 'object',
+      properties,
+    },
+  };
+}
+
+// ─── GPT/OpenAI strict-mode nullable helper (issue #360) ────────────
+
+/** Add `null` to a property's `type` (string -> ["string","null"]). Per OpenAI's Structured
+ *  Outputs guide, null goes in `type` only, never into `enum`. */
+function makeNullableType(def: Record<string, unknown>): Record<string, unknown> {
+  const d = { ...def };
+  const t = d.type;
+  if (typeof t === 'string') {
+    if (t !== 'null') d.type = [t, 'null'];
+  } else if (Array.isArray(t) && !t.includes('null')) {
+    d.type = [...t, 'null'];
+  }
+  return d;
+}
+
+/**
+ * Recursively make every non-required property of a JSON-schema object nullable.
+ *
+ * This exists only for explicit OpenAI/Azure strict-mode compatibility (#360), where a strict
+ * function schema can force every optional field to be present and enum optionals then get
+ * fabricated values. Several MCP clients reject `type: ["x","null"]` unions, so the default
+ * visible schema stays plain for broad client compatibility (#520).
+ *
+ * Pure — returns a copy and does not mutate the input. Each object node's own `required` array
+ * decides what stays non-nullable, so top-level `action` and batch-item `type`/`name` remain plain.
+ */
+function makeOptionalPropertiesNullable(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(makeOptionalPropertiesNullable);
+  if (!node || typeof node !== 'object') return node;
+  const obj = node as Record<string, unknown>;
+  const result: Record<string, unknown> = { ...obj };
+  if (obj.type === 'object' && obj.properties && typeof obj.properties === 'object') {
+    const required = new Set(Array.isArray(obj.required) ? (obj.required as string[]) : []);
+    const newProps: Record<string, unknown> = {};
+    for (const [key, def] of Object.entries(obj.properties as Record<string, unknown>)) {
+      let processed = makeOptionalPropertiesNullable(def);
+      if (!required.has(key) && processed && typeof processed === 'object' && !Array.isArray(processed)) {
+        processed = makeNullableType(processed as Record<string, unknown>);
+      }
+      newProps[key] = processed;
+    }
+    result.properties = newProps;
+  }
+  if (obj.items !== undefined) result.items = makeOptionalPropertiesNullable(obj.items);
+  return result;
+}
+
+// ─── Main Tool Definitions ──────────────────────────────────────────
+
+/** Advertise the strictness the runtime enforces — the Zod schemas are `.strict()`, and JSON Schema means
+ *  the opposite when absent. Every return path goes through here. TOP-LEVEL ONLY: nested `objects[]`
+ *  items stay lenient, matching `.strict()`, which does not cascade (batch_create; #360). */
+function withStrictSchemas(tools: ToolDefinition[]): ToolDefinition[] {
+  for (const tool of tools) (tool.inputSchema as Record<string, unknown>).additionalProperties = false;
+  return tools;
+}
+
+export function getToolDefinitions(
+  config: ServerConfig,
+  textSearchAvailable?: boolean,
+  resolvedFeatures?: ResolvedFeatures,
+  options: ToolDefinitionOptions = {},
+): ToolDefinition[] {
+  // Hyperfocused mode: single universal SAP tool (~200 tokens).
+  if (config.toolMode === 'hyperfocused')
+    return withStrictSchemas([getHyperfocusedToolDefinition(config, resolvedFeatures)]);
+
+  const btp = isBtpMode(config);
+  const tools: ToolDefinition[] = [
+    {
+      name: 'SAPRead',
+      description: btp ? SAPREAD_DESC_BTP : SAPREAD_DESC_ONPREM,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          type: {
+            type: 'string',
+            enum: btp ? SAPREAD_TYPES_BTP : SAPREAD_TYPES_ONPREM,
+            description:
+              'Object or metadata type. TABL includes DDIC structures; KTD aliases SKTD (Knowledge Transfer Documents). SYNTAX checks objectType+name. Server-driven objects use discovery-gated XML metadata and AFF JSON source (DTSC/DSFD/DTDC/DRTY use DDL text). DESD logical external schema; EVTB event binding; EVTO event object; CSNM CSN model; COTA communication target; DTSC static cache; DTDC dynamic cache; DSFD scalar function; UIAD launchpad descriptor; DRTY CDS type; APLO log object; SAJC/SAJT job catalog/template. Deprecated: MESSAGES→MSAG.' +
+              (btp ? ' ENQU lock object as JSON.' : ' FTG2→FEATURE_TOGGLE. ENQU lock object as JSON.'),
+          },
+          name: { type: 'string', description: 'Object name (e.g., ZTEST_PROGRAM, ZCL_ORDER, MARA)' },
+          action: {
+            type: 'string',
+            enum: ['diff'],
+            description:
+              'Set to "diff" for a unified diff between two source versions (uses from/to) — cheaper than fetching both sources. Source types only: PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, BDEF, SRVD, DDLX, TABL.',
+          },
+          from: {
+            type: 'string',
+            description:
+              'action="diff" OLD side: "active" (default), "inactive", a revision id from SAPRead(type="VERSIONS"), or a /sap/bc/adt/ revision URI.',
+          },
+          to: {
+            type: 'string',
+            description:
+              'action="diff" NEW side (default "inactive" = pending unactivated changes). Same values as from.',
+          },
+          fromLabel: {
+            type: 'string',
+            description:
+              'action="diff" optional display label for the OLD side in the summary and patch header, e.g. "DNT-6-6: Validate discounts (DS7K900123)". Does not affect source resolution.',
+          },
+          toLabel: {
+            type: 'string',
+            description:
+              'action="diff" optional display label for the NEW side in the summary and patch header, e.g. "active" or "inactive draft". Does not affect source resolution.',
+          },
+          include: {
+            type: 'string',
+            description:
+              'CLAS: omit include or use main for the global declaration + implementation; definitions/implementations select local helper classes, macros/testclasses their own sections. Explicit include wins over method auto-routing. ' +
+              'For DDLS: use include="elements" for the CDS field catalog (key fields, aliases, associations, expression types) instead of raw DDL. ' +
+              'For VERSIONS (CLAS): include selects the class include history to query (main, definitions, implementations, macros, testclasses). BSP: case-sensitive path; name may also be APP/path.' +
+              // TEXT_ELEMENTS does not exist on BTP — keep the BTP surface byte-identical.
+              (btp ? '' : ' TEXT_ELEMENTS: symbols|selections|headings; omit for pool (CLAS: symbols).'),
+          },
+          group: {
+            type: 'string',
+            description:
+              'For FUNC/VERSIONS type. The function group containing the function module. Optional for FUNC — auto-resolved via SAPSearch if omitted. Required for VERSIONS when querying a function module revision feed.',
+          },
+          method: {
+            type: 'string',
+            description:
+              'For CLAS: read a method (e.g., "get_name", "zif_order~process", "lhc_travel~accept") or use "*" to list methods. Without include=, lhc_*/lcl_* use implementations, ltc_* uses testclasses, and others use MAIN; explicit include= wins. ' +
+              (btp ? '' : 'For SOBJ: BOR method name to read. If omitted, returns the full BOR method catalog. ') +
+              'Not used with other types.',
+          },
+          grep: {
+            type: 'string',
+            maxLength: MAX_GREP_PATTERN_LENGTH,
+            description:
+              'Regex pattern (case-insensitive) to search within the object source. Returns only matching lines with 1-based line numbers and ±3 context lines, instead of the full source — token-efficient. ' +
+              'For CLAS, matches are annotated with the owning class/method; combine with include= to scope a section, but do NOT combine with method= (use grep to find, then method= to read). ' +
+              'Works for source-bearing types (CLAS, INTF, DDLS, DCLS, BDEF, SRVD, SRVB, SKTD/KTD, DDLX, TABL' +
+              (btp ? '' : ', PROG, FUNC, FUGR, INCL, VIEW') +
+              '). Falls back to a literal search when the pattern is not valid regex.',
+          },
+          ...(btp
+            ? {}
+            : {
+                expand_includes: {
+                  type: 'boolean',
+                  description:
+                    'For FUGR type only. When true, recursively expands the function group include tree — the main source plus all nested INCLUDEs (the FUNCTION...ENDFUNCTION bodies live in nested LZ<grp>U01/U02 includes, so a flat one-level walk misses them). Each block is prefixed with a "=== name ===" marker; depth/count-capped. Dynpros and GUI status are not included (ADT does not expose them over REST).',
+                },
+              }),
+          format: {
+            type: 'string',
+            enum: ['text', 'structured', 'editable'],
+            description:
+              'Default text. editable: fresh {source, sourceHash} for guarded SAPWrite; omit version/method/grep, select CLAS include. structured: CLAS metadata+includes, DEVC {objects,listing}, or action=diff JSON. DEVC text returns the array then listing metadata; diff text returns a patch.',
+          },
+          version: {
+            type: 'string',
+            enum: ['active', 'inactive', 'auto'],
+            description:
+              'Source defaults active; inactive requests a draft (SAP may return active if none); auto selects developer view. DTEL/ENQU/server-driven types default to developer view. Server-driven types return an error if SAP cannot confirm an explicit version (e.g. no draft).',
+          },
+          includeSignature: {
+            type: 'boolean',
+            description:
+              'For FUNC type only. When true, response is JSON: {source, signature: {importing[], exporting[], changing[], tables[], exceptions[], raising[]}, processingType?, updateTaskKind?} — each parameter parsed into {kind, name, type, byValue?, default?, optional?}; processingType reports rfc/update/normal. Default false (returns plain source body).',
+          },
+          force_refresh: {
+            type: 'boolean',
+            description:
+              'For source reads: bypass cached source and inactive-list state before reading. Use when you know the object changed outside ARC-1.',
+          },
+          maxRows: {
+            type: 'number',
+            description:
+              'Row cap for TABLE_CONTENTS/TABLE_QUERY (default 100, max 10,000; byte limit may apply sooner). On 758, TABLE_CONTENTS returns N+1; use TABLE_QUERY for exact caps.',
+          },
+          maxResults: {
+            type: 'number',
+            description:
+              'DEVC object limit (default 200, clamped to [1, 1000]). Listing metadata reports the effective limit and possible truncation. Total and full repository completeness remain unknown.',
+          },
+          sqlFilter: {
+            type: 'string',
+            description:
+              'TABLE_CONTENTS condition expression only (no WHERE, no SELECT); broken on 758 (SAP expects SELECT). Use TABLE_QUERY where.',
+          },
+          objectType: {
+            type: 'string',
+            description:
+              'SYNTAX: required repository type (e.g. CLAS, PROG, DDLS). API_STATE: inferred if omitted. VERSIONS: type selects the endpoint (FUNC needs group); inferred from CL_/IF_/CX_, else PROG.' +
+              (btp ? '' : ' TEXT_ELEMENTS: PROG (default), CLAS or FUGR.'),
+          },
+          source: {
+            type: 'string',
+            description:
+              'SYNTAX only: proposed source to check without saving. Omit to check stored version (default active; inactive checks draft). Object must exist; version=auto is unsupported.',
+          },
+          versionUri: {
+            type: 'string',
+            description:
+              'VERSION_SOURCE: canonical source/revision URI from VERSIONS .revisions[].uri; rejects unrelated ADT endpoints, absolute URLs, traversal, queries, and fragments.',
+          },
+          columns: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'For TABLE_QUERY: columns to SELECT (default: all). Example: ["MATNR","BWART","BUDAT","MENGE"].',
+          },
+          where: {
+            type: 'array',
+            description:
+              'For TABLE_QUERY: structured WHERE conditions, ANDed together. Each item: {field, op, value?}. ' +
+              'Ops: =, <>, <, <=, >, >=, LIKE, NOT LIKE, IN, NOT IN, IS NULL, IS NOT NULL; use <> because 758 rejects !=. ' +
+              'For IN/NOT IN: use bare comma-separated values; do NOT quote them. ARC-1 quotes and escapes values, e.g. "261,262". No subqueries. ' +
+              'Example: [{"field":"MATNR","op":"=","value":"300006888"},{"field":"BUDAT_MKPF","op":">=","value":"20250101"}].',
+            items: {
+              type: 'object',
+              properties: {
+                field: { type: 'string', description: 'SAP field name (uppercase)' },
+                op: { type: 'string', description: 'Comparison operator' },
+                value: { type: 'string', description: 'Value to compare (omit for IS NULL / IS NOT NULL)' },
+              },
+              required: ['field', 'op'],
+            },
+          },
+        },
+        required: ['type'],
+      },
+    },
+    buildSAPSearchTool(btp, textSearchAvailable),
+  ];
+
+  // Write tools — only registered when writes are enabled
+  if (config.allowWrites) {
+    let sapWriteDesc = btp ? SAPWRITE_DESC_BTP : SAPWRITE_DESC_ONPREM;
+    // Append package restriction info so the LLM knows its boundaries
+    if (config.allowedPackages.length > 0) {
+      const pkgList = config.allowedPackages.join(', ');
+      sapWriteDesc += ` Write access is restricted to packages: ${pkgList}.`;
+    }
+    const sapWriteTool: ToolDefinition = {
+      name: 'SAPWrite',
+      description: sapWriteDesc,
+      // Keep visible schemas on widely supported JSON Schema primitives. Runtime argument
+      // normalization still strips null-valued optionals from strict clients before Zod (#360).
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: [
+              'create',
+              'update',
+              'delete',
+              'edit_method',
+              ...(btp ? [] : ['edit_unit', 'add_unit']),
+              'edit_class_definition',
+              'add_method',
+              'edit_method_signature',
+              'delete_method',
+              'change_method_visibility',
+              'batch_create',
+              'scaffold_rap_handlers',
+              'generate_behavior_implementation',
+              // Class text-symbol writes are on-prem only (BTP has no classic text elements) — keep out
+              // of the BTP action enum so the zod↔json-schema parity check stays green.
+              ...(btp ? [] : ['edit_text_symbols']),
+            ],
+            // This is where an LLM decides WHICH action to use, so every action gets a line —
+            // especially the destructive and refusing ones, whose behaviour is not guessable.
+            description:
+              'Write action. create/update/delete: whole-object writes (update replaces /source/main, or one class-local include when include= is set). ' +
+              'edit_method: replace a single method body — the token-cheap path for class edits. ' +
+              (btp ? '' : 'edit_unit replaces a FORM/MODULE in PROG/INCL; add_unit appends one at EOF. ') +
+              'batch_create: create and activate many objects in one call; order is preserved, so list dependencies first. ' +
+              'Class surgery (CLAS, all on /source/main unless noted): edit_class_definition replaces the global DEFINITION block — or a class-local include when include= is set — and refuses a diff that would leave the class non-activatable; ' +
+              'add_method inserts a METHODS clause plus an empty IMPL stub (abstract=true skips the stub); ' +
+              'edit_method_signature rewrites one METHODS clause and leaves the body alone; ' +
+              'change_method_visibility moves a method to another section and preserves its body; ' +
+              'delete_method is destructive — it discards the body, so to re-section a method use change_method_visibility, never delete+add. ' +
+              'scaffold_rap_handlers / generate_behavior_implementation: derive behavior-pool handlers from a BDEF (the latter is the equivalent of Eclipse\'s "Generate Behavior Implementation").' +
+              (btp
+                ? ''
+                : ' edit_text_symbols: replace a CLAS/PROG/FUGR textpool part; read first, retain other entries. source="" clears it.'),
+          },
+          type: {
+            type: 'string',
+            enum: btp ? SAPWRITE_TYPES_BTP : SAPWRITE_TYPES_ONPREM,
+            description: btp
+              ? 'Object type (for create/update/delete/edit_method/edit_class_definition/add_method/edit_method_signature/delete_method/change_method_visibility). Supported on BTP: CLAS, INTF, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD or KTD (Knowledge Transfer Documents), TABL, TABL/DT, TABL/DS, DOMA, DTEL, MSAG. Class-section surgery actions require type=CLAS. UIAD: checks AFF JSON; create honors header.abapLanguageVersion. Manual cloudDevelopment items are editable; generated items may be read-only.'
+              : 'Object type (for create/update/delete/edit_method/edit_unit/add_unit/edit_class_definition/add_method/edit_method_signature/delete_method/change_method_visibility). Supported on-prem: PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD or KTD (Knowledge Transfer Documents), TABL, TABL/DT, TABL/DS, DOMA, DTEL, MSAG. Class-section surgery actions require CLAS. UIAD: validates AFF JSON and saves active; create honors header.abapLanguageVersion. Manual cloudDevelopment items are editable; generated items can be read-only.',
+          },
+          name: {
+            type: 'string',
+            description: btp
+              ? 'Object name (for create/update/delete/edit_method/edit_class_definition/add_method/edit_method_signature/delete_method/change_method_visibility).'
+              : 'Object name (for create/update/delete/edit_method/edit_unit/add_unit/edit_class_definition/add_method/edit_method_signature/delete_method/change_method_visibility).',
+          },
+          expectedSourceHash: {
+            type: 'string',
+            description:
+              'SHA-256 from SAPRead(format=editable). Refuses changed source under the lock. Text-source update and class/procedural surgery only; whole addressed source/include, not just the edited unit. Omitted/blank: no cross-call protection.',
+          },
+          source: {
+            type: 'string',
+            description: btp
+              ? 'ABAP source. create/update: full body. DDLS: type=DDLS; Cloud permits eligible `extend view entity`, not legacy `extend view`. edit_method: body. edit_class_definition without include=: only global CLASS…DEFINITION…ENDCLASS block (no IMPLEMENTATION); with include=: full replacement include. edit_method_signature: only new METHODS clause. Not used by add_method/delete_method/change_method_visibility (use `method`/`visibility`). SKTD/KTD: one "## <node>" section per node (any name or id the SAPRead node index lists); update MERGES, so unaddressed nodes keep their text; an unmatched node-shaped heading aborts it.'
+              : 'Source. create/update: full body. DDLS: type=DDLS for `extend view`/`extend view entity`; legacy needs a Standard ABAP package. edit_method: body. edit_unit/add_unit: complete FORM/MODULE. edit_class_definition without include=: only global CLASS…DEFINITION…ENDCLASS block (no IMPLEMENTATION); with include=: full replacement include. edit_method_signature: only METHODS clause. Not used by add_method/delete_method/change_method_visibility (use `method`/`visibility`). SKTD/KTD: one "## <node>" section per node (any name or id the SAPRead node index lists); update MERGES, so unaddressed nodes keep their text; an unmatched node-shaped heading aborts it.',
+          },
+          include: {
+            type: 'string',
+            enum: CLASS_WRITE_INCLUDES,
+            description:
+              'CLAS-ONLY. Do NOT send unless type=CLAS AND action is update / edit_method / edit_class_definition. OMIT it entirely for every other type and for delete / batch_create / add_method / edit_method_signature / delete_method / change_method_visibility (those use /source/main). Targets a class-local include: definitions (CCDEF), implementations (CCIMP), macros, testclasses. edit_method auto-detects it from the method specifier (lhc_*/lcl_* → implementations, ltc_* → testclasses), so you rarely pass it; use include=testclasses to create a new local test class. Whole-include writes auto-create a missing include and produce an inactive draft (read with SAPRead version="inactive" before activation).',
+          },
+          ...(btp
+            ? {}
+            : {
+                textPart: {
+                  type: 'string',
+                  enum: TEXT_ELEMENT_PARTS,
+                  description:
+                    'edit_text_symbols: symbols (default), selections (selection-screen labels), headings. CLAS: symbols only.',
+                },
+              }),
+          method: {
+            type: 'string',
+            description:
+              'edit_method/edit_method_signature/delete_method/change_method_visibility: the method NAME (e.g. "get_name", "zif_order~process", "lhc_project~approve_project"). add_method: the full METHODS clause as ABAP source. Local-class methods auto-route by prefix (lhc_*/lcl_* → implementations, ltc_* → testclasses); use the qualified <localclass>~<method> form when a bare name is ambiguous.',
+          },
+          ...(btp
+            ? {}
+            : {
+                unit: {
+                  type: 'string',
+                  description: 'edit_unit/add_unit: existing/new FORM or MODULE name (case-insensitive).',
+                },
+              }),
+          visibility: {
+            type: 'string',
+            enum: ['public', 'protected', 'private'],
+            description:
+              'For action=add_method: target visibility section to insert into (default "public"). For action=change_method_visibility: the TARGET section to move the method to (required). The target section header must already exist in the DEFINITION block — if not, ARC-1 refuses with a hint to use edit_class_definition first.',
+          },
+          abstract: {
+            type: 'boolean',
+            description:
+              'For action=add_method: when true, only the METHODS clause is inserted into DEFINITION; no METHOD/ENDMETHOD stub is added to IMPLEMENTATION. Default false (concrete method — DEFINITION + IMPL stub written atomically).',
+          },
+          bdefName: {
+            type: 'string',
+            description:
+              'For scaffold_rap_handlers: interface BDEF name whose actions/determinations/validations/authorizations define the required handlers (e.g. ZI_TRAVELREQ). For generate_behavior_implementation: optional override (default discovery reads the class rootEntityRef).',
+          },
+          autoApply: {
+            type: 'boolean',
+            description:
+              'For scaffold_rap_handlers: true inserts missing METHODS signatures + empty stubs and writes the class under one lock; false (default) returns a required-vs-missing report without modifying (preview, then re-run with autoApply=true). Not used by generate_behavior_implementation (use dryRun to preview there).',
+          },
+          targetAlias: {
+            type: 'string',
+            description:
+              'For scaffold_rap_handlers and generate_behavior_implementation: optional RAP entity alias filter (e.g., Travel, Segment) to scaffold only one handler class. When omitted, all entities declared in the BDEF are scaffolded. Case-insensitive.',
+          },
+          activate: {
+            type: 'boolean',
+            description:
+              'For generate_behavior_implementation: true (default) activates the class after writing; false writes source only. The known "Local classes of CL_ABAP_BEHAVIOR_HANDLER…" stale-active activation failure does not throw — it returns activation.success=false with a recovery hint.',
+          },
+          activateAtEnd: {
+            type: 'boolean',
+            description:
+              'For batch_create only. false (default): per-object inline activation in order. true: write all inactive drafts then one terminal activateBatch so SAP resolves cross-references between siblings — use for interdependent RAP stacks (TABL→DDLS→DCLS→BDEF→SRVD). A write-phase failure still breaks the loop; the terminal activate runs over the already-written subset.',
+          },
+          dryRun: {
+            type: 'boolean',
+            description:
+              'For generate_behavior_implementation: when true, runs discovery + cross-validation + scaffold planning and returns the report without writing or activating. Use this to preview what would change. SKTD/KTD update: reports which nodes would change, writing nothing.',
+          },
+          description: {
+            type: 'string',
+            description:
+              'Object description for create action (defaults to name if omitted). Max 60 chars for most types.',
+          },
+          package: {
+            type: 'string',
+            description: 'Package for new objects (default $TMP). Non-$TMP packages require a transport number.',
+          },
+          transport: {
+            type: 'string',
+            description:
+              'Transport request number. Required for non-$TMP packages. Use SAPTransport(action="list") to find or SAPTransport(action="create") to create one.',
+          },
+          group: {
+            type: 'string',
+            description:
+              'FUNC: existing FUGR; required for create, otherwise resolved. INCL: parent FUGR for structural includes; omit for standalone.',
+          },
+          ...(btp ? {} : FuncProcessing.FUNCTION_PROCESSING_TOOL_PROPERTIES),
+          dataType: { type: 'string', description: 'DOMA/DTEL: ABAP data type (e.g., CHAR, NUMC, DEC)' },
+          rowType: {
+            type: 'string',
+            description:
+              'TTYP create: the row type — a built-in ABAP type (STRING, I, …) or a DDIC structure/type name. Required for TTYP create.',
+          },
+          rowTypeKind: {
+            type: 'string',
+            enum: ['builtin', 'structure'],
+            description: 'TTYP create: row-type mode (auto-detected from rowType if omitted).',
+          },
+          length: { type: 'number', description: 'DOMA/DTEL: data type length' },
+          decimals: { type: 'number', description: 'DOMA/DTEL: decimal places' },
+          outputLength: { type: 'number', description: 'DOMA: output length' },
+          conversionExit: { type: 'string', description: 'DOMA: conversion exit (e.g., ALPHA)' },
+          signExists: { type: 'boolean', description: 'DOMA: signed values allowed' },
+          lowercase: { type: 'boolean', description: 'DOMA: lowercase characters allowed' },
+          fixedValues: {
+            type: 'array',
+            description: 'DOMA: fixed value ranges',
+            items: {
+              type: 'object',
+              properties: {
+                low: { type: 'string', description: 'Low value (required)' },
+                high: { type: 'string', description: 'High value for ranges (optional)' },
+                description: { type: 'string', description: 'Value description (optional)' },
+              },
+              required: ['low'],
+            },
+          },
+          valueTable: { type: 'string', description: 'DOMA: value table reference (e.g., T001)' },
+          typeKind: {
+            type: 'string',
+            enum: ['domain', 'predefinedAbapType'],
+            description: 'DTEL: type source (domain reference or predefined ABAP type)',
+          },
+          typeName: { type: 'string', description: 'DTEL: domain/type name reference (for typeKind=domain)' },
+          domainName: { type: 'string', description: 'DTEL: alias for typeName when referencing a domain' },
+          shortLabel: { type: 'string', description: 'DTEL: short field label' },
+          mediumLabel: { type: 'string', description: 'DTEL: medium field label' },
+          longLabel: { type: 'string', description: 'DTEL: long field label' },
+          headingLabel: { type: 'string', description: 'DTEL: heading field label' },
+          ...DtelFields.DATA_ELEMENT_TOOL_PROPERTIES,
+          searchHelp: { type: 'string', description: 'DTEL: search help name' },
+          searchHelpParameter: { type: 'string', description: 'DTEL: search help parameter' },
+          setGetParameter: { type: 'string', description: 'DTEL: SET/GET parameter ID' },
+          defaultComponentName: { type: 'string', description: 'DTEL: default component name' },
+          changeDocument: { type: 'boolean', description: 'DTEL: enable change document flag' },
+          messages: {
+            type: 'array',
+            description: 'MSAG: message entries for create/update',
+            items: {
+              type: 'object',
+              properties: {
+                number: { type: 'string', description: 'Message number (e.g., "001")' },
+                shortText: { type: 'string', description: 'Message short text (use & for placeholders: "&1", "&2")' },
+              },
+              required: ['number', 'shortText'],
+            },
+          },
+          parameters: {
+            type: 'array',
+            description:
+              'FUNC: structured signature parameters. ARC-1 builds the IMPORTING/EXPORTING/CHANGING/TABLES/EXCEPTIONS/RAISING clause and splices it into the FM body. When omitted, the supplied source is PUT verbatim.',
+            items: {
+              type: 'object',
+              properties: {
+                kind: {
+                  type: 'string',
+                  enum: ['importing', 'exporting', 'changing', 'tables', 'exceptions', 'raising'],
+                  description: 'Parameter kind. EXCEPTIONS/RAISING use only `name`; the others require `type`.',
+                },
+                name: { type: 'string', description: 'Parameter / exception name (uppercased on emit).' },
+                type: {
+                  type: 'string',
+                  description:
+                    'ABAP type expression. Required for IMPORTING/EXPORTING/CHANGING/TABLES; ignored for EXCEPTIONS/RAISING. Examples: "STRING", "I", "BAPIRET2", "TYPE STANDARD TABLE OF X", "LIKE DOKHL-OBJECT". For TABLES, include the leading TYPE/LIKE keyword.',
+                },
+                byValue: {
+                  type: 'boolean',
+                  description: 'Emit `VALUE(name)` wrapper. Default false (pass-by-reference).',
+                },
+                default: {
+                  type: 'string',
+                  description:
+                    'Raw ABAP literal — IMPORTING/CHANGING only. Emitted verbatim. Example: "\'X\'", "0", "SPACE".',
+                },
+                optional: { type: 'boolean', description: 'Emit `OPTIONAL` keyword.' },
+              },
+              required: ['kind', 'name'],
+            },
+          },
+          serviceDefinition: { type: 'string', description: 'SRVB: service definition name (SRVD) to bind to' },
+          bindingType: {
+            type: 'string',
+            description:
+              'SRVB: binding type — human-readable values like "ODataV4-UI", "OData V2 - Web API" are auto-normalized (sets odataVersion + category).',
+          },
+          odataVersion: {
+            type: 'string',
+            enum: ['V2', 'V4'],
+            description: 'SRVB: OData protocol version (default: V2). Overrides version inferred from bindingType.',
+          },
+          category: {
+            type: 'string',
+            enum: ['0', '1'],
+            description:
+              'SRVB: binding category (0=UI, 1=Web API; default: 0). Overrides category inferred from bindingType.',
+          },
+          version: { type: 'string', description: 'SRVB: service version number (default: 0001)' },
+          lintBeforeWrite: {
+            type: 'boolean',
+            description:
+              'Override server lint-before-write for this call (false skips it). Lint covers PROG/CLAS/INTF/FUNC and DDLS; other types rely on RAP preflight.',
+          },
+          preflightBeforeWrite: {
+            type: 'boolean',
+            description:
+              'Enable/disable deterministic RAP preflight checks (default true) — TABL/BDEF/DDLX static rules (curr/quan semantics, invalid BDEF enums, DDLX scope on 7.5x).',
+          },
+          checkBeforeWrite: {
+            type: 'boolean',
+            description:
+              'Override server check-before-write (default off). When true, runs a SAP syntax check and appends diagnostics to the response — the write is NOT blocked. Off by default (adds a round-trip; intermediate refactor writes legitimately trip transient dependency errors). Activation remains the definitive check.',
+          },
+          refObjectType: {
+            type: 'string',
+            description:
+              'SKTD/KTD create (required): ADT type+subtype of the documented parent (e.g. "DDLS/DF", "BDEF/BDO", "SRVD/SRV", "DEVC/K"). Not CLAS/INTF/PROG (use ABAP Doc for code).',
+          },
+          refObjectName: {
+            type: 'string',
+            description: 'SKTD/KTD create: name of the parent object the KTD documents (defaults to "name").',
+          },
+          refObjectDescription: {
+            type: 'string',
+            description: 'SKTD/KTD create: description of the parent object (shown in Eclipse tooltips).',
+          },
+          shortTexts: {
+            type: 'array',
+            description: `SKTD/KTD create/update: node = any name or id the SAPRead node index lists; text max ${KTD_SHORT_TEXT_MAX_LENGTH} UTF-16 units after whitespace normalization; empty clears; source optional.`,
+            items: {
+              type: 'object',
+              properties: {
+                node: { type: 'string', minLength: 1 },
+                text: { type: 'string' },
+              },
+              required: ['node', 'text'],
+            },
+          },
+          objects: {
+            type: 'array',
+            maxItems: BATCH_CREATE_MAX_OBJECTS,
+            items: {
+              type: 'object',
+              properties: {
+                type: {
+                  type: 'string',
+                  enum: btp ? SAPWRITE_TYPES_BTP : SAPWRITE_TYPES_ONPREM,
+                  description: 'Object type (includes TABL for RAP stack bootstrapping)',
+                },
+                name: { type: 'string', description: 'Object name' },
+                source: { type: 'string', description: 'ABAP source code (optional — some objects have no source)' },
+                description: { type: 'string', description: 'Object description (defaults to name if omitted)' },
+                package: {
+                  type: 'string',
+                  description: 'Object-specific package. Overrides top-level package for this item.',
+                },
+                transport: {
+                  type: 'string',
+                  description: 'Object-specific transport request. Overrides top-level transport for this item.',
+                },
+                ...(btp ? {} : FuncProcessing.FUNCTION_MODULE_BATCH_TOOL_PROPERTIES),
+                // DDIC metadata fields (DOMA/DTEL/TTYP/MSAG/SRVB) mirror the top-level SAPWrite
+                // params 1:1 — descriptions omitted here to keep the tools/list payload small (#520).
+                dataType: { type: 'string' },
+                rowType: { type: 'string' },
+                rowTypeKind: { type: 'string', enum: ['builtin', 'structure'] },
+                length: { type: 'number' },
+                decimals: { type: 'number' },
+                outputLength: { type: 'number' },
+                conversionExit: { type: 'string' },
+                signExists: { type: 'boolean' },
+                lowercase: { type: 'boolean' },
+                fixedValues: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: { low: { type: 'string' }, high: { type: 'string' }, description: { type: 'string' } },
+                    required: ['low'],
+                  },
+                },
+                valueTable: { type: 'string' },
+                typeKind: { type: 'string', enum: ['domain', 'predefinedAbapType'] },
+                typeName: { type: 'string' },
+                domainName: { type: 'string' },
+                shortLabel: { type: 'string' },
+                mediumLabel: { type: 'string' },
+                longLabel: { type: 'string' },
+                headingLabel: { type: 'string' },
+                ...DtelFields.DATA_ELEMENT_TOOL_PROPERTIES,
+                searchHelp: { type: 'string' },
+                searchHelpParameter: { type: 'string' },
+                setGetParameter: { type: 'string' },
+                defaultComponentName: { type: 'string' },
+                changeDocument: { type: 'boolean' },
+                messages: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: { number: { type: 'string' }, shortText: { type: 'string' } },
+                    required: ['number', 'shortText'],
+                  },
+                },
+                serviceDefinition: { type: 'string' },
+                bindingType: { type: 'string' },
+                odataVersion: { type: 'string', enum: ['V2', 'V4'] },
+                category: { type: 'string', enum: ['0', '1'] },
+                version: { type: 'string' },
+              },
+              required: ['type', 'name'],
+            },
+            description:
+              'For batch_create: ordered list of objects to create+activate (each needs type, name, and source if applicable). Created in array order — dependencies first (TABL before DDLS, BDEF after DDLS). Item-level package/transport override the top-level. Use activateAtEnd=true for interdependent stacks.',
+          },
+        },
+        required: ['action'],
+      },
+    };
+    if (options.nullableOptionals) {
+      sapWriteTool.inputSchema = makeOptionalPropertiesNullable(sapWriteTool.inputSchema) as Record<string, unknown>;
+    }
+    tools.push(sapWriteTool);
+
+    tools.push({
+      name: 'SAPActivate',
+      description:
+        'Activate (publish) ABAP objects, single or batch. Type codes auto-normalized (e.g. "CLAS/OC" → CLAS). ' +
+        'ALWAYS prefer batch activation for 2+ objects — pass an "objects" array of {type, name}: one round-trip, works for any mix (required for interdependent RAP stacks, useful for unrelated objects too). ' +
+        'publish_srvb/unpublish_srvb: publish or unpublish an OData service binding (SRVB).',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['activate', 'publish_srvb', 'unpublish_srvb'],
+            description:
+              'Action to perform. "activate" (default): activate ABAP objects. ' +
+              '"publish_srvb": publish a service binding to make OData service available. ' +
+              '"unpublish_srvb": unpublish a service binding.',
+          },
+          name: { type: 'string', description: 'Object name (for single activation or publish/unpublish)' },
+          type: { type: 'string', description: 'Object type (PROG, CLAS, DDLS, DDLX, BDEF, SRVD, SRVB, etc.)' },
+          group: {
+            type: 'string',
+            description: 'Parent FUGR for FUNC or structural INCL.',
+          },
+          version: { type: 'string', description: 'Service version for publish/unpublish (default: "0001")' },
+          service_type: {
+            type: 'string',
+            enum: ['odatav2', 'odatav4'],
+            description:
+              'OData service type for publish/unpublish routing. Auto-detected from SRVB metadata when omitted.',
+          },
+          preaudit: {
+            type: 'boolean',
+            description:
+              'Request pre-activation audit (default true) — SAP returns warnings/errors before activating. false skips it for speed.',
+          },
+          objects: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', description: 'Object type' },
+                name: { type: 'string', description: 'Object name' },
+                group: { type: 'string' },
+              },
+              required: ['type', 'name'],
+            },
+            description: 'Batch items; use for 2+ objects.',
+          },
+        },
+      },
+    });
+  }
+
+  tools.push({
+    name: 'SAPNavigate',
+    description: btp
+      ? 'Navigate code (BTP ABAP Environment): definitions, references, completion, hierarchy. references: scope-based where-used with lines/snippets/package; objectType filters results (e.g. CLAS/OC); type+name replaces uri. Scope = released SAP + custom Z/Y. hierarchy queries SEOMETAREL: requires data/SQL opt-in + matching scope; otherwise inspect class MAIN with SAPRead. CDS (DDLS) impact: SAPContext(action="impact") classifies where-used into RAP buckets.'
+      : 'Navigate code: definitions, references, completion, hierarchy. references: scope-based where-used with lines/snippets/package; objectType filters results (e.g. CLAS/OC, PROG/P); type+name replaces uri. hierarchy queries SEOMETAREL for superclass/interfaces/direct subclasses: requires data/SQL opt-in + matching scope; otherwise inspect class MAIN with SAPRead. CDS (DDLS) impact: SAPContext(action="impact") classifies where-used into RAP buckets.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['definition', 'references', 'completion', 'hierarchy'],
+          description: 'Navigation action',
+        },
+        uri: {
+          type: 'string',
+          description: 'Definition needs source URI, line, column and source; references also accepts type+name.',
+        },
+        type: {
+          type: 'string',
+          description:
+            'Root object type, paired with name instead of uri (e.g. type="INTF"). Not the result-type filter.',
+        },
+        name: { type: 'string', description: 'Object name — alternative to uri for references.' },
+        objectType: {
+          type: 'string',
+          description:
+            'references RESULT filter, not the root type: CLAS/OC, PROG/P, FUGR/FF. Omit for all consumer types. A bare prefix ("CLAS") matches every subtype.',
+        },
+        maxResults: {
+          type: 'number',
+          description: 'references: max entries (default 100, max 1000). "total" counts every match of the filter.',
+        },
+        line: { type: 'number', description: 'Line (1-based integer)' },
+        column: { type: 'number', description: 'Column (0-based integer)' },
+        source: { type: 'string', description: 'Current source for definition/completion' },
+      },
+      required: ['action'],
+    },
+  });
+
+  const navigation = tools.find((tool) => tool.name === 'SAPNavigate')!;
+  addLiveRelationsDefinition(navigation, config, options.discoveryMap ?? resolvedFeatures?.discoveryMap);
+
+  // SAPQuery — only registered when free SQL is allowed
+  if (config.allowFreeSQL) {
+    tools.push({
+      name: 'SAPQuery',
+      description: btp ? SAPQUERY_DESC_BTP : SAPQUERY_DESC_ONPREM,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sql: { type: 'string', description: 'ABAP SQL SELECT statement' },
+          maxRows: {
+            type: 'number',
+            description: 'Rows (default 100, max 10,000; byte limit may apply sooner).',
+          },
+        },
+        required: ['sql'],
+      },
+    });
+  }
+
+  tools.push(
+    {
+      name: 'SAPLint',
+      description:
+        'Run local abaplint rules on ABAP/CDS source (auto-selects cloud or on-prem rules by system type). Actions:\n' +
+        '- "lint": check source (errors+warnings) for ABAP (PROG/CLAS/INTF/FUNC) and CDS (DDLS).\n' +
+        '- "lint_and_fix": lint + auto-fix fixable issues (keyword case, obsolete statements); returns fixed source.\n' +
+        '- "list_rules": list rules + current config (no source).\n' +
+        '- "format": pretty-print via SAP\'s ADT formatter (needs source).\n' +
+        '- "get_formatter_settings" / "set_formatter_settings": read/update the system\'s global PrettyPrinter (indentation bool, style keywordUpper|keywordLower|keywordAuto|none; set is blocked read-only).\n' +
+        'lint/lint_and_fix/list_rules run locally; format/*_formatter_settings call SAP. Syntax: SAPRead(type="SYNTAX"); ATC/unit tests: SAPDiagnose.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['lint', 'lint_and_fix', 'list_rules', 'format', 'get_formatter_settings', 'set_formatter_settings'],
+            description: 'Check type',
+          },
+          source: {
+            type: 'string',
+            description: 'ABAP or CDS source code to lint/format (not needed for list_rules/get_formatter_settings)',
+          },
+          name: { type: 'string', description: 'Object name (used for filename detection)' },
+          indentation: {
+            type: 'boolean',
+            description: 'PrettyPrinter: indent source (for set_formatter_settings)',
+          },
+          style: {
+            type: 'string',
+            enum: ['keywordUpper', 'keywordLower', 'keywordAuto', 'none'],
+            description: 'PrettyPrinter: keyword casing (for set_formatter_settings)',
+          },
+          rules: {
+            type: 'object',
+            description:
+              'Rule overrides: { "rule_name": false } to disable, { "rule_name": { "severity": "Warning" } } to configure. Overrides system defaults.',
+          },
+        },
+        required: ['action'],
+      },
+    },
+    {
+      name: 'SAPDiagnose',
+      description:
+        'ABAP diagnostics and runtime analysis. Actions:\n' +
+        '- "syntax": compatibility check; when available prefer SAPRead(type="SYNTAX", objectType, name, version?, source?).\n' +
+        '- "unittest": harmless ABAP Unit for CLAS/PROG/FUGR or DEVC (exact; includeSubpackages recurses).\n' +
+        '- "unittest_ci": harmless package tests with source reconciliation; empty/incomplete runs fail.\n' +
+        '- "atc": run ATC checks (name+type or objects [{type,name}], max 20; omit variant to bind the system default; unknown variant = error). "atc_variants": list variants + that default (variant = name filter; read-only).\n' +
+        '- "atc_ci": package ATC CI; requires available API and verified selection.\n' +
+        '- "cds_testcases": SAP-suggested ABAP Unit test cases for a CDS entity (name; read-only; SAP_BASIS 8.16+).\n' +
+        '- "object_state": active/inactive ETags, hashes and divergence (name+type; CLAS: all includes). Server-driven types unsupported.\n' +
+        '- "quickfix": proposals at name+type+source+line (optional column/sourceUri).\n' +
+        '- "apply_quickfix": return proposal text deltas without writing; needs quickfix inputs + proposalUri/proposalUserContent.\n' +
+        '- "dumps": list/read ST22 short dumps (no id = list, newest first, user/from/to/maxResults; id = read; includeFullText, sections).\n' +
+        '- "traces": list profiler traces; id+analysis analyzes one.\n' +
+        '- "trace_start": arm a profiler trace for the NEXT matching execution, then reproduce and read via "traces" (write scope; defaults: next HTTP request, SQL on).\n' +
+        '- "trace_requests": list armed trace requests. "trace_cancel": cancel one by id (write scope).\n' +
+        '- "system_messages": list SM02 messages. "gateway_errors": list /IWFND/ERROR_LOG (on-prem; detailUrl or id+errorType for detail).\n' +
+        '- "odata_perf": diagnose why an OData call is slow (url = host-relative path); returns the sap-statistics timing split (DB/ABAP/framework/auth). Read-only; needs allowDataPreview.\n' +
+        '- "authorization_trace": read the on-prem STUSERTRACE auth trace (SUAUTHVALTRC); needs SAP_ALLOW_DATA_PREVIEW.\n' +
+        '- "cds_sql": show the native SQL a CDS view compiles to (name; read-only).\n' +
+        '- "sql_trace_state" / "set_sql_trace_state" (sqlOn; needs SAP_ALLOW_WRITES) / "sql_trace_directory": ST05 SQL-trace control.\n' +
+        'Quickfix workflow: syntax/ATC → quickfix → apply_quickfix → write via SAPWrite. Full action reference: docs_page SAPDiagnose.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: [
+              'syntax',
+              'unittest',
+              'unittest_ci',
+              'atc',
+              'atc_ci',
+              'atc_variants',
+              'cds_testcases',
+              'dumps',
+              'traces',
+              'trace_start',
+              'trace_requests',
+              'trace_cancel',
+              'system_messages',
+              'gateway_errors',
+              'object_state',
+              'quickfix',
+              'apply_quickfix',
+              'odata_perf',
+              'cds_sql',
+              'sql_trace_state',
+              'set_sql_trace_state',
+              'sql_trace_directory',
+              'authorization_trace',
+            ],
+          },
+          name: {
+            type: 'string',
+            description: 'syntax/unittest/atc/object_state object name; cds_testcases/cds_sql CDS entity or DDLS name.',
+          },
+          url: {
+            type: 'string',
+            description:
+              'odata_perf: host-relative OData path from the app network request (e.g. /sap/opu/odata4/sap/.../Entity?$filter=…). Absolute URLs rejected.',
+          },
+          type: {
+            type: 'string',
+            description: 'Object type; unittest accepts CLAS, PROG, FUGR, or DEVC.',
+          },
+          objects: {
+            type: 'array',
+            minItems: 1,
+            maxItems: ATC_BATCH_MAX_OBJECTS,
+            description:
+              'ATC only, instead of name/type/url. One batch + at most one verification. Returns coverage; unreported objects stay incomplete. No packages.',
+            items: {
+              type: 'object',
+              required: ['type', 'name'],
+              additionalProperties: false,
+              properties: {
+                type: { type: 'string', enum: btp ? ATC_BATCH_TYPES_BTP : [...ATC_BATCH_TYPES] },
+                name: {
+                  type: 'string',
+                  minLength: 1,
+                  maxLength: ATC_BATCH_NAME_MAX_LENGTH,
+                  pattern: ATC_BATCH_NAME_PATTERN,
+                },
+              },
+            },
+          },
+          source: {
+            type: 'string',
+            description: 'Current source code (required for quickfix/apply_quickfix).',
+          },
+          sourceUri: {
+            type: 'string',
+            description:
+              'quickfix/apply_quickfix source URI; default type/name main source. Set for includes, e.g. /includes/definitions.',
+          },
+          line: {
+            type: 'number',
+            description: 'Required quickfix/apply_quickfix source line.',
+          },
+          column: {
+            type: 'number',
+            description: 'Quickfix source column (default 0).',
+          },
+          version: {
+            type: 'string',
+            enum: ['active', 'inactive'],
+            description: 'syntax source version (default active); inactive checks pending changes.',
+          },
+          proposalUri: {
+            type: 'string',
+            description: 'Quickfix proposal URI from quickfix action (required for apply_quickfix).',
+          },
+          proposalUserContent: {
+            type: 'string',
+            description:
+              'Opaque userContent from quickfix action (required for apply_quickfix). May be an empty string; pass through exactly.',
+          },
+          proposalAffectedObjects: {
+            type: 'array',
+            description:
+              'quickfix affectedObjects; provide current content for each source unit when applying multi-object fixes.',
+            items: {
+              type: 'object',
+              required: ['uri'],
+              properties: {
+                uri: { type: 'string', description: 'Affected ADT source URI, optionally with #start/#end range.' },
+                type: { type: 'string', description: 'Optional ADT object type metadata.' },
+                name: { type: 'string', description: 'Optional ADT object name metadata.' },
+                description: { type: 'string', description: 'Optional affected object description.' },
+                content: { type: 'string', description: 'Current source content for this affected unit.' },
+              },
+            },
+          },
+          id: {
+            type: 'string',
+            description:
+              'Dump or trace ID (for dumps/traces actions); also the trace-request id to cancel (for trace_cancel). Omit to list, provide to get details.',
+          },
+          detailUrl: {
+            type: 'string',
+            description: 'Detail path: canonical /sap/bc/adt/gw/errorlog/...; no absolute URLs.',
+          },
+          errorType: {
+            type: 'string',
+            description: 'gateway_errors: required with id instead of detailUrl, e.g. "Frontend Error".',
+          },
+          user: { type: 'string', description: 'SAP-user filter for dumps, feeds, or authorization_trace.' },
+          authObject: { type: 'string', description: 'Authorization object filter, e.g. S_TCODE.' },
+          from: {
+            type: 'string',
+            description: 'Inclusive lower time bound for dumps/system_messages/gateway_errors; ISO or YYYYMMDDHHMMSS.',
+          },
+          to: {
+            type: 'string',
+            description: 'Inclusive upper time bound for dumps/system_messages/gateway_errors; ISO or YYYYMMDDHHMMSS.',
+          },
+          maxResults: {
+            type: 'number',
+            description:
+              'Result limit (default 50; authorization_trace 100). Caps: dumps 500, system_messages/gateway_errors 200, authorization_trace 10000.',
+          },
+          sections: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'dumps detail chapter IDs, e.g. ["kap0","kap3","kap8"]; omit for focused defaults.',
+          },
+          includeFullText: {
+            type: 'boolean',
+            description: 'dumps detail: include full formattedText (default false).',
+          },
+          coverage: {
+            type: 'boolean',
+            description:
+              'unittest only: collect statement/branch/procedure coverage and methodsBelowFull. Unavailable measurements do not discard test results. Default false.',
+          },
+          includeSubpackages: { type: 'boolean', default: false },
+          resultFormat: {
+            type: 'string',
+            enum: ['legacy', 'structured', 'junit'],
+            description: 'unittest: legacy|structured|junit; atc: legacy|structured; other actions reject it.',
+          },
+          sqlOn: {
+            type: 'boolean',
+            description: 'set_sql_trace_state: true arms ST05 SQL trace, false disarms; user filters the SAP user.',
+          },
+          onlyFailures: {
+            type: 'boolean',
+            description: 'authorization_trace: only denied checks (RC<>0), like SU53.',
+          },
+          analysis: {
+            type: 'string',
+            enum: ['hitlist', 'statements', 'dbAccesses'],
+            description: 'traces with id: hitlist=hot spots, statements=call tree, dbAccesses=DB access stats.',
+          },
+          traceUser: {
+            type: 'string',
+            description: 'trace_start/trace_requests SAP user (default connected user).',
+          },
+          processType: {
+            type: 'string',
+            enum: ['any', 'http', 'dialog', 'batch', 'rfc'],
+            description:
+              'trace_start work process (default http/OData): dialog=SAP GUI, batch=background job, rfc=RFC.',
+          },
+          objectType: {
+            type: 'string',
+            enum: ['any', 'url', 'transaction', 'report', 'functionModule'],
+            description:
+              'trace_start match type; defaults: http→url, dialog→transaction, batch→report, rfc→functionModule.',
+          },
+          maxExecutions: {
+            type: 'number',
+            description: 'trace_start executions to capture (default 1).',
+          },
+          expiresHours: {
+            type: 'number',
+            description: 'trace_start expiry in hours (default 24).',
+          },
+          sqlTrace: {
+            type: 'boolean',
+            description: 'trace_start SQL capture (default true; required for analysis="dbAccesses").',
+          },
+          aggregate: {
+            type: 'boolean',
+            description: 'trace_start aggregation (default true).',
+          },
+          description: {
+            type: 'string',
+            description: 'trace_start label.',
+          },
+          ...SAPDIAGNOSE_ADDITIONAL_INPUTS,
+        },
+        required: ['action'],
+      },
+    },
+  );
+
+  // SAPContext — always available (read-only tool)
+  tools.push({
+    name: 'SAPContext',
+    description: btp ? SAPCONTEXT_DESC_BTP : SAPCONTEXT_DESC_ONPREM,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['impact', 'deps', 'usages', 'structure'],
+          description:
+            'Action:\n' +
+            '"impact" = CDS blast-radius analysis (DDLS only). USE THIS for any question like "what breaks if I change <view>", "who consumes <I_*>", "impact analysis on <CDS>", "downstream of <view>". Returns upstream AST dependencies + downstream where-used classified into RAP buckets (projectionViews, bdefs, serviceDefinitions, serviceBindings, accessControls, metadataExtensions, abapConsumers, documentation, tables, other), plus additive sibling-consistency diagnostics (consistencyHints + siblingExtensionAnalysis) when related DDLS siblings show asymmetric DDLX coverage. ALWAYS prefer over SAPQuery against DDDDLSRC/ACMDCLSRC/DDLXSRC_SRC/SRVDSRC_SRC (those text-scans produce noise this classifier filters out). Non-DDLS input returns a guardrail error.\n' +
+            '"deps" (default) = source-derived dependency contracts plus KTD when available. Requires type+name, even with source. Not a complete inventory; read source for behavior.\n' +
+            '"usages" = live SAP where-used lookup. Provide "type" when known; without it, the name must resolve uniquely. Prefer "impact" for CDS.\n' +
+            '"structure" = TABL includes/appends.',
+        },
+        type: {
+          type: 'string',
+          enum: btp ? SAPCONTEXT_TYPES_BTP : SAPCONTEXT_TYPES_ONPREM,
+          description:
+            'Root type. deps requires type+name, even with source. Optional for action="impact" (defaults to DDLS) or usages (unique name lookup); structure requires TABL.',
+        },
+        name: {
+          type: 'string',
+          description: 'Object name (e.g., ZCL_ORDER)',
+        },
+        source: {
+          type: 'string',
+          description:
+            'Optional: provide source directly instead of fetching from SAP. ' +
+            'Saves one round-trip if you already have the source from SAPRead.',
+        },
+        ...(btp
+          ? {}
+          : {
+              group: {
+                type: 'string',
+                description: 'Required for FUNC type. The function group containing the function module.',
+              },
+            }),
+        maxResults: {
+          type: 'number',
+          description:
+            'usages: max entries (default 100); impact: max per downstream bucket (default 50). Max 1000. "usageCount"/"summary" stay true totals, not page sizes.',
+        },
+        maxDeps: {
+          type: 'number',
+          description: 'Max dependencies to resolve (default 20). Lower = faster + fewer tokens.',
+        },
+        depth: {
+          type: 'number',
+          description:
+            'Dependency depth: 1 = direct deps only (default), 2 = deps of deps, 3 = maximum. ' +
+            'Higher depth = more context but more SAP calls.',
+        },
+        includeIndirect: {
+          type: 'boolean',
+          description: 'impact: Include indirect (transitive) downstream where-used entries. Default false.',
+        },
+        siblingCheck: {
+          type: 'boolean',
+          description: 'impact: Enable sibling metadata-extension consistency analysis. Default true.',
+        },
+        siblingMaxCandidates: {
+          type: 'number',
+          description: 'impact: Maximum sibling DDLS candidates to compare. Default 4; hard cap 10.',
+        },
+        includeKtd: {
+          type: 'boolean',
+          description:
+            'deps: When true/default, prepend the object Knowledge Transfer Document (KTD/SKTD) when one exists. Set false to skip the KTD lookup.',
+        },
+      },
+      required: ['name'],
+    },
+  });
+
+  // SAPManage — always registered; mutating actions remain safety/scope-protected.
+  const sapManageActions = config.allowWrites
+    ? [...SAPMANAGE_ACTIONS_READ, ...SAPMANAGE_ACTIONS_WRITE]
+    : SAPMANAGE_ACTIONS_READ;
+  tools.push({
+    name: 'SAPManage',
+    description: btp ? SAPMANAGE_DESC_BTP : SAPMANAGE_DESC_ONPREM,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: sapManageActions,
+          description:
+            'Action to execute. Read actions: features, probe, cache_stats, flp_list_catalogs, flp_list_groups, flp_list_tiles. ' +
+            'Mutating package/FLP actions require writable safety config and write scope in authenticated mode.',
+        },
+        name: {
+          type: 'string',
+          description: 'Package name (required for create_package and delete_package).',
+        },
+        description: {
+          type: 'string',
+          description: 'Package description (required for create_package).',
+        },
+        superPackage: {
+          type: 'string',
+          description: 'Parent package for create_package (defaults to empty root package).',
+        },
+        softwareComponent: {
+          type: 'string',
+          description: 'Software component for create_package (default: LOCAL on-prem, ZLOCAL on BTP).',
+        },
+        responsible: {
+          type: 'string',
+          description:
+            'Person-responsible: an existing ABAP user (XUBNAME, max 12 chars); an email is rejected. Defaults to the connection user; pass explicitly under principal propagation. BTP: auto-resolved from prior creates.',
+        },
+        transportLayer: {
+          type: 'string',
+          description: 'Transport layer for create_package (optional; required by some transportable landscapes).',
+        },
+        recordChanges: {
+          type: 'boolean',
+          description:
+            'Whether the created package records object changes in transport requests. Defaults to true for non-LOCAL software components or when a transport layer is set; false for literal LOCAL packages.',
+        },
+        packageType: {
+          type: 'string',
+          enum: ['development', 'structure', 'main'],
+          description: 'Package type for create_package (default: development).',
+        },
+        transport: {
+          type: 'string',
+          description: 'Optional transport request (corrNr) for create_package, delete_package, or change_package.',
+        },
+        objectUri: {
+          type: 'string',
+          description:
+            'ADT URI of the object to move (e.g., /sap/bc/adt/oo/classes/zcl_my_class). If not provided, resolved automatically from objectName + objectType via search. For set_api_state: the object whose API release contract to set (or pass name + objectType instead).',
+        },
+        objectType: {
+          type: 'string',
+          description:
+            'ADT object type (e.g., CLAS/OC, DDLS/DF, PROG/P). Required for change_package. For set_api_state: object type of "name" when objectUri is omitted (e.g. CLAS, INTF, DDLS, TABL).',
+        },
+        apiState: {
+          type: 'string',
+          enum: ['RELEASED', 'NOT_RELEASED'],
+          description:
+            'For set_api_state: target state of the object\'s API release contract — RELEASED (mark released for ABAP Cloud / Clean Core) or NOT_RELEASED (revoke). Default RELEASED. Visibility (ABAP Cloud / Key User Apps) follows the contract\'s defaults. Read the current state first with SAPRead(type="API_STATE").',
+        },
+        contract: {
+          type: 'string',
+          enum: ['C0', 'C1', 'C2', 'C3', 'C4'],
+          description:
+            'For set_api_state: which release contract to set. Default C1 (Key-User/Cloud — the common clean-core contract). Object types support different contracts: e.g. service definitions (SRVD) only support C0, classic DDIC views only C3, behavior definitions and tables support C0+C1. If the object does not support the chosen contract, the error lists the ones it does.',
+        },
+        objectName: {
+          type: 'string',
+          description: 'Object name to move (e.g., ZCL_MY_CLASS). Required for change_package.',
+        },
+        oldPackage: {
+          type: 'string',
+          description: 'Current package of the object. Required for change_package.',
+        },
+        newPackage: {
+          type: 'string',
+          description: 'Target package to move the object to. Required for change_package.',
+        },
+        catalogId: {
+          type: 'string',
+          description:
+            'FLP catalog identifier — accepts either full ID (X-SAP-UI2-CATALOGPAGE:MY_CAT) or domain ID (MY_CAT). Required for flp_list_tiles, flp_create_tile, flp_add_tile_to_group, flp_delete_catalog.',
+        },
+        groupId: {
+          type: 'string',
+          description: 'FLP group/page identifier (required for flp_create_group, flp_add_tile_to_group).',
+        },
+        title: {
+          type: 'string',
+          description: 'Title — required for flp_create_catalog and flp_create_group.',
+        },
+        domainId: {
+          type: 'string',
+          description: 'Domain ID — required for flp_create_catalog (e.g., ZARC1_SALES).',
+        },
+        tileInstanceId: {
+          type: 'string',
+          description: 'Tile instance ID in the source catalog (required for flp_add_tile_to_group).',
+        },
+        tile: {
+          type: 'object',
+          description: 'Tile definition for flp_create_tile.',
+          properties: {
+            id: { type: 'string', description: 'Tile ID (client-side logical id).' },
+            title: { type: 'string', description: 'Display title.' },
+            icon: { type: 'string', description: 'Optional icon URI.' },
+            semanticObject: { type: 'string', description: 'Semantic object for intent navigation.' },
+            semanticAction: { type: 'string', description: 'Semantic action for intent navigation.' },
+            url: { type: 'string', description: 'Optional target URL.' },
+            subtitle: { type: 'string', description: 'Optional subtitle text.' },
+            info: { type: 'string', description: 'Optional info text.' },
+          },
+          required: ['id', 'title', 'semanticObject', 'semanticAction'],
+        },
+      },
+      required: ['action'],
+    },
+  });
+
+  // Transport reads stay available; writes also require transports scope + allowTransportWrites.
+  if (config.featureTransport !== 'off') {
+    const sapTransportActions =
+      config.allowWrites && config.allowTransportWrites
+        ? [...SAPTRANSPORT_ACTIONS_READ, ...SAPTRANSPORT_ACTIONS_WRITE]
+        : SAPTRANSPORT_ACTIONS_READ;
+    tools.push({
+      name: 'SAPTransport',
+      description: btp ? SAPTRANSPORT_DESC_BTP : SAPTRANSPORT_DESC_ONPREM,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: sapTransportActions,
+            description:
+              "list: show transports (defaults to current user, modifiable only). Pass summary=true for a headers-only overview that omits each transport's object lists (keeps an objectCount) — far cheaper when many transports are open. " +
+              'get: fetch transport details including tasks and objects. ' +
+              'diff: what a transport CHANGED — per object, the revision written under it vs the one before, as diff hunks (get only lists names). LIMU entries roll up to their class; an open transport compares to the last released revision. Read baselineStatus first: prior-revision = solid; prior-revision-unverified = pair guessed, may be another change; no-prior-snapshot = created here; baseline-ambiguous = no baseline, so an all-additions block is NOT proof of creation; baseline-unavailable = the read FAILED, never call that unchanged. ' +
+              'create: create a new transport request (description required). To target another system, pass target=<system | system.client | /group/> (the Transportziel / TR_TARGET, e.g. "/TRG/" or "C11"; the group and system.client forms require extended transport control to be active). Otherwise omit target and pass an optional package to let SAP infer the route (defaults to $TMP). The response reports the resolved transport target; an empty target means a LOCAL request (cannot be transported onward). ' +
+              'release: release a single transport or task. ' +
+              'delete: delete a transport (use recursive=true to delete tasks first; removeLockedObjects=true to strip locked objects that otherwise block deletion with "...contains locked objects"). ' +
+              'remove_object: remove one object from a request, keeping the request — needs the full key pgmid+type+name. ' +
+              'reassign: change transport owner (use recursive=true for tasks too). ' +
+              'release_recursive: release all unreleased tasks first, then the transport itself. ' +
+              'check: check create/modify transport needs for a package/object (requires type, name, package; operation defaults to create). ' +
+              'history: inspect the current object lock and assignment candidates (legacy action name; not complete transport history; requires type, name; works without SAP_ALLOW_TRANSPORT_WRITES). ' +
+              "layers: list the transport layers this system offers (name + description + resolved target where any) — the valid values for create's transportLayer. Use this to discover a real value instead of guessing; works without SAP_ALLOW_TRANSPORT_WRITES. " +
+              "targets: list the valid transport targets (Transportziel / TR_TARGET) this system offers — the valid values for create's target. Use this to discover a real target (e.g. before create with target=). Read-only. Both report unavailability at runtime on releases that lack the value-help endpoint.",
+          },
+          id: {
+            type: 'string',
+            description:
+              'Transport request ID, e.g. A4HK900123 (required for get/diff/release/delete/reassign/release_recursive/remove_object)',
+          },
+          offset: { type: 'number', description: 'diff: first object to diff (default 0).' },
+          limit: { type: 'number', description: 'diff: objects per call (default 20, max 40); page with offset.' },
+          description: { type: 'string', description: 'Transport description text (required for create)' },
+          name: { type: 'string', description: 'Object name (for check, history, or remove_object actions)' },
+          package: {
+            type: 'string',
+            description:
+              'Package name. For create: optional — defaults to $TMP; an explicit package influences the route/target, while the request remains Workbench type K. For check: required.',
+          },
+          target: {
+            type: 'string',
+            description:
+              'Explicit transport target (Transportziel / TR_TARGET) for create — what the user means by "create a transport with target X". Forms: a system ("C11"), system.client ("C11.021"), or target group ("/TRG/"). The group and system.client forms require extended transport control (CTC) to be active. Created via the tm:root/newrequest endpoint (the only ADT path that sets the target directly) — this needs a newer ABAP Platform / S/4HANA; SAP_BASIS 7.50 rejects it with "user action is not supported" (an ADT-stack limitation, so set the target in SE09/SE10 there instead). SAP validates the target — an unknown target is rejected. Pass the exact value the user gives; do not invent one.',
+          },
+          transportLayer: {
+            type: 'string',
+            description:
+              'Transport layer for create (optional, advanced). Sent as the ?transportLayer= query param to override which consolidation route — and therefore which target — SAP resolves. OMIT IT by default: SAP resolves the target from the package automatically, which is correct for almost all cases. Never invent a value — if you need a specific layer, obtain it from action="layers" or from the user. Only effective when that layer has a classic STMS consolidation route; otherwise the request is local regardless.',
+          },
+          user: { type: 'string', description: 'List user (default: current SAP user; "*" means all visible owners).' },
+          status: {
+            type: 'string',
+            description: 'Transport status filter (for list). D=modifiable (default), R=released, "*"=all statuses.',
+          },
+          type: {
+            type: 'string',
+            description:
+              'Object type for check/history/remove_object actions (PROG, CLAS, DDLS, etc.). Not used by create, which creates a Workbench (K) request.',
+          },
+          operation: {
+            type: 'string',
+            enum: ['create', 'modify'],
+            description: 'Check mode: create (default) or modify.',
+          },
+          group: {
+            type: 'string',
+            description: 'check/history: parent group for INCL L<group>… or a new FUNC; existing FUNC auto-resolves.',
+          },
+          pgmid: {
+            type: 'string',
+            description:
+              'Program ID for remove_object: "R3TR" (whole object) or "LIMU" (sub-object). Required — object type alone does not determine pgmid.',
+          },
+          owner: { type: 'string', description: 'New owner SAP username (required for reassign)' },
+          recursive: {
+            type: 'boolean',
+            description: 'Apply recursively to child tasks (for delete/reassign). release_recursive always recurses.',
+          },
+          removeLockedObjects: {
+            type: 'boolean',
+            description:
+              'For delete only. Strip locked objects from each task before deleting, so a request that still holds a locked object (e.g. a deleted object\'s lingering record → HTTP 400 "...contains locked objects") can be removed.',
+          },
+          summary: {
+            type: 'boolean',
+            description:
+              'For list only. DEFAULT true: headers-only — drops each transport\'s (and task\'s) object lists, keeping id/description/owner/status/target + objectCount; use action="get" for one in full. Pass false for full object lists (~5x larger).',
+          },
+          maxResults: {
+            type: 'number',
+            description:
+              'Maximum list rows or check/history assignment candidates (defaults: list/history 50, check 10; max 1000).',
+          },
+          resultFormat: {
+            type: 'string',
+            enum: ['legacy', 'structured'],
+            description: 'release actions: legacy (default) or structured JSON.',
+          },
+          timeoutSeconds: {
+            type: 'number',
+            description: 'release timeout seconds: 1-1800; default 300.',
+          },
+        },
+        required: ['action'],
+      },
+    });
+  }
+
+  // SAPGit — registered when a gCTS/abapGit backend is available, or not yet probed (see
+  // isGitToolVisible: unknown must stay visible or the tool is lost for the whole session).
+  if (isGitToolVisible(config, resolvedFeatures)) {
+    const sapGitActions =
+      config.allowWrites && config.allowGitWrites
+        ? [...SAPGIT_ACTIONS_READ, ...SAPGIT_ACTIONS_WRITE]
+        : SAPGIT_ACTIONS_READ;
+    tools.push({
+      name: 'SAPGit',
+      description: SAPGIT_DESC,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: sapGitActions,
+          },
+          backend: {
+            type: 'string',
+            enum: ['gcts', 'abapgit'],
+            description: 'Backend override; omit to auto-select (gCTS preferred).',
+          },
+          repoId: {
+            type: 'string',
+          },
+          url: {
+            type: 'string',
+            description: 'HTTPS remote for clone/external_info; embedded credentials are rejected.',
+          },
+          branch: {
+            type: 'string',
+            description: 'Branch name for switch_branch/create_branch.',
+          },
+          package: {
+            type: 'string',
+            description:
+              'abapGit clone package. Mutations require an allowedPackages ROOT/** or * grant; not gCTS evidence.',
+          },
+          transport: {
+            type: 'string',
+            description: 'Optional transport request where supported by the backend.',
+          },
+          commit: {
+            type: 'string',
+            description: 'Commit SHA for history/pull-by-commit actions.',
+          },
+          message: {
+            type: 'string',
+            description: 'Commit message required for abapGit push.',
+          },
+          objects: {
+            type: 'array',
+            description: 'For abapGit push, the changed objects to commit; omit to select every local change.',
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string' },
+                name: { type: 'string' },
+                package: { type: 'string' },
+                path: { type: 'string' },
+                state: { type: 'string' },
+                operation: { type: 'string' },
+              },
+              required: ['type', 'name'],
+            },
+          },
+          user: {
+            type: 'string',
+            description: 'Remote repository username.',
+          },
+          password: {
+            type: 'string',
+            description: 'Remote repository password/token secret.',
+          },
+          token: {
+            type: 'string',
+            description: 'Remote repository access token. abapGit sends it as basic auth user "x-access-token".',
+          },
+          limit: {
+            type: 'number',
+            description: 'Optional limit for history queries.',
+          },
+        },
+        required: ['action'],
+      },
+    });
+  }
+
+  if (config.transport === 'stdio' && config.systemType !== 'btp' && !config.ppEnabled && config.allowDataPreview)
+    tools.push(customizingDefinition);
+
+  // Attach read-only / destructive annotations (single source of truth: TOOL_ANNOTATIONS).
+  for (const tool of tools) {
+    const annotations = TOOL_ANNOTATIONS[tool.name];
+    if (annotations) tool.annotations = { ...annotations };
+  }
+
+  return withStrictSchemas(tools);
+}

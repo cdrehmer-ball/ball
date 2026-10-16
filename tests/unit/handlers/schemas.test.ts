@@ -1,0 +1,2304 @@
+import { describe, expect, it } from 'vitest';
+import { MAX_GREP_PATTERN_LENGTH } from '../../../src/context/grep.js';
+import { normalizeTypeArgsForValidation } from '../../../src/handlers/object-types.js';
+import {
+  getToolSchema,
+  SAPActivateSchema,
+  SAPContextSchema,
+  SAPContextSchemaBtp,
+  SAPDiagnoseSchema,
+  SAPGitSchema,
+  SAPHyperfocusedSchema,
+  SAPLintSchema,
+  SAPManageSchema,
+  SAPNavigateSchema,
+  SAPQuerySchema,
+  SAPReadSchema,
+  SAPReadSchemaBtp,
+  SAPSearchSchema,
+  SAPSearchSchemaNoSource,
+  SAPTransportSchema,
+  SAPWRITE_TYPES_BTP,
+  SAPWRITE_TYPES_ONPREM,
+  SAPWriteSchema,
+  SAPWriteSchemaBtp,
+} from '../../../src/handlers/schemas.js';
+import { getMetadataWriteProperties } from '../../../src/handlers/write-helpers.js';
+
+describe('SAPReadSchema', () => {
+  it('accepts valid on-prem input without materializing the handler-owned version default', () => {
+    const result = SAPReadSchema.safeParse({ type: 'PROG', name: 'ZTEST' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.version).toBeUndefined();
+
+    const btpResult = SAPReadSchemaBtp.safeParse({ type: 'CLAS', name: 'ZCL_TEST' });
+    expect(btpResult.success).toBe(true);
+    if (btpResult.success) expect(btpResult.data.version).toBeUndefined();
+  });
+
+  it('accepts diff display labels', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      action: 'diff',
+      from: '00001',
+      to: 'active',
+      fromLabel: 'DNT-6-6 (DS7K900123)',
+      toLabel: 'active',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.fromLabel).toBe('DNT-6-6 (DS7K900123)');
+      expect(result.data.toLabel).toBe('active');
+    }
+
+    expect(
+      SAPReadSchemaBtp.safeParse({
+        type: 'CLAS',
+        name: 'ZCL_TEST',
+        action: 'diff',
+        fromLabel: 'inactive draft',
+        toLabel: 'active',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('accepts server-driven object types (DESD/EVTB/COTA — 816)', () => {
+    expect(SAPReadSchema.safeParse({ type: 'DESD', name: 'DEMO_CDS_LOGICL_EXTERNL_SCHEMA' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'EVTB', name: 'S_BUSINESSPARTNER_CHANGE' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'COTA', name: 'X' }).success).toBe(true);
+  });
+
+  it('SAPWrite accepts server-driven object types (create/update/delete — 816)', () => {
+    for (const t of ['DESD', 'DTSC', 'CSNM', 'EVTB', 'EVTO', 'COTA', 'DSFD', 'DTDC', 'UIAD']) {
+      expect(SAPWRITE_TYPES_ONPREM).toContain(t);
+      expect(SAPWRITE_TYPES_BTP).toContain(t);
+      expect(SAPWriteSchema.safeParse({ action: 'create', type: t, name: 'ZARC1_SDO', package: '$TMP' }).success).toBe(
+        true,
+      );
+      expect(SAPWriteSchema.safeParse({ action: 'delete', type: t, name: 'ZARC1_SDO' }).success).toBe(true);
+    }
+  });
+
+  it('accepts all optional fields', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      include: 'definitions',
+      method: '*',
+      expand_includes: true,
+      version: 'inactive',
+      force_refresh: true,
+      maxRows: 50,
+      sqlFilter: "MANDT = '100'",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid source version', () => {
+    const result = SAPReadSchema.safeParse({ type: 'PROG', name: 'ZTEST', version: 'latest' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects missing required type', () => {
+    const result = SAPReadSchema.safeParse({ name: 'ZTEST' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects invalid type enum', () => {
+    const result = SAPReadSchema.safeParse({ type: 'INVALID' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts FUNC with includeSignature flag (issue #252)', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'FUNC',
+      name: 'BAPI_USER_GETLIST',
+      group: 'SU_USER',
+      includeSignature: true,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.includeSignature).toBe(true);
+  });
+
+  it('accepts FUNC without includeSignature (backward compat — issue #252)', () => {
+    const result = SAPReadSchema.safeParse({ type: 'FUNC', name: 'X', group: 'Y' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.includeSignature).toBeUndefined();
+  });
+
+  it('coerces numeric maxRows from string', () => {
+    const result = SAPReadSchema.safeParse({ type: 'TABLE_CONTENTS', maxRows: '50' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.maxRows).toBe(50);
+    }
+  });
+
+  it('accepts optional DEVC maxResults within [1, 1000]', () => {
+    const ok = SAPReadSchema.safeParse({ type: 'DEVC', name: 'ZPKG', maxResults: 500 });
+    expect(ok.success).toBe(true);
+    if (ok.success) {
+      expect(ok.data.maxResults).toBe(500);
+    }
+  });
+
+  it('coerces numeric maxResults from string for DEVC', () => {
+    const result = SAPReadSchema.safeParse({ type: 'DEVC', name: 'ZPKG', maxResults: '300' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.maxResults).toBe(300);
+    }
+  });
+
+  it('accepts out-of-range and float DEVC maxResults (clamping happens at the sink)', () => {
+    // The JSON Schema advertises maxResults as `type: number` and the DEVC description promises
+    // "clamped to [1, 1000]" — so the schema must ACCEPT these and round-trip the raw value;
+    // floor + range handling is the sink's job (getPackageContents). See
+    // docs/research/2026-06-12-maxresults-contract-asymmetry.md.
+    for (const v of [0, 1001, -1, 50.5]) {
+      const r = SAPReadSchema.safeParse({ type: 'DEVC', name: 'ZPKG', maxResults: v });
+      expect(r.success, `maxResults ${v} should parse`).toBe(true);
+      if (r.success) expect(r.data.maxResults).toBe(v);
+    }
+  });
+
+  it('rejects non-numeric DEVC maxResults — and agrees with SAPSearchSchema (the contract twin)', () => {
+    // z.coerce.number() turns "abc" into NaN, which z.number() rejects. Both schemas must behave
+    // identically now that SAPRead no longer carries the divergent .int()/.min/.max.
+    expect(SAPReadSchema.safeParse({ type: 'DEVC', name: 'ZPKG', maxResults: 'abc' }).success).toBe(false);
+    expect(SAPSearchSchema.safeParse({ query: 'X', maxResults: 'abc' }).success).toBe(false);
+  });
+
+  it('accepts SAPRead without maxResults (it is optional)', () => {
+    // Sanity: maxResults is optional even on DEVC; client uses default 200.
+    const result = SAPReadSchema.safeParse({ type: 'DEVC', name: 'ZPKG' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.maxResults).toBeUndefined();
+    }
+  });
+
+  it('accepts TABLE_CONTENTS sqlFilter as condition expression', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'TABLE_CONTENTS',
+      name: 'MARA',
+      sqlFilter: "MANDT = '100' AND MATNR LIKE 'Z%'",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts TABLE_CONTENTS sqlFilter when identifier contains SELECT as substring', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'TABLE_CONTENTS',
+      name: 'ZTAB',
+      sqlFilter: "SELECTFLAG = 'X' AND MANDT = '100'",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects TABLE_CONTENTS sqlFilter that starts with SELECT', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'TABLE_CONTENTS',
+      name: 'MARA',
+      sqlFilter: "SELECT * FROM MARA WHERE MANDT = '100'",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('condition expression only');
+    }
+  });
+
+  it('rejects TABLE_CONTENTS sqlFilter that starts with WHERE', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'TABLE_CONTENTS',
+      name: 'MARA',
+      sqlFilter: "WHERE MANDT = '100'",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('must not start with WHERE');
+    }
+  });
+
+  it('rejects TABLE_CONTENTS sqlFilter with semicolons', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'TABLE_CONTENTS',
+      name: 'MARA',
+      sqlFilter: "MANDT = '100'; DELETE FROM T000",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('no semicolons');
+    }
+  });
+
+  it('coerces boolean expand_includes from string', () => {
+    const result = SAPReadSchema.safeParse({ type: 'FUGR', expand_includes: 'true' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.expand_includes).toBe(true);
+    }
+  });
+
+  it('accepts type-only input (name is optional)', () => {
+    const result = SAPReadSchema.safeParse({ type: 'SYSTEM' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts an optional grep string on both on-prem and BTP read schemas', () => {
+    const onprem = SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_X', grep: 'select.*from' });
+    expect(onprem.success).toBe(true);
+    if (onprem.success) expect(onprem.data.grep).toBe('select.*from');
+    const btp = SAPReadSchemaBtp.safeParse({ type: 'CLAS', name: 'ZCL_X', grep: 'RETURNING' });
+    expect(btp.success).toBe(true);
+  });
+
+  it('rejects a non-string grep', () => {
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_X', grep: 123 }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'CLAS', name: 'ZCL_X', grep: ['a'] }).success).toBe(false);
+  });
+
+  it('rejects grep patterns beyond the server-side length cap', () => {
+    const grep = 'x'.repeat(MAX_GREP_PATTERN_LENGTH + 1);
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_X', grep }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'CLAS', name: 'ZCL_X', grep }).success).toBe(false);
+  });
+
+  it('accepts on-prem AUTH/FEATURE_TOGGLE/ENHO types', () => {
+    expect(SAPReadSchema.safeParse({ type: 'AUTH', name: 'BUKRS' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'FEATURE_TOGGLE', name: 'ABC_TOGGLE' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'ENHO', name: 'ZMY_BADI_IMPL' }).success).toBe(true);
+  });
+
+  it('still accepts deprecated FTG2 alias for one minor release', () => {
+    // Per docs/plans/completed/2026-05-08-audit-symmetry-and-ftg2-rename.md: FTG2 was an ARC-1-invented
+    // identifier (docs/research/abap-types/types/ftg2.md). FEATURE_TOGGLE is the new
+    // canonical short type, FTG2 stays as a deprecated alias for one minor.
+    expect(SAPReadSchema.safeParse({ type: 'FTG2', name: 'ABC_TOGGLE' }).success).toBe(true);
+  });
+
+  it('accepts MSAG canonical message-class type and MESSAGES deprecated alias', () => {
+    // MSAG = TADIR R3TR truth (docs/research/abap-types/types/msag.md). 'MESSAGES' was the
+    // original ARC-1 read-side alias, kept for one minor release.
+    expect(SAPReadSchema.safeParse({ type: 'MSAG', name: 'SY' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'MESSAGES', name: 'SY' }).success).toBe(true);
+    // BTP variant should accept both as well.
+    expect(SAPReadSchemaBtp.safeParse({ type: 'MSAG', name: 'ZMSG' }).success).toBe(true);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'MESSAGES', name: 'ZMSG' }).success).toBe(true);
+  });
+
+  it('accepts KTD as a friendly read/write alias for SKTD', () => {
+    expect(SAPReadSchema.safeParse({ type: 'KTD', name: 'ZCL_DOC' }).success).toBe(true);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'KTD', name: 'ZCL_DOC' }).success).toBe(true);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'update',
+        type: 'KTD',
+        name: 'ZCL_DOC',
+        source: '# Documentation',
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPWriteSchemaBtp.safeParse({
+        action: 'update',
+        type: 'KTD',
+        name: 'ZCL_DOC',
+        source: '# Documentation',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('write enum has MSAG (canonical) — read/write symmetry guard', () => {
+    // Anti-cargo-cult guard from docs/plans/completed/2026-05-08-audit-symmetry-and-ftg2-rename.md:
+    // every type that supports both verbs in ADT MUST be in both enums under the
+    // same canonical short form. The audit found MSAG missing from the read enum.
+    // This test asserts the symmetry; new types that violate it will fail loudly.
+    // Source of truth: SAPWRITE_TYPES_ONPREM/_BTP exported from schemas.ts so the
+    // guard can never drift from the runtime enum (codex review on PR #224).
+    //
+    // Exception: the TABL/DT and TABL/DS slash forms are SAPWrite-only subtype
+    // refinements used by the create path to route between /sap/bc/adt/ddic/tables
+    // and /sap/bc/adt/ddic/structures. For reads they collapse to bare TABL via
+    // `normalizeObjectType()` / SLASH_TYPE_MAP — they are not first-class read
+    // types. Bare 'TABL' is already in the read enum, so symmetry holds at the
+    // canonical level. See follow-up to issue #285.
+    const TABL_WRITE_ONLY_SUBTYPES = new Set(['TABL/DT', 'TABL/DS']);
+    for (const t of SAPWRITE_TYPES_ONPREM) {
+      if (TABL_WRITE_ONLY_SUBTYPES.has(t)) continue;
+      const result = SAPReadSchema.safeParse({ type: t, name: 'X' });
+      expect(result.success, `on-prem read enum missing canonical write type ${t}`).toBe(true);
+    }
+    for (const t of SAPWRITE_TYPES_BTP) {
+      if (TABL_WRITE_ONLY_SUBTYPES.has(t)) continue;
+      const result = SAPReadSchemaBtp.safeParse({ type: t, name: 'X' });
+      expect(result.success, `BTP read enum missing canonical write type ${t}`).toBe(true);
+    }
+  });
+
+  it('accepts VERSIONS on on-prem', () => {
+    const result = SAPReadSchema.safeParse({ type: 'VERSIONS', name: 'ZARC1_TEST_REPORT' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts VERSION_SOURCE only when versionUri is provided and ADT-scoped', () => {
+    const result = SAPReadSchema.safeParse({
+      type: 'VERSION_SOURCE',
+      versionUri: '/sap/bc/adt/programs/programs/ZARC1_TEST_REPORT/source/main/versions/20260410185851/00000/content',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts a namespaced object URI emitted by VERSIONS', () => {
+    expect(
+      SAPReadSchema.safeParse({
+        type: 'VERSION_SOURCE',
+        versionUri: '/sap/bc/adt/oo/classes/%2FARC%2FCL_DEMO/includes/main/versions/1/00000/content',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects unrelated same-host ADT endpoints for VERSION_SOURCE', () => {
+    expect(SAPReadSchema.safeParse({ type: 'VERSION_SOURCE', versionUri: '/sap/bc/adt/runtime/dumps' }).success).toBe(
+      false,
+    );
+  });
+
+  it('rejects VERSION_SOURCE when versionUri is missing', () => {
+    const result = SAPReadSchema.safeParse({ type: 'VERSION_SOURCE' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.path.join('.') === 'versionUri')).toBe(true);
+    }
+  });
+
+  it('rejects VERSION_SOURCE when versionUri is not an ADT path', () => {
+    const result = SAPReadSchema.safeParse({ type: 'VERSION_SOURCE', versionUri: 'https://evil.example/source' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('/sap/bc/adt/');
+    }
+  });
+
+  it.each([
+    '/sap/bc/adt/../../../sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/%2e%2e/%2e%2e/sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/%252e%252e/%252e%252e/sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/programs/%2f..%2fadmin',
+    '/sap/bc/adt/programs/%5c..%5cadmin',
+    '/sap/bc/adt\\..\\sap\\opu\\odata',
+    '/sap/bc/adt/programs/source#fragment',
+    '/sap/bc/adt/programs/source\u0000suffix',
+    '//evil.example/sap/bc/adt/source',
+    '/sap/bc/adt/oo/classes/%252FARC%252FCL_DEMO/includes/main/versions/1/00000/content',
+    '/sap/bc/adt/oo/classes/ZCL_DEMO/includes/main/versions/1%2F00000%2Fcontent',
+  ])('rejects ambiguous or traversal-capable VERSION_SOURCE URI %j', (versionUri) => {
+    expect(SAPReadSchema.safeParse({ type: 'VERSION_SOURCE', versionUri }).success).toBe(false);
+  });
+
+  it('accepts format field with valid values', () => {
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST', format: 'text' }).success).toBe(true);
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST', format: 'structured' }).success).toBe(true);
+  });
+
+  it('rejects invalid format values', () => {
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST', format: 'xml' }).success).toBe(false);
+    expect(SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST', format: 'json' }).success).toBe(false);
+  });
+
+  it('rejects invalid CLAS include values and lists allowed includes', () => {
+    const result = SAPReadSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST', include: 'invalid_include' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const message = result.error.issues[0]?.message ?? '';
+      expect(message).toContain('Valid values');
+      expect(message).toContain('main');
+      expect(message).toContain('testclasses');
+    }
+  });
+
+  it('rejects invalid DDLS include values', () => {
+    const result = SAPReadSchema.safeParse({ type: 'DDLS', name: 'ZI_TEST', include: 'main' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('Valid values: elements');
+    }
+  });
+
+  it('allows free-form include for BSP paths', () => {
+    const result = SAPReadSchema.safeParse({ type: 'BSP', name: 'ZAPP', include: 'webapp/Component.js' });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('SAPReadSchemaBtp', () => {
+  it('accepts BTP types', () => {
+    const result = SAPReadSchemaBtp.safeParse({ type: 'CLAS', name: 'ZCL_TEST' });
+    expect(result.success).toBe(true);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'DCLS', name: 'ZI_TEST_DCL' }).success).toBe(true);
+  });
+
+  it('rejects on-prem-only types', () => {
+    expect(SAPReadSchemaBtp.safeParse({ type: 'PROG' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'INCL' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'VIEW' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'TEXT_ELEMENTS' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'VARIANTS' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'AUTH' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'FTG2' }).success).toBe(false);
+    expect(SAPReadSchemaBtp.safeParse({ type: 'ENHO' }).success).toBe(false);
+  });
+
+  it('rejects expand_includes — the field is on-prem only', () => {
+    // The schema is strict, so an on-prem-only field is reported rather than silently dropped.
+    const result = SAPReadSchemaBtp.safeParse({ type: 'CLAS', expand_includes: true });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.code).toBe('unrecognized_keys');
+      expect((result.error.issues[0] as { keys?: string[] }).keys).toContain('expand_includes');
+    }
+  });
+});
+
+describe('SAPSearchSchema', () => {
+  it.each([SAPSearchSchema, SAPSearchSchemaNoSource])('bounds the type filter in both tool variants', (schema) => {
+    expect(schema.safeParse({ query: '*', objectType: 'CLAS/OC' }).success).toBe(true);
+    expect(schema.safeParse({ query: '*', objectType: 'X'.repeat(65) }).success).toBe(false);
+  });
+
+  it('accepts valid input with query', () => {
+    const result = SAPSearchSchema.safeParse({ query: 'ZCL_*' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts all optional fields', () => {
+    const result = SAPSearchSchema.safeParse({
+      query: 'ZCL_*',
+      maxResults: 50,
+      searchType: 'source_code',
+      objectType: 'CLAS',
+      objectTypes: ['CLAS', 'DDLS'],
+      packageName: 'ZTEST',
+      names: ['ZCL_TEST'],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts TADIR lookup with names and no query', () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZDM_PROJECT_D', 'ZR_DM_PROJECT'],
+      objectTypes: ['TABL', 'BDEF'],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects missing query', () => {
+    const result = SAPSearchSchema.safeParse({ maxResults: 10 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects TADIR lookup without names or query', () => {
+    const result = SAPSearchSchema.safeParse({ searchType: 'tadir_lookup', maxResults: 10 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects invalid searchType', () => {
+    const result = SAPSearchSchema.safeParse({ query: 'test', searchType: 'invalid' });
+    expect(result.success).toBe(false);
+  });
+
+  it("accepts source='adt' for tadir_lookup", () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZA'],
+      source: 'adt',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts source='db' for tadir_lookup", () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZA'],
+      source: 'db',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts source='both' for tadir_lookup", () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZA'],
+      source: 'both',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects source with an unknown enum value', () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZA'],
+      source: 'sql',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts tadir_lookup without source (default applies in handler)', () => {
+    const result = SAPSearchSchema.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZA'],
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('SAPSearchSchemaNoSource', () => {
+  it('accepts query without searchType', () => {
+    const result = SAPSearchSchemaNoSource.safeParse({ query: 'ZCL_*' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects source_code searchType when source search is unavailable', () => {
+    const result = SAPSearchSchemaNoSource.safeParse({ query: 'test', searchType: 'source_code' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts TADIR lookup when source search is unavailable', () => {
+    const result = SAPSearchSchemaNoSource.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZDM_PROJECT_D'],
+      objectTypes: ['TABL'],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it("accepts source='both' for tadir_lookup when source search is unavailable", () => {
+    const result = SAPSearchSchemaNoSource.safeParse({
+      searchType: 'tadir_lookup',
+      names: ['ZDM_PROJECT_D'],
+      source: 'both',
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('SAPQuerySchema', () => {
+  it('accepts valid SQL', () => {
+    const result = SAPQuerySchema.safeParse({ sql: 'SELECT * FROM MARA' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects missing sql', () => {
+    const result = SAPQuerySchema.safeParse({ maxRows: 10 });
+    expect(result.success).toBe(false);
+  });
+
+  it('coerces maxRows from string', () => {
+    const result = SAPQuerySchema.safeParse({ sql: 'SELECT * FROM MARA', maxRows: '200' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.maxRows).toBe(200);
+    }
+  });
+});
+
+describe('SAPWriteSchema', () => {
+  it('accepts valid create input', () => {
+    const result = SAPWriteSchema.safeParse({ action: 'create', type: 'CLAS', name: 'ZCL_NEW' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts FUGR create input (issue #250)', () => {
+    const result = SAPWriteSchema.safeParse({ action: 'create', type: 'FUGR', name: 'ZARC1_FG', package: '$TMP' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts FUNC create input with group (issue #250)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'FUNC',
+      name: 'Z_ARC1_FM',
+      group: 'ZARC1_FG',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts FUNC create input WITHOUT group at schema level (runtime check enforces it)', () => {
+    // Schema makes group optional; the runtime handler returns errorResult for create without group.
+    // This test pins that behavior so a schema-side enforcement attempt would surface here.
+    const result = SAPWriteSchema.safeParse({ action: 'create', type: 'FUNC', name: 'Z_FM' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts FUNC create input with structured parameters (issue #252)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'FUNC',
+      name: 'Z_ARC1_FM_PARAMS',
+      group: 'ZARC1_FG',
+      parameters: [
+        { kind: 'importing', name: 'IV_INPUT', type: 'STRING', byValue: true, optional: true, default: "'X'" },
+        { kind: 'exporting', name: 'EV_OUTPUT', type: 'STRING', byValue: true },
+        { kind: 'changing', name: 'CV_FLAG', type: 'I' },
+        { kind: 'tables', name: 'IT_LINES', type: 'TYPE STANDARD TABLE' },
+        { kind: 'exceptions', name: 'BAD_INPUT' },
+        { kind: 'raising', name: 'CX_ROOT' },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts explicit FUNC processing metadata for RFC and update modules', () => {
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'create',
+        type: 'FUNC',
+        name: 'Z_REMOTE',
+        group: 'Z_FG',
+        processingType: 'rfc',
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [
+          {
+            type: 'FUNC',
+            name: 'Z_UPDATE',
+            group: 'Z_FG',
+            processingType: 'update',
+            updateTaskKind: 'startImmediate',
+          },
+        ],
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects invalid or inapplicable FUNC processing metadata before a write', () => {
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'create',
+        type: 'FUNC',
+        name: 'Z_UPDATE',
+        group: 'Z_FG',
+        processingType: 'update',
+      }).success,
+    ).toBe(false);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'create',
+        type: 'FUNC',
+        name: 'Z_REMOTE',
+        group: 'Z_FG',
+        processingType: 'rfc',
+        updateTaskKind: 'startImmediate',
+      }).success,
+    ).toBe(false);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'update',
+        type: 'FUNC',
+        name: 'Z_REMOTE',
+        group: 'Z_FG',
+        processingType: 'rfc',
+      }).success,
+    ).toBe(false);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'create',
+        type: 'PROG',
+        name: 'Z_NOT_FUNC',
+        processingType: 'normal',
+      }).success,
+    ).toBe(false);
+  });
+
+  // Issue #664: the schema-level rejections above are defense-in-depth. A real call goes through
+  // normalizeTypeArgsForValidation first, which drops metadata the write cannot use — otherwise a
+  // strict-mode client (which must emit a value for every advertised property, and has no `null` to
+  // emit since #526) blocks every non-FUNC write with a fabricated `normal`/`startImmediate`.
+  it('accepts a write whose inapplicable FUNC metadata was normalized away first', () => {
+    const polluted = {
+      action: 'create',
+      type: 'PROG',
+      name: 'ZPLU_HELLO_WORLD',
+      package: '$TMP',
+      source: 'REPORT zplu_hello_world.',
+      processingType: 'normal',
+      updateTaskKind: 'startImmediate',
+    };
+    expect(SAPWriteSchema.safeParse(polluted).success).toBe(false);
+    expect(SAPWriteSchema.safeParse(normalizeTypeArgsForValidation('SAPWrite', { ...polluted })).success).toBe(true);
+  });
+
+  it('still rejects a normalized FUNC create that asks for update without a task kind', () => {
+    const args = normalizeTypeArgsForValidation('SAPWrite', {
+      action: 'create',
+      type: 'FUNC',
+      name: 'Z_UPDATE',
+      group: 'Z_FG',
+      processingType: 'update',
+    });
+    expect(SAPWriteSchema.safeParse(args).success).toBe(false);
+  });
+
+  it('applies FUNC processing validation inside batch objects', () => {
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [
+          {
+            type: 'FUNC',
+            name: 'Z_UPDATE',
+            group: 'Z_FG',
+            processingType: 'update',
+          },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [
+          {
+            type: 'FUNC',
+            name: 'Z_REMOTE',
+            group: 'Z_FG',
+            processingType: 'rfc',
+            updateTaskKind: 'startImmediate',
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('rejects FUNC parameters with invalid kind (issue #252)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'FUNC',
+      name: 'Z_FM',
+      group: 'Z_FG',
+      parameters: [{ kind: 'returning', name: 'RV_X', type: 'STRING' }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects FUNC parameters missing required name (issue #252)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'FUNC',
+      name: 'Z_FM',
+      group: 'Z_FG',
+      parameters: [{ kind: 'importing', type: 'STRING' }],
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts DOMA/DTEL write fields', () => {
+    const doma = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'DOMA',
+      name: 'ZDOMAIN',
+      dataType: 'CHAR',
+      length: '1',
+      decimals: '0',
+      outputLength: '1',
+      signExists: 'true',
+      lowercase: 'false',
+      fixedValues: [{ low: 'A', description: 'Active' }],
+      valueTable: 'T001',
+    });
+    expect(doma.success).toBe(true);
+    if (doma.success) {
+      expect(doma.data.length).toBe(1);
+      expect(doma.data.signExists).toBe(true);
+    }
+
+    const dtel = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'DTEL',
+      name: 'ZDELEM',
+      typeKind: 'domain',
+      typeName: 'ZDOMAIN',
+      shortLabel: 'Status',
+      shortLength: '10',
+      mediumLength: 20,
+      longLength: 40,
+      headingLength: 55,
+      deactivateInputHistory: 'true',
+      changeDocument: 'true',
+    });
+    expect(dtel.success).toBe(true);
+    if (dtel.success) {
+      expect(dtel.data.changeDocument).toBe(true);
+      expect(dtel.data.shortLength).toBe(10);
+      expect(dtel.data.deactivateInputHistory).toBe(true);
+    }
+  });
+
+  it('keeps valid DTEL label metadata in every write schema and rejects invalid lengths', () => {
+    const fields = {
+      shortLength: 0,
+      mediumLength: 20,
+      longLength: 40,
+      headingLength: 55,
+      deactivateInputHistory: 'false',
+    };
+    const inputs = [
+      { schema: SAPWriteSchema, value: { action: 'create', type: 'DTEL', name: 'ZDTEL', ...fields } },
+      { schema: SAPWriteSchemaBtp, value: { action: 'create', type: 'DTEL', name: 'ZDTEL', ...fields } },
+      {
+        schema: SAPWriteSchema,
+        value: { action: 'batch_create', objects: [{ type: 'DTEL', name: 'ZDTEL', ...fields }] },
+      },
+      {
+        schema: SAPWriteSchemaBtp,
+        value: { action: 'batch_create', objects: [{ type: 'DTEL', name: 'ZDTEL', ...fields }] },
+      },
+    ];
+
+    for (const { schema, value } of inputs) {
+      const result = schema.safeParse(value);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        const parsed = 'objects' in result.data ? result.data.objects?.[0] : result.data;
+        expect(parsed).toMatchObject({ ...fields, deactivateInputHistory: false });
+      }
+    }
+
+    for (const [field, value] of [
+      ['shortLength', 11],
+      ['mediumLength', -1],
+      ['longLength', 40.5],
+      ['headingLength', 56],
+    ] as const) {
+      expect(SAPWriteSchema.safeParse({ action: 'create', type: 'DTEL', name: 'ZDTEL', [field]: value }).success).toBe(
+        false,
+      );
+    }
+  });
+
+  it('keeps TTYP rowType fields in on-prem/BTP top-level and batch schemas plus metadata whitelist', () => {
+    const topLevelOnprem = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'TTYP',
+      name: 'ZTTYP',
+      rowType: 'BAPIRET2',
+      rowTypeKind: 'structure',
+    });
+    expect(topLevelOnprem.success).toBe(true);
+    if (topLevelOnprem.success) {
+      expect(topLevelOnprem.data.rowType).toBe('BAPIRET2');
+      expect(topLevelOnprem.data.rowTypeKind).toBe('structure');
+    }
+
+    const batchOnprem = SAPWriteSchema.safeParse({
+      action: 'batch_create',
+      package: '$TMP',
+      objects: [{ type: 'TTYP', name: 'ZTTYP', rowType: 'STRING', rowTypeKind: 'builtin' }],
+    });
+    expect(batchOnprem.success).toBe(true);
+    if (batchOnprem.success) {
+      expect(batchOnprem.data.objects?.[0]).toMatchObject({ rowType: 'STRING', rowTypeKind: 'builtin' });
+    }
+
+    const topLevelBtp = SAPWriteSchemaBtp.safeParse({
+      action: 'create',
+      type: 'DOMA',
+      name: 'ZDOMAIN',
+      rowType: 'STRING',
+      rowTypeKind: 'builtin',
+    });
+    expect(topLevelBtp.success).toBe(true);
+    if (topLevelBtp.success) {
+      expect(topLevelBtp.data.rowTypeKind).toBe('builtin');
+    }
+
+    const batchBtp = SAPWriteSchemaBtp.safeParse({
+      action: 'batch_create',
+      package: '$TMP',
+      objects: [{ type: 'DOMA', name: 'ZDOMAIN', rowType: 'BAPIRET2', rowTypeKind: 'structure' }],
+    });
+    expect(batchBtp.success).toBe(true);
+    if (batchBtp.success) {
+      expect(batchBtp.data.objects?.[0]).toMatchObject({ rowType: 'BAPIRET2', rowTypeKind: 'structure' });
+    }
+
+    expect(SAPWriteSchema.safeParse({ action: 'create', type: 'TTYP', name: 'ZTTYP', rowTypeKind: true }).success).toBe(
+      false,
+    );
+    expect(getMetadataWriteProperties({ rowType: 'BAPIRET2', rowTypeKind: 'structure' })).toMatchObject({
+      rowType: 'BAPIRET2',
+      rowTypeKind: 'structure',
+    });
+  });
+
+  it('accepts SRVB fields and validates category enum', () => {
+    const srvb = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'SRVB',
+      name: 'ZSB_TRAVEL_O4',
+      serviceDefinition: 'ZSD_TRAVEL',
+      bindingType: 'ODATA',
+      category: '0',
+    });
+    expect(srvb.success).toBe(true);
+
+    const invalidCategory = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'SRVB',
+      name: 'ZSB_TRAVEL_O4',
+      serviceDefinition: 'ZSD_TRAVEL',
+      category: '2',
+    });
+    expect(invalidCategory.success).toBe(false);
+  });
+
+  it('accepts edit_method with all fields', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'edit_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'get_name',
+      source: 'METHOD get_name.\nENDMETHOD.',
+      transport: 'DEVK900001',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it.each(['edit_unit', 'add_unit'])('exposes %s only for on-prem PROG/INCL writes', (action) => {
+    const program = SAPWriteSchema.safeParse({
+      action,
+      type: 'PROG',
+      name: 'ZUNIT_TEST',
+      unit: 'PROCESS_ORDERS',
+      source: 'FORM process_orders.\nENDFORM.',
+    });
+    const include = SAPWriteSchema.safeParse({
+      action,
+      type: 'INCL',
+      name: 'ZUNIT_INCLUDE',
+      unit: 'STATUS_0100',
+      source: 'MODULE status_0100 OUTPUT.\nENDMODULE.',
+    });
+    const btp = SAPWriteSchemaBtp.safeParse({
+      action,
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      unit: 'PROCESS_ORDERS',
+      source: 'FORM process_orders.\nENDFORM.',
+    });
+    expect(program.success).toBe(true);
+    expect(include.success).toBe(true);
+    expect(btp.success).toBe(false);
+  });
+
+  it('accepts preflightBeforeWrite override', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'update',
+      type: 'TABL',
+      name: 'ZTABL_TEST',
+      source: 'define table ztabl_test { key client : abap.clnt not null; }',
+      preflightBeforeWrite: false,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.preflightBeforeWrite).toBe(false);
+    }
+  });
+
+  it('accepts CLAS include update fields', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'update',
+      type: 'CLAS',
+      name: 'ZBP_I_TRAVELREQ',
+      include: 'definitions',
+      source: 'CLASS lhc_travel DEFINITION.\nENDCLASS.',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.include).toBe('definitions');
+    }
+  });
+
+  it('rejects SAPWrite include outside CLAS update/edit_method/class-section-surgery actions', () => {
+    const nonUpdate = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      include: 'definitions',
+    });
+    expect(nonUpdate.success).toBe(false);
+    if (!nonUpdate.success) {
+      // PR-D + issue #303: include= is valid for update, edit_method, and the
+      // four class-section surgery actions. The schema must still reject
+      // create/delete/batch_create/scaffold_rap_handlers.
+      expect(nonUpdate.error.issues[0]?.message).toMatch(/edit_class_definition|edit_method/);
+    }
+
+    const nonClass = SAPWriteSchema.safeParse({
+      action: 'update',
+      type: 'PROG',
+      name: 'ZPROG',
+      include: 'definitions',
+      source: 'REPORT zprog.',
+    });
+    expect(nonClass.success).toBe(false);
+    if (!nonClass.success) {
+      expect(nonClass.error.issues[0]?.message).toContain('type="CLAS"');
+    }
+  });
+
+  it('accepts include for action=edit_method on CLAS (PR-D)', () => {
+    const editIncl = SAPWriteSchema.safeParse({
+      action: 'edit_method',
+      type: 'CLAS',
+      name: 'ZBP_DM_PROJECT',
+      method: 'lhc_project~approve_project',
+      include: 'implementations',
+      source: '    DATA(x) = 1.',
+    });
+    expect(editIncl.success).toBe(true);
+    if (editIncl.success) {
+      expect(editIncl.data.include).toBe('implementations');
+      expect(editIncl.data.action).toBe('edit_method');
+    }
+  });
+
+  it('rejects include on edit_method when type is not CLAS', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'edit_method',
+      type: 'PROG',
+      name: 'ZPROG',
+      method: 'foo',
+      include: 'implementations',
+      source: 'WRITE / 1.',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((i) => i.message.includes('type="CLAS"'))).toBe(true);
+    }
+  });
+
+  it('rejects invalid SAPWrite CLAS include values', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'update',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      include: 'main',
+      source: 'CLASS zcl_test DEFINITION. ENDCLASS.',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  // ── Class-section surgery actions (issue #303) ─────────────────────────
+
+  it('accepts edit_class_definition with CLAS + source', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'edit_class_definition',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      source: 'CLASS zcl_test DEFINITION PUBLIC FINAL CREATE PUBLIC.\nPUBLIC SECTION.\nENDCLASS.',
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts edit_class_definition with include=definitions (CCDEF target)', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'edit_class_definition',
+      type: 'CLAS',
+      name: 'ZBP_X',
+      include: 'definitions',
+      source: 'CLASS lhc_x DEFINITION.\nENDCLASS.',
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts add_method with method clause + visibility + abstract', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS greet IMPORTING who TYPE string.',
+      visibility: 'protected',
+      abstract: false,
+    });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.visibility).toBe('protected');
+      expect(r.data.abstract).toBe(false);
+    }
+  });
+
+  it('add_method accepts abstract=true (no IMPL stub will be inserted)', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS to_impl ABSTRACT.',
+      abstract: true,
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts edit_method_signature with method name + new clause source', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'edit_method_signature',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'greet',
+      source:
+        "METHODS greet IMPORTING who TYPE string greeting TYPE string DEFAULT 'Hi' RETURNING VALUE(r) TYPE string.",
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('accepts delete_method with method name', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'delete_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'greet',
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('rejects invalid visibility on add_method', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS foo.',
+      visibility: 'package' as 'public',
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('accepts change_method_visibility with method name + target visibility', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'change_method_visibility',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'greet',
+      visibility: 'private',
+    });
+    expect(r.success).toBe(true);
+    expect(
+      SAPWriteSchemaBtp.safeParse({
+        action: 'change_method_visibility',
+        type: 'CLAS',
+        name: 'ZCL_TEST',
+        method: 'greet',
+        visibility: 'protected',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects include= for change_method_visibility (MAIN-only action)', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'change_method_visibility',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'greet',
+      visibility: 'private',
+      include: 'implementations',
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('rejects include= for add_method / edit_method_signature / delete_method (MAIN-only actions)', () => {
+    for (const action of ['add_method', 'edit_method_signature', 'delete_method'] as const) {
+      const r = SAPWriteSchema.safeParse({
+        action,
+        type: 'CLAS',
+        name: 'ZCL_TEST',
+        method: 'foo',
+        source: 'METHODS foo.',
+        include: 'implementations',
+      });
+      expect(r.success, `${action} should reject include=`).toBe(false);
+      if (!r.success) {
+        expect(r.error.issues[0]?.message).toMatch(
+          /global class \/source\/main only|update, edit_method, edit_class_definition/,
+        );
+      }
+    }
+  });
+
+  it('treats empty-string include as "not provided" (no false "Invalid include" rejection)', () => {
+    // Some MCP clients serialize an omitted optional string as "". edit_class_definition
+    // (MAIN path) must accept include="" as if include were omitted.
+    const r = SAPWriteSchema.safeParse({
+      action: 'edit_class_definition',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      source: 'CLASS zcl_test DEFINITION PUBLIC. PUBLIC SECTION. ENDCLASS.',
+      include: '',
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('add_method abstract coerces string "false" to false (not true)', () => {
+    // Regression: z.coerce.boolean() maps any non-empty string (incl. "false") to true.
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS foo.',
+      abstract: 'false',
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.abstract).toBe(false);
+  });
+
+  it('add_method abstract coerces string "true" to true', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS foo ABSTRACT.',
+      abstract: 'true',
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.abstract).toBe(true);
+  });
+
+  it('add_method abstract preserves undefined when omitted', () => {
+    const r = SAPWriteSchema.safeParse({
+      action: 'add_method',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      method: 'METHODS foo.',
+    });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.abstract).toBeUndefined();
+  });
+
+  it('accepts TABL for source-based writes', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'TABL',
+      name: 'ZTABL_TEST',
+      source: 'define table ztabl_test { key client : abap.clnt; key id : abap.numc(8); }',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects missing action', () => {
+    expect(SAPWriteSchema.safeParse({ type: 'CLAS', name: 'ZCL_TEST' }).success).toBe(false);
+  });
+
+  it('rejects invalid action', () => {
+    const result = SAPWriteSchema.safeParse({ action: 'invalid', type: 'CLAS', name: 'ZCL_TEST' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts batch_create action', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'batch_create',
+      package: '$TMP',
+      objects: [
+        {
+          type: 'DDLS',
+          name: 'ZI_TRAVEL',
+          source: 'define view entity ZI_TRAVEL {}',
+          package: 'ZDEV',
+          transport: 'A4HK900123',
+        },
+        { type: 'BDEF', name: 'ZI_TRAVEL', package: 'ZDEV' },
+      ],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.objects?.[0]).toMatchObject({ package: 'ZDEV', transport: 'A4HK900123' });
+    }
+  });
+
+  it('accepts scaffold_rap_handlers action fields', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'scaffold_rap_handlers',
+      type: 'CLAS',
+      name: 'ZBP_I_TRAVELREQ',
+      bdefName: 'ZI_TRAVELREQ',
+      autoApply: 'true',
+      targetAlias: 'Travel',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.autoApply).toBe(true);
+    }
+  });
+
+  it('accepts generate_behavior_implementation action with new fields', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'generate_behavior_implementation',
+      type: 'CLAS',
+      name: 'ZBP_DM_PROJECT',
+      bdefName: 'ZR_DM_PROJECT',
+      targetAlias: 'Project',
+      activate: false,
+      dryRun: true,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.activate).toBe(false);
+      expect(result.data.dryRun).toBe(true);
+      expect(result.data.action).toBe('generate_behavior_implementation');
+    }
+  });
+
+  it('accepts generate_behavior_implementation with only the required name (auto-discovery + activate-by-default)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'generate_behavior_implementation',
+      type: 'CLAS',
+      name: 'ZBP_DM_PROJECT',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      // Defaults: activate / dryRun / bdefName are optional → undefined here
+      expect(result.data.activate).toBeUndefined();
+      expect(result.data.dryRun).toBeUndefined();
+    }
+  });
+
+  it('rejects unknown SAPWrite action values', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'totally_invented_action',
+      type: 'CLAS',
+      name: 'ZCL_NOT_A_REAL_ACTION',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('validates objects array structure', () => {
+    // Valid: objects with type and name
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [{ type: 'CLAS', name: 'ZCL_NEW', source: 'CLASS zcl_new.', description: 'New class' }],
+      }).success,
+    ).toBe(true);
+
+    // Invalid: object missing type
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [{ name: 'ZCL_NEW' }],
+      }).success,
+    ).toBe(false);
+
+    // Invalid: object missing name
+    expect(
+      SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [{ type: 'CLAS' }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts activateAtEnd with boolean and string-coerced values for batch_create', () => {
+    for (const v of [true, false, 'true', 'false']) {
+      const parsed = SAPWriteSchema.safeParse({
+        action: 'batch_create',
+        objects: [{ type: 'CLAS', name: 'ZCL_X' }],
+        activateAtEnd: v,
+      });
+      expect(parsed.success, `activateAtEnd=${JSON.stringify(v)} should parse`).toBe(true);
+      if (parsed.success) {
+        expect(typeof parsed.data.activateAtEnd).toBe('boolean');
+      }
+    }
+  });
+
+  it('activateAtEnd accepts boolish strings but rejects non-coercible values (issue #360)', () => {
+    // looseOptionalBoolean (replacing z.coerce.boolean) accepts real booleans + boolish
+    // strings ("yes"/"true"/"false"/"0"), but — unlike z.coerce.boolean, which silently
+    // mapped any object to `true` — rejects clearly-invalid values like objects.
+    const yes = SAPWriteSchema.safeParse({
+      action: 'batch_create',
+      objects: [{ type: 'CLAS', name: 'ZCL_X' }],
+      activateAtEnd: 'yes',
+    });
+    expect(yes.success).toBe(true);
+    if (yes.success) expect(yes.data.activateAtEnd).toBe(true);
+
+    const objParsed = SAPWriteSchema.safeParse({
+      action: 'batch_create',
+      objects: [{ type: 'CLAS', name: 'ZCL_X' }],
+      activateAtEnd: { not: 'a boolean' },
+    });
+    // An object is not a valid boolean — must be rejected, not silently coerced to true.
+    expect(objParsed.success).toBe(false);
+  });
+
+  // ─── TABL subtype acceptance (follow-up to issue #285) ────────────────────
+  it('accepts SAPWrite create with explicit type="TABL/DT" (transparent table)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'TABL/DT',
+      name: 'ZTBL_NEW',
+      package: '$TMP',
+      source: "@EndUserText.label : 'x'\ndefine table ztbl_new { key client : abap.clnt; }",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts SAPWrite create with explicit type="TABL/DS" (DDIC structure)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'TABL/DS',
+      name: 'ZSTR_NEW',
+      package: '$TMP',
+      source: "@EndUserText.label : 'x'\ndefine structure zstr_new { mandt : abap.clnt; }",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('still accepts SAPWrite create with bare type="TABL" (backward-compat alias for TABL/DT)', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'create',
+      type: 'TABL',
+      name: 'ZTBL_LEGACY',
+      package: '$TMP',
+      source: "@EndUserText.label : 'x'\ndefine table ztbl_legacy { key client : abap.clnt; }",
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts SAPWrite batch_create entries with TABL/DS', () => {
+    const result = SAPWriteSchema.safeParse({
+      action: 'batch_create',
+      package: '$TMP',
+      objects: [
+        { type: 'TABL/DS', name: 'ZSTR_BATCH', source: 'define structure zstr_batch { mandt : abap.clnt; }' },
+        { type: 'DOMA', name: 'ZD_BATCH', dataType: 'CHAR', length: 1 },
+      ],
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('SAPWriteSchemaBtp', () => {
+  it('rejects on-prem-only types', () => {
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'PROG', name: 'Z' }).success).toBe(false);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'FUNC', name: 'Z' }).success).toBe(false);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'INCL', name: 'Z' }).success).toBe(false);
+  });
+
+  it('accepts BTP types', () => {
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'CLAS', name: 'Z' }).success).toBe(true);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'DDLS', name: 'Z' }).success).toBe(true);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'DCLS', name: 'ZI_TEST_DCL' }).success).toBe(true);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'TABL', name: 'ZTABL' }).success).toBe(true);
+    expect(
+      SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'SRVB', name: 'ZSB', serviceDefinition: 'ZSD' }).success,
+    ).toBe(true);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'DOMA', name: 'ZDOMAIN' }).success).toBe(true);
+    expect(SAPWriteSchemaBtp.safeParse({ action: 'create', type: 'DTEL', name: 'ZDELEM' }).success).toBe(true);
+  });
+
+  it('accepts CLAS include update on BTP schema', () => {
+    const result = SAPWriteSchemaBtp.safeParse({
+      action: 'update',
+      type: 'CLAS',
+      name: 'ZCL_TEST',
+      include: 'implementations',
+      source: 'CLASS zcl_test IMPLEMENTATION.\nENDCLASS.',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts activateAtEnd on BTP schema for batch_create', () => {
+    const result = SAPWriteSchemaBtp.safeParse({
+      action: 'batch_create',
+      objects: [{ type: 'CLAS', name: 'ZCL_X' }],
+      activateAtEnd: true,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.activateAtEnd).toBe(true);
+  });
+});
+
+describe('SAPActivateSchema', () => {
+  it('accepts single object activation', () => {
+    const result = SAPActivateSchema.safeParse({ name: 'ZCL_TEST', type: 'CLAS' });
+    expect(result.success).toBe(true);
+  });
+
+  it('preserves the parent group for structural include activation', () => {
+    const result = SAPActivateSchema.safeParse({ name: 'LZARC1TOP', type: 'INCL', group: 'ZARC1' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.group).toBe('ZARC1');
+  });
+
+  it('accepts batch activation', () => {
+    const result = SAPActivateSchema.safeParse({
+      objects: [
+        { type: 'INCL', name: 'LZARC1TOP', group: 'ZARC1' },
+        { type: 'BDEF', name: 'ZI_TRAVEL' },
+      ],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.objects?.[0]?.group).toBe('ZARC1');
+  });
+
+  it('accepts empty input (all fields optional)', () => {
+    const result = SAPActivateSchema.safeParse({});
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts publish_srvb action', () => {
+    const result = SAPActivateSchema.safeParse({ action: 'publish_srvb', name: 'ZSB_BOOKING_V4' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts unpublish_srvb action', () => {
+    const result = SAPActivateSchema.safeParse({ action: 'unpublish_srvb', name: 'ZSB_BOOKING_V4' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    const result = SAPActivateSchema.safeParse({ action: 'invalid_action', name: 'ZSB_TEST' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('SAPNavigateSchema', () => {
+  it('accepts definition action', () => {
+    const result = SAPNavigateSchema.safeParse({
+      action: 'definition',
+      uri: '/sap/bc/adt/programs/programs/ztest',
+      line: 10,
+      column: 5,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    const result = SAPNavigateSchema.safeParse({ action: 'invalid' });
+    expect(result.success).toBe(false);
+  });
+
+  it('coerces line/column from strings', () => {
+    const result = SAPNavigateSchema.safeParse({ action: 'definition', line: '10', column: '5' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.line).toBe(10);
+      expect(result.data.column).toBe(5);
+    }
+  });
+});
+
+describe('SAPLintSchema', () => {
+  it('accepts lint with source', () => {
+    const result = SAPLintSchema.safeParse({ action: 'lint', source: 'REPORT ztest.' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts list_rules without source', () => {
+    const result = SAPLintSchema.safeParse({ action: 'list_rules' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts formatter actions', () => {
+    expect(SAPLintSchema.safeParse({ action: 'format', source: 'report ztest.' }).success).toBe(true);
+    expect(SAPLintSchema.safeParse({ action: 'get_formatter_settings' }).success).toBe(true);
+    expect(SAPLintSchema.safeParse({ action: 'set_formatter_settings', style: 'keywordLower' }).success).toBe(true);
+  });
+
+  it('coerces indentation for set_formatter_settings', () => {
+    const result = SAPLintSchema.safeParse({ action: 'set_formatter_settings', indentation: 0 });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.indentation).toBe(false);
+    }
+  });
+
+  it('rejects invalid action', () => {
+    const result = SAPLintSchema.safeParse({ action: 'invalid' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('SAPDiagnoseSchema', () => {
+  it.each(['CLAS', 'PROG', 'FUGR', 'DEVC'])('accepts unittest source-audited type %s', (type) => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', type, timeoutSeconds: '300' }).success).toBe(true);
+  });
+
+  it.each(['INTF', 'FUNC', 'DDLS'])('rejects unittest type %s without source-selection support', (type) => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', type }).success).toBe(false);
+  });
+
+  it('accepts loose includeSubpackages only for DEVC unittest scope', () => {
+    expect(
+      SAPDiagnoseSchema.safeParse({ action: 'unittest', type: 'DEVC', includeSubpackages: 'false' }).data,
+    ).toMatchObject({ includeSubpackages: false });
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', type: 'CLAS', includeSubpackages: false }).success).toBe(
+      false,
+    );
+    expect(SAPDiagnoseSchema.safeParse({ action: 'atc', type: 'DEVC', includeSubpackages: true }).success).toBe(false);
+  });
+
+  it('restricts unittest and ATC timeout and rejects it for unrelated actions', () => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', timeoutSeconds: 1 }).success).toBe(true);
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', timeoutSeconds: 3601 }).success).toBe(false);
+    expect(SAPDiagnoseSchema.safeParse({ action: 'atc', timeoutSeconds: 30 }).success).toBe(true);
+    expect(SAPDiagnoseSchema.safeParse({ action: 'atc_ci', packages: ['Z'], timeoutSeconds: 600 }).success).toBe(true);
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest_ci', packages: ['Z'], timeoutSeconds: 600 }).success).toBe(
+      true,
+    );
+    expect(SAPDiagnoseSchema.safeParse({ action: 'syntax', timeoutSeconds: 30 }).success).toBe(false);
+  });
+
+  it.each(['legacy', 'structured', 'junit'] as const)('accepts unittest resultFormat=%s', (resultFormat) => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'unittest', resultFormat }).success).toBe(true);
+  });
+
+  it.each(['legacy', 'structured'] as const)('accepts atc resultFormat=%s', (resultFormat) => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'atc', resultFormat }).success).toBe(true);
+  });
+
+  it('rejects junit for atc with an action-specific diagnostic', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'atc', resultFormat: 'junit' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toEqual(['resultFormat']);
+      expect(result.error.issues[0]?.message).toContain('only supported for action="unittest"');
+    }
+  });
+
+  it('rejects resultFormat for unrelated diagnostic actions', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'syntax', resultFormat: 'legacy' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toEqual(['resultFormat']);
+      expect(result.error.issues[0]?.message).toContain('only supported for action="unittest" or action="atc"');
+    }
+  });
+
+  it('accepts authorization_trace filters without inverting stringified false', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'authorization_trace',
+      user: 'AUTH_TEST',
+      authObject: '',
+      onlyFailures: 'false',
+      maxResults: '5',
+      type: 'CLAS',
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.onlyFailures).toBe(false);
+      expect(result.data.maxResults).toBe(5);
+      expect(result.data.authObject).toBe('');
+    }
+  });
+
+  it('accepts syntax check', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'syntax', name: 'ZTEST', type: 'PROG' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts cds_testcases with a CDS name', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'cds_testcases', name: 'I_CURRENCY' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts dumps with optional filters', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'dumps',
+      user: 'DEVELOPER',
+      maxResults: 10,
+      sections: ['kap0', 'kap3'],
+      includeFullText: false,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts traces with analysis type', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'traces', id: '123', analysis: 'hitlist' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid analysis type', () => {
+    const result = SAPDiagnoseSchema.safeParse({ action: 'traces', id: '123', analysis: 'invalid' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts system_messages feed filters', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'system_messages',
+      user: 'BASISADM',
+      maxResults: '25',
+      from: '20260401090000',
+      to: '20260401120000',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.maxResults).toBe(25);
+    }
+  });
+
+  it('accepts gateway_errors list and detail modes', () => {
+    expect(
+      SAPDiagnoseSchema.safeParse({
+        action: 'gateway_errors',
+        maxResults: 20,
+      }).success,
+    ).toBe(true);
+
+    expect(
+      SAPDiagnoseSchema.safeParse({
+        action: 'gateway_errors',
+        detailUrl: '/sap/bc/adt/gw/errorlog/Frontend%20Error/ABC123',
+      }).success,
+    ).toBe(true);
+
+    expect(
+      SAPDiagnoseSchema.safeParse({
+        action: 'gateway_errors',
+        id: 'ABC123',
+        errorType: 'Frontend Error',
+      }).success,
+    ).toBe(true);
+  });
+
+  it.each([
+    '/sap/bc/adt/../../../sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/%2e%2e/%2e%2e/sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/%252e%252e/%252e%252e/sap/opu/odata/sap/ZSECRET',
+    '/sap/bc/adt/gw/errorlog/%2fadmin',
+    '/sap/bc/adt/gw/errorlog/%5cadmin',
+    '/sap/bc/adt\\..\\sap\\opu\\odata',
+    '/sap/bc/adt/gw/errorlog/ABC#fragment',
+    'https://a4h.example/sap/bc/adt/gw/errorlog/FrontendError/ABC123',
+    'adt://A4H/sap/bc/adt/gw/errorlog/FrontendError/ABC123',
+  ])('rejects ambiguous or non-host-relative gateway detail URL %j', (detailUrl) => {
+    expect(SAPDiagnoseSchema.safeParse({ action: 'gateway_errors', detailUrl }).success).toBe(false);
+  });
+
+  it('accepts quickfix with source position fields', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'quickfix',
+      name: 'ZCL_TEST',
+      type: 'CLAS',
+      source: 'CLASS zcl_test DEFINITION. ENDCLASS.',
+      line: '12',
+      column: '4',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.line).toBe(12);
+      expect(result.data.column).toBe(4);
+    }
+  });
+
+  it('accepts object_state with object identity fields', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'object_state',
+      name: 'ZBP_DM_PROJECT',
+      type: 'CLAS',
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts apply_quickfix with proposal data', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'apply_quickfix',
+      name: 'ZCL_TEST',
+      type: 'CLAS',
+      source: 'CLASS zcl_test DEFINITION. ENDCLASS.',
+      sourceUri: '/sap/bc/adt/oo/classes/ZCL_TEST/includes/definitions',
+      line: 12,
+      proposalUri: '/sap/bc/adt/quickfixes/1',
+      proposalUserContent: 'opaque-state',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts apply_quickfix with empty userContent and affected objects', () => {
+    const result = SAPDiagnoseSchema.safeParse({
+      action: 'apply_quickfix',
+      name: 'ZCL_TEST',
+      type: 'CLAS',
+      source: 'CLASS zcl_test DEFINITION. ENDCLASS.',
+      sourceUri: '/sap/bc/adt/oo/classes/ZCL_TEST/includes/definitions',
+      line: 12,
+      proposalUri: '/sap/bc/adt/quickfixes/1',
+      proposalUserContent: '',
+      proposalAffectedObjects: [
+        {
+          uri: '/sap/bc/adt/oo/classes/ZCL_HELPER/source/main',
+          type: 'CLAS/OC',
+          name: 'ZCL_HELPER',
+          description: 'Helper class',
+          content: 'CLASS zcl_helper DEFINITION. ENDCLASS.',
+        },
+      ],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.proposalUserContent).toBe('');
+      expect(result.data.sourceUri).toBe('/sap/bc/adt/oo/classes/ZCL_TEST/includes/definitions');
+      expect(result.data.proposalAffectedObjects?.[0]?.uri).toBe('/sap/bc/adt/oo/classes/ZCL_HELPER/source/main');
+    }
+  });
+});
+
+describe('SAPTransportSchema', () => {
+  it('accepts a bounded release verification timeout', () => {
+    expect(SAPTransportSchema.safeParse({ action: 'release', timeoutSeconds: '300' }).success).toBe(true);
+    expect(SAPTransportSchema.safeParse({ action: 'release', timeoutSeconds: 1801 }).success).toBe(false);
+    expect(SAPTransportSchema.safeParse({ action: 'list', timeoutSeconds: 30 }).success).toBe(false);
+  });
+
+  it('accepts list action', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'list' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts create with description', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'create', description: 'Test transport' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts create with package and transportLayer', () => {
+    const result = SAPTransportSchema.safeParse({
+      action: 'create',
+      description: 'Test transport',
+      package: 'ZFOO',
+      transportLayer: 'ZDEV',
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts create with an explicit target (Transportziel)', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'create', description: 'Test transport', target: '/TRG/' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts layers discovery action', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'layers' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts targets discovery action', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'targets' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'invalid' });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts history with type and name', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'history', type: 'CLAS', name: 'ZCL_X' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts history without type/name at schema level', () => {
+    const result = SAPTransportSchema.safeParse({ action: 'history' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts create/modify transport-check operations and rejects unknown operations', () => {
+    expect(
+      SAPTransportSchema.safeParse({
+        action: 'check',
+        type: 'CLAS',
+        name: 'ZCL_X',
+        package: 'ZPKG',
+        operation: 'create',
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPTransportSchema.safeParse({
+        action: 'check',
+        type: 'CLAS',
+        name: 'ZCL_X',
+        package: 'ZPKG',
+        operation: 'modify',
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPTransportSchema.safeParse({
+        action: 'check',
+        type: 'CLAS',
+        name: 'ZCL_X',
+        package: 'ZPKG',
+        operation: 'delete',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('coerces stringified booleans for delete flags (GPT/OpenAI client robustness)', () => {
+    const result = SAPTransportSchema.safeParse({
+      action: 'delete',
+      id: 'DEVK900001',
+      recursive: 'false',
+      removeLockedObjects: 'true',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      // Stringified booleans coerce (looseOptionalBoolean) instead of erroring — a real GPT
+      // pollution case; plain z.boolean() would reject "true"/"false" here.
+      expect(result.data.recursive).toBe(false);
+      expect(result.data.removeLockedObjects).toBe(true);
+    }
+  });
+});
+
+describe('SAPGitSchema', () => {
+  it('does not advertise the unreachable commit action', () => {
+    expect(SAPGitSchema.safeParse({ action: 'commit' }).success).toBe(false);
+    expect(SAPGitSchema.safeParse({ action: 'push', description: 'unused' }).success).toBe(false);
+  });
+
+  it('accepts valid read action payload', () => {
+    const result = SAPGitSchema.safeParse({ action: 'list_repos', backend: 'gcts' });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects unknown action', () => {
+    const result = SAPGitSchema.safeParse({ action: 'status' });
+    expect(result.success).toBe(false);
+  });
+
+  it('restricts backend enum to gcts|abapgit', () => {
+    expect(SAPGitSchema.safeParse({ action: 'list_repos', backend: 'gcts' }).success).toBe(true);
+    expect(SAPGitSchema.safeParse({ action: 'list_repos', backend: 'abapgit' }).success).toBe(true);
+    expect(SAPGitSchema.safeParse({ action: 'list_repos', backend: 'unknown' }).success).toBe(false);
+  });
+
+  it('validates objects array shape', () => {
+    const ok = SAPGitSchema.safeParse({
+      action: 'push',
+      repoId: 'ZARC1',
+      objects: [{ type: 'CLAS', name: 'ZCL_ARC1_TEST', operation: 'M' }],
+    });
+    expect(ok.success).toBe(true);
+
+    const invalid = SAPGitSchema.safeParse({
+      action: 'push',
+      repoId: 'ZARC1',
+      objects: [{ type: 'CLAS' }],
+    });
+    expect(invalid.success).toBe(false);
+  });
+
+  it('coerces limit from string to number', () => {
+    const result = SAPGitSchema.safeParse({ action: 'history', repoId: 'ZARC1', limit: '25' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.limit).toBe(25);
+  });
+});
+
+describe('SAPContextSchema', () => {
+  it('accepts minimal input (name only)', () => {
+    const result = SAPContextSchema.safeParse({ name: 'ZCL_ORDER' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts full input', () => {
+    const result = SAPContextSchema.safeParse({
+      action: 'impact',
+      type: 'CLAS',
+      name: 'ZCL_ORDER',
+      maxDeps: 10,
+      depth: 2,
+      includeIndirect: true,
+      includeKtd: true,
+      siblingCheck: false,
+      siblingMaxCandidates: 5,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts sibling controls for impact', () => {
+    const result = SAPContextSchema.safeParse({
+      action: 'impact',
+      type: 'DDLS',
+      name: 'ZI_SALES',
+      siblingCheck: true,
+      siblingMaxCandidates: 3,
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('clamps siblingMaxCandidates to hard bounds', () => {
+    const low = SAPContextSchema.safeParse({
+      action: 'impact',
+      type: 'DDLS',
+      name: 'ZI_SALES',
+      siblingMaxCandidates: 0,
+    });
+    expect(low.success).toBe(true);
+    if (low.success) {
+      expect(low.data.siblingMaxCandidates).toBe(1);
+    }
+
+    const high = SAPContextSchema.safeParse({
+      action: 'impact',
+      type: 'DDLS',
+      name: 'ZI_SALES',
+      siblingMaxCandidates: 999,
+    });
+    expect(high.success).toBe(true);
+    if (high.success) {
+      expect(high.data.siblingMaxCandidates).toBe(10);
+    }
+  });
+
+  it('rejects missing name', () => {
+    const result = SAPContextSchema.safeParse({ type: 'CLAS' });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects depth > 3', () => {
+    const result = SAPContextSchema.safeParse({ name: 'ZCL_TEST', depth: 5 });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects depth < 1', () => {
+    const result = SAPContextSchema.safeParse({ name: 'ZCL_TEST', depth: 0 });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts string false for includeKtd without inverting it', () => {
+    const result = SAPContextSchema.safeParse({ name: 'ZCL_TEST', type: 'CLAS', includeKtd: 'false' });
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.includeKtd).toBe(false);
+  });
+
+  it('accepts structure action for TABL', () => {
+    const result = SAPContextSchema.safeParse({
+      action: 'structure',
+      type: 'TABL',
+      name: 'ZSTRUCT',
+    });
+    expect(result.success).toBe(true);
+  });
+});
+
+describe('SAPContextSchemaBtp', () => {
+  it('rejects on-prem-only types', () => {
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'PROG' }).success).toBe(false);
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'FUNC' }).success).toBe(false);
+  });
+
+  it('accepts BTP types', () => {
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'CLAS' }).success).toBe(true);
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'DDLS' }).success).toBe(true);
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'DDLS', action: 'impact' }).success).toBe(true);
+    expect(SAPContextSchemaBtp.safeParse({ name: 'Z', type: 'TABL', action: 'structure' }).success).toBe(true);
+    const siblingControls = SAPContextSchemaBtp.safeParse({
+      name: 'Z',
+      type: 'DDLS',
+      action: 'impact',
+      siblingCheck: false,
+      siblingMaxCandidates: 4,
+    });
+    expect(siblingControls.success).toBe(true);
+  });
+
+  it('rejects group — the field is on-prem only', () => {
+    const result = SAPContextSchemaBtp.safeParse({ name: 'Z', group: 'TEST' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.code).toBe('unrecognized_keys');
+    }
+  });
+});
+
+describe('SAPManageSchema', () => {
+  it('accepts valid actions', () => {
+    expect(SAPManageSchema.safeParse({ action: 'features' }).success).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'probe' }).success).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'cache_stats' }).success).toBe(true);
+    expect(
+      SAPManageSchema.safeParse({
+        action: 'create_package',
+        name: 'ZPKG',
+        description: 'Package',
+        superPackage: '$TMP',
+      }).success,
+    ).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'delete_package', name: 'ZPKG' }).success).toBe(true);
+    expect(
+      SAPManageSchema.safeParse({
+        action: 'change_package',
+        objectName: 'ZARC1_TEST',
+        objectType: 'DDLS/DF',
+        oldPackage: '$TMP',
+        newPackage: 'Z_TARGET',
+        transport: 'A4HK900123',
+      }).success,
+    ).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'flp_list_catalogs' }).success).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'flp_list_groups' }).success).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'flp_list_tiles', catalogId: 'ZCAT' }).success).toBe(true);
+    expect(
+      SAPManageSchema.safeParse({ action: 'flp_create_catalog', domainId: 'ZCAT', title: 'Test Catalog' }).success,
+    ).toBe(true);
+    expect(SAPManageSchema.safeParse({ action: 'flp_create_group', groupId: 'ZGROUP', title: 'Group' }).success).toBe(
+      true,
+    );
+    expect(
+      SAPManageSchema.safeParse({
+        action: 'flp_create_tile',
+        catalogId: 'ZCAT',
+        tile: { id: 'tile-1', title: 'Tile', semanticObject: 'ZSO', semanticAction: 'display' },
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPManageSchema.safeParse({
+        action: 'flp_add_tile_to_group',
+        groupId: 'ZGROUP',
+        catalogId: 'ZCAT',
+        tileInstanceId: 'TILE123',
+      }).success,
+    ).toBe(true);
+    expect(
+      SAPManageSchema.safeParse({
+        action: 'flp_delete_catalog',
+        catalogId: 'X-SAP-UI2-CATALOGPAGE:ZARC1_TEST',
+      }).success,
+    ).toBe(true);
+  });
+
+  it('rejects invalid action', () => {
+    expect(SAPManageSchema.safeParse({ action: 'invalid' }).success).toBe(false);
+  });
+
+  it('rejects missing action', () => {
+    expect(SAPManageSchema.safeParse({}).success).toBe(false);
+  });
+
+  it('rejects invalid tile object', () => {
+    const result = SAPManageSchema.safeParse({
+      action: 'flp_create_tile',
+      catalogId: 'ZCAT',
+      tile: { id: 'tile-1', title: 'Tile', semanticObject: 'ZSO' },
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('SAPHyperfocusedSchema', () => {
+  it('accepts any action string', () => {
+    const result = SAPHyperfocusedSchema.safeParse({ action: 'read', type: 'CLAS', name: 'ZCL_TEST' });
+    expect(result.success).toBe(true);
+  });
+
+  it('accepts params object', () => {
+    const result = SAPHyperfocusedSchema.safeParse({
+      action: 'write',
+      params: { action: 'create', source: 'REPORT z.' },
+    });
+    expect(result.success).toBe(true);
+  });
+
+  it('rejects missing action', () => {
+    const result = SAPHyperfocusedSchema.safeParse({ type: 'CLAS' });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('getToolSchema', () => {
+  it('returns on-prem schema for SAPRead when isBtp=false', () => {
+    const schema = getToolSchema('SAPRead', false);
+    expect(schema).toBe(SAPReadSchema);
+  });
+
+  it('returns BTP schema for SAPRead when isBtp=true', () => {
+    const schema = getToolSchema('SAPRead', true);
+    expect(schema).toBe(SAPReadSchemaBtp);
+  });
+
+  it('returns restricted search schema when textSearch unavailable', () => {
+    const schema = getToolSchema('SAPSearch', false, false);
+    expect(schema).toBe(SAPSearchSchemaNoSource);
+  });
+
+  it('returns full search schema when textSearch available', () => {
+    const schema = getToolSchema('SAPSearch', false, true);
+    expect(schema).toBe(SAPSearchSchema);
+  });
+
+  it('returns undefined for unknown tool', () => {
+    expect(getToolSchema('UnknownTool', false)).toBeUndefined();
+  });
+
+  it('returns schema for all 12 tools + hyperfocused', () => {
+    const tools = [
+      'SAPRead',
+      'SAPSearch',
+      'SAPQuery',
+      'SAPWrite',
+      'SAPActivate',
+      'SAPNavigate',
+      'SAPLint',
+      'SAPDiagnose',
+      'SAPTransport',
+      'SAPGit',
+      'SAPContext',
+      'SAPManage',
+      'SAP',
+    ];
+    for (const tool of tools) {
+      expect(getToolSchema(tool, false)).toBeDefined();
+    }
+  });
+});
+
+// ─── Issue #360: optional booleans must not invert stringified "false" ───────
+describe('looseOptionalBoolean coercion (issue #360 — replaces z.coerce.boolean)', () => {
+  const mk = (extra: Record<string, unknown>) =>
+    SAPWriteSchema.safeParse({ action: 'create', type: 'DOMA', name: 'ZDOM', package: '$TMP', ...extra });
+
+  it('maps stringified "false" to false (the DDIC-corruption regression)', () => {
+    const r = mk({ signExists: 'false', lowercase: 'false' });
+    expect(r.success).toBe(true);
+    if (r.success) {
+      expect(r.data.signExists).toBe(false);
+      expect(r.data.lowercase).toBe(false);
+    }
+  });
+
+  it('maps "0" / "no" / "off" to false', () => {
+    for (const v of ['0', 'no', 'NO', 'off']) {
+      const r = mk({ signExists: v });
+      expect(r.success).toBe(true);
+      if (r.success) expect(r.data.signExists).toBe(false);
+    }
+  });
+
+  it('still accepts real JSON booleans (compliant clients send these)', () => {
+    const t = mk({ signExists: true, lowercase: false });
+    expect(t.success).toBe(true);
+    if (t.success) {
+      expect(t.data.signExists).toBe(true);
+      expect(t.data.lowercase).toBe(false);
+    }
+  });
+
+  it('maps "true"/"1"/"yes"/"on" to true', () => {
+    for (const v of ['true', '1', 'yes', 'on']) {
+      const r = mk({ signExists: v });
+      expect(r.success).toBe(true);
+      if (r.success) expect(r.data.signExists).toBe(true);
+    }
+  });
+
+  it('accepts numeric 0/1 as booleans but rejects nonsense', () => {
+    const zero = mk({ signExists: 0 });
+    expect(zero.success).toBe(true);
+    if (zero.success) expect(zero.data.signExists).toBe(false);
+    const garbage = mk({ signExists: { not: 'a bool' } });
+    expect(garbage.success).toBe(false);
+  });
+});

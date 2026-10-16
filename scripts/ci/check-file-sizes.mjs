@@ -1,0 +1,148 @@
+#!/usr/bin/env node
+/**
+ * File-size ratchet — a regrowth brake for the handler refactor
+ * (docs/plans/completed/2026-06-11-architecture-consolidation-plan.md).
+ *
+ * The codebase doubled in 8 weeks and the growth concentrated in a few monoliths (intent.ts,
+ * intent.test.ts). This guard fails CI when a tracked source/test file crosses its line budget,
+ * so the next big file can't sneak in unnoticed. To fix a failure: split the file, or — if the
+ * size is genuinely justified — consciously raise its budget in BUDGETS below (a reviewed act,
+ * visible in the diff). As the refactor shrinks the seeded files, LOWER their budgets here in the
+ * same commit that shrinks them.
+ *
+ * Run: npm run check:sizes   (also wired into .github/workflows/test.yml)
+ */
+
+import { execSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+
+/**
+ * Explicit per-file budgets. Seeded at "current size + headroom" for files that are legitimately
+ * large today, so the ratchet blocks GROWTH without forcing an immediate split. Lower these as
+ * the refactor lands. There is intentionally no blanket exemption for `fixtures/` directories —
+ * golden data is non-.ts/.mjs and never enters the scan, and a generated CODE fixture must earn
+ * an explicit budget here like everything else (a silent infinite budget is the exact regrowth
+ * hole this script exists to close).
+ */
+const BUDGETS = {
+  // write.ts is now a thin SAPWrite orchestrator (prologue + ctx + action dispatch) after the
+  // Stage D split into src/handlers/write/{create,update-delete,class-surgery,rap}.ts. The action
+  // submodules ride the default src budget; keep this tight so the dispatcher can't reabsorb them.
+  'src/handlers/write.ts': 300,
+  // tools.ts holds every tool's JSON schema. The #520 description trim (write-mode tools/list
+  // 87→66 KB to clear the Copilot-for-Eclipse gateway limit) shrank it; lowered to match. The
+  // CLIENT-SAFETY size guard is scripts/ci/check-tool-schema-budget.ts — trim there before raising this.
+  // +text-pool SAPWrite actions/description (edit_text_symbols/edit_selection_texts).
+  // +per-action SAPWrite description (one line per action, incl. the destructive/refusing ones).
+  // +3 for SAPTransport action="diff" (action list + offset/limit properties).
+  // +30 for the inline shortTexts object schema and retained refObjectDescription guidance. Keeping
+  // this public schema beside SAPWrite avoids a one-constant module whose only purpose was the ratchet.
+  // +5 for the optional relations projection hook; its implementation stays in relation-tool.ts.
+  // +30 for SAPDiagnose ATC objects[]; keep its small item schema with the tool (no new module).
+  // Combined #769/#772: 1791 lines, retaining 4 lines of headroom.
+  // +4: parent function group for SAPTransport check/history.
+  'src/handlers/tools.ts': 1784,
+  // +shared parseNamedItems relocated here from transport.ts (now used by ATC variants too) +
+  // parseAtcSystemCheckVariant (FEAT-68 ATC variant listing) + parseFunctionModuleProperties and
+  // the pre-7.52 projectexplorer function-group parser.
+  // +38 for revisionTransportId: the versions feed carries the CTS id in adtcore:name on a
+  // .../transport/request link, not in the link title. The extra lines over the first estimate
+  // are the CTS-id shape guard and the safe percent-decode — an unvalidated href tail returned
+  // "reference" as a transport id, and a malformed escape threw away the whole feed
+  // (docs/plans/2026-08-03-transport-diff.md).
+  // -25: parseXml decodes entities itself, so the per-parser decodes went away.
+  'src/adt/xml-parser.ts': 1769,
+  // diagnostics.ts gained the ABAP trace-request engine (#508) + the OData perf probe + CDS Show-SQL (#509)
+  // + ST05 SQL-trace control (#510) + clientWait split. Split out a perf/trace module if it grows much further.
+  // +88 for dump paging: SAP caps the dumps feed at 100 entries and ignores $skip, so listDumps walks
+  // the inclusive `to` bound, refuses to guess when a second holds a full page, and rejects bounds
+  // SAP would silently discard or roll over to another day.
+  'src/adt/diagnostics.ts': 1933,
+  // The ADT client facade aggregates every read/write op; set_api_state (#506) + runQueryWithMetrics
+  // (SAPQuery metrics) + getEffectiveUser (BTP JWT-derived user, G-5) + getSourceAtObjectUrl
+  // (post-activation cache promotion) + get/writeClassTextElements (class text pool) pushed it past
+  // the default. Keep tight headroom.
+  // + getFunctionModuleProperties and the getFunctionGroup pre-7.52 objectstructure fallback.
+  // + the #739 data-result scope/budget plumbing (main raised this to 1730 for it).
+  // +10 on top of that for runQueryBatch, the single freestyle-SQL entry point that authorizes a
+  // whole logical request once and then executes its statements inside one response-memory scope.
+  // Authorization and the POSTs must stay inside one private client operation, so this genuinely
+  // belongs on the facade; the two parts that did not were extracted first (lineage evaluation to
+  // data-source-policy.ts, the statement-execution loop to table-query.ts).
+  // -5 after removing the forwarding-only guard factory and its extra import/configuration lines.
+  // TABL write-route cache removed (never cache subtype routes for mutations); +9 for refusing TABL
+  // mutations whose subtype cannot be verified on 7.50/7.51 (the resolver's error text).
+  'src/adt/client.ts': 1697,
+  // The single live ADT integration suite covers every read/write surface against a real system;
+  // it passed the 3000-line default test budget with the ATC check-variant binding cases
+  // (docs/research/2026-08-19-atc-default-check-variant.md). Split by domain before raising again.
+  'tests/integration/adt.integration.test.ts': 3100,
+  // Typed attempt accounting, scoped response ownership, and stateful-context teardown must stay at
+  // the transport choke point. Relation parsing/traversal and feature algorithms live elsewhere.
+  'src/adt/http.ts': 1561, // +12: #907 bounded legacy negotiation; selector lives in its own module.
+  // #817: reject absent CTS documents at the existing list/get parser boundary.
+  'src/adt/transport.ts': 1507, // Keep the safe CTS explanation in minimal-error mode.
+  // +3 for passing existing exact discovery evidence into the pure opt-in schema projection.
+  'src/server/server.ts': 1493, // Shared HTTP transport + monotonic renewal for new requests (R21).
+};
+
+const DEFAULT_SRC = 1500;
+const DEFAULT_TEST = 3000;
+
+function budgetFor(path) {
+  if (path in BUDGETS) return BUDGETS[path];
+  if (path.endsWith('.test.ts') || path.startsWith('tests/')) return DEFAULT_TEST;
+  return DEFAULT_SRC;
+}
+
+function countLines(path) {
+  const text = readFileSync(path, 'utf8');
+  if (text === '') return 0;
+  return text.split('\n').length - (text.endsWith('\n') ? 1 : 0); // match `wc -l`
+}
+
+// NUL-delimited so paths with spaces/non-ASCII are never quoted-and-mangled (git's default
+// core.quotePath would wrap "tests/.../zäh.ts" in quotes, and a naive .endsWith('.ts') would
+// then silently skip it — voiding the ratchet for that file).
+// Include the maintained relation-validation entry points, not unrelated research scripts.
+const files = execSync('git ls-files -z src tests bin scripts/smoke-live-relations.ts scripts/bench-context-parsing.ts', {
+  encoding: 'utf8',
+})
+  .split('\0')
+  .filter((f) => f.endsWith('.ts') || f.endsWith('.mjs'));
+
+// A BUDGETS key that no longer names a tracked file is a silent loosening: the renamed/deleted
+// file's successor falls back to the (much larger) default budget while the tight entry sits dead.
+// Fail loudly so a rename must move its budget in the same change.
+const tracked = new Set(files);
+const danglingBudgets = Object.keys(BUDGETS).filter((p) => !tracked.has(p));
+if (danglingBudgets.length > 0) {
+  console.error('✗ file-size ratchet: these BUDGETS keys no longer match a tracked file (rename/delete?):\n');
+  for (const p of danglingBudgets) console.error(`  ${p}`);
+  console.error('\nUpdate the key in scripts/ci/check-file-sizes.mjs to the new path, or remove it.');
+  process.exit(1);
+}
+
+const offenders = [];
+for (const f of files) {
+  // A file tracked in the index but missing from the worktree (e.g. deleted-not-committed) is not
+  // a size concern — skip it instead of crashing the whole report with a raw ENOENT.
+  if (!existsSync(f)) continue;
+  const lines = countLines(f);
+  const budget = budgetFor(f);
+  if (lines > budget) offenders.push({ f, lines, budget });
+}
+
+if (offenders.length > 0) {
+  console.error('✗ file-size ratchet failed — these files exceed their line budget:\n');
+  for (const o of offenders) {
+    console.error(`  ${o.f}: ${o.lines} lines (budget ${o.budget})`);
+  }
+  console.error(
+    '\nSplit the file (see docs/plans/completed/2026-06-11-architecture-consolidation-plan.md), or — if justified —\n' +
+      'raise its budget in scripts/ci/check-file-sizes.mjs (a deliberate, reviewed change).',
+  );
+  process.exit(1);
+}
+
+console.log(`✓ file-size ratchet: all ${files.length} tracked source/test files within budget.`);

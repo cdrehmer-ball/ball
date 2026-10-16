@@ -1,0 +1,674 @@
+/**
+ * Integration tests for CTS transport compatibility and corrNr propagation.
+ *
+ * These tests validate the transport-related fixes from issues #9, #26, #56, #70
+ * against a live SAP system.
+ *
+ * Transport tests require:
+ *   - SAP credentials (TEST_SAP_URL / SAP_URL, etc.)
+ *   - allowTransportWrites safety config
+ *
+ * Transportable-package tests additionally require:
+ *   - TEST_TRANSPORT_PACKAGE env var (e.g., Z_LLM_TEST_PACKAGE)
+ *   - TEST_TRANSPORT_PACKAGE_WRITE_TESTS=true for write paths (manual/destructive)
+ *
+ * Run: npm run test:integration -- tests/integration/transport.integration.test.ts
+ * Slow recursive release coverage:
+ *   TEST_TRANSPORT_RELEASE_TESTS=true npm run test:integration:slow -- tests/integration/transport-release.slow.integration.test.ts
+ * Run with transportable package:
+ *   TEST_TRANSPORT_PACKAGE=Z_LLM_TEST_PACKAGE TEST_TRANSPORT_PACKAGE_WRITE_TESTS=true npm run test:integration -- tests/integration/transport.integration.test.ts
+ */
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { AdtClient } from '../../src/adt/client.js';
+import { createObject, deleteObject, lockObject, safeUpdateSource } from '../../src/adt/crud.js';
+import { AdtApiError } from '../../src/adt/errors.js';
+import { unrestrictedSafetyConfig } from '../../src/adt/safety.js';
+import {
+  createTransport,
+  createTransportWithTarget,
+  deleteTransport,
+  getObjectTransports,
+  getTransport,
+  getTransportInfo,
+  inactiveObjectsForTransport,
+  listTransportLayers,
+  listTransports,
+  listTransportTargets,
+  reassignTransport,
+} from '../../src/adt/transport.js';
+import { handleToolCall } from '../../src/handlers/dispatch.js';
+import { DEFAULT_CONFIG } from '../../src/server/types.js';
+import { expectSapFailureClass } from '../helpers/expected-error.js';
+import { requireOrSkip, SkipReason, skipTest } from '../helpers/skip-policy.js';
+import { buildCreateXml, generateUniqueName } from './crud-harness.js';
+import { requireSapCredentials } from './helpers.js';
+
+const transportPackageWriteTestsEnabled = process.env.TEST_TRANSPORT_PACKAGE_WRITE_TESTS === 'true';
+
+function isArc1TestTransport(description: string): boolean {
+  return /^ARC-1 (IT|integration test)\b/.test(description);
+}
+
+/** Create an ADT client with transport writes enabled */
+function getTransportEnabledClient(): AdtClient {
+  requireSapCredentials();
+
+  const url = process.env.TEST_SAP_URL || process.env.SAP_URL || '';
+  const username = process.env.TEST_SAP_USER || process.env.SAP_USER || '';
+  const password = process.env.TEST_SAP_PASSWORD || process.env.SAP_PASSWORD || '';
+  const client = process.env.TEST_SAP_CLIENT || process.env.SAP_CLIENT || '100';
+  const language = process.env.TEST_SAP_LANGUAGE || process.env.SAP_LANGUAGE || 'EN';
+  const insecure = (process.env.TEST_SAP_INSECURE || process.env.SAP_INSECURE) === 'true';
+
+  const safety = unrestrictedSafetyConfig();
+  safety.allowTransportWrites = true;
+
+  return new AdtClient({
+    baseUrl: url,
+    username,
+    password,
+    client,
+    language,
+    insecure,
+    safety,
+  });
+}
+
+/** Check if an error indicates the backend doesn't support this CTS operation */
+function isUnsupportedBackend(err: unknown): boolean {
+  if (err instanceof AdtApiError) {
+    // 400/405/501 typically indicate the operation isn't supported on this system
+    return [400, 405, 501].includes(err.statusCode);
+  }
+  return false;
+}
+
+describe('Transport Integration Tests', () => {
+  let client: AdtClient;
+  const createdTransportIds = new Set<string>();
+  const createdTransportableObjects: Array<{
+    objectUrl: string;
+    objectType: string;
+    name: string;
+    transportId: string;
+  }> = [];
+  let initialArc1DraftTransportIds = new Set<string>();
+
+  function trackTransport(id: string): string {
+    createdTransportIds.add(id);
+    return id;
+  }
+
+  function trackTransportableObject(objectUrl: string, objectType: string, name: string, transportId: string): void {
+    createdTransportableObjects.push({ objectUrl, objectType, name, transportId });
+  }
+
+  async function listArc1DraftTransportIds(): Promise<Set<string>> {
+    const transports = await listTransports(client.http, client.safety, undefined, 'D');
+    return new Set(
+      transports
+        .filter((transport) => isArc1TestTransport(transport.description) && transport.status === 'D')
+        .map((transport) => transport.id),
+    );
+  }
+
+  async function deleteTrackedTransport(id: string): Promise<void> {
+    try {
+      await deleteTransport(client.http, client.safety, id, true);
+      createdTransportIds.delete(id);
+    } catch (err) {
+      try {
+        const transport = await getTransport(client.http, client.safety, id);
+        if (!transport) {
+          createdTransportIds.delete(id);
+          return;
+        }
+      } catch {
+        // Keep the original cleanup error below.
+      }
+      throw err;
+    }
+  }
+
+  async function deleteTrackedTransportableObject(entry: {
+    objectUrl: string;
+    objectType: string;
+    name: string;
+    transportId: string;
+  }): Promise<void> {
+    let deletedOrMissing = false;
+    try {
+      await client.http.withStatefulSession(async (session) => {
+        const lock = await lockObject(session, client.safety, entry.objectUrl);
+        await deleteObject(session, client.safety, entry.objectUrl, lock.lockHandle, lock.corrNr || entry.transportId);
+      });
+      deletedOrMissing = true;
+    } catch (err) {
+      if (err instanceof AdtApiError && err.isNotFound) {
+        deletedOrMissing = true;
+        return;
+      }
+      throw err;
+    } finally {
+      if (deletedOrMissing) {
+        const index = createdTransportableObjects.findIndex((object) => object.name === entry.name);
+        if (index >= 0) createdTransportableObjects.splice(index, 1);
+      }
+    }
+  }
+
+  async function cleanupTrackedTransportableObjects(): Promise<Array<{ id: string; error: string }>> {
+    const failures: Array<{ id: string; error: string }> = [];
+    for (const entry of [...createdTransportableObjects].reverse()) {
+      try {
+        await deleteTrackedTransportableObject(entry);
+      } catch (err) {
+        failures.push({
+          id: `${entry.objectType} ${entry.name}`,
+          error: `transportable object cleanup failed with ${entry.transportId}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        });
+      }
+    }
+    return failures;
+  }
+
+  beforeAll(async () => {
+    requireSapCredentials();
+    client = getTransportEnabledClient();
+    initialArc1DraftTransportIds = await listArc1DraftTransportIds();
+  });
+
+  afterAll(async () => {
+    if (!client) return;
+
+    const failures: Array<{ id: string; error: string }> = [];
+
+    failures.push(...(await cleanupTrackedTransportableObjects()));
+
+    for (const id of [...createdTransportIds].reverse()) {
+      try {
+        await deleteTrackedTransport(id);
+      } catch (err) {
+        failures.push({ id, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    const currentArc1DraftTransportIds = await listArc1DraftTransportIds();
+    const leaked = [...currentArc1DraftTransportIds].filter((id) => !initialArc1DraftTransportIds.has(id));
+    for (const id of leaked) {
+      failures.push({ id, error: 'new ARC-1 draft transport still exists after integration cleanup' });
+    }
+
+    if (failures.length > 0) {
+      throw new Error(`Transport cleanup failed: ${JSON.stringify(failures)}`);
+    }
+  });
+
+  // ─── getTransport ──────────────────────────────────────────────
+
+  describe('getTransport', () => {
+    it('returns transport details with corrected Accept header', async () => {
+      // First list transports to find an existing one
+      const transports = await listTransports(client.http, client.safety);
+      if (transports.length === 0) {
+        // No transports available — create one to test with
+        const id = trackTransport(
+          await createTransport(client.http, client.safety, 'ARC-1 integration test: getTransport'),
+        );
+        expect(id).toBeTruthy();
+        expect(id).toMatch(/^[A-Z0-9]+K\d+$/);
+
+        const transport = await getTransport(client.http, client.safety, id);
+        expect(transport).not.toBeNull();
+        expect(transport!.id).toBe(id);
+        expect(transport!.description).toBe('ARC-1 integration test: getTransport');
+        expect(transport!.status).toBeTruthy();
+        return;
+      }
+
+      // Use the first available transport
+      const transport = await getTransport(client.http, client.safety, transports[0].id);
+      expect(transport).not.toBeNull();
+      expect(transport!.id).toBe(transports[0].id);
+      expect(transport!.description).toBeTruthy();
+      expect(transport!.owner).toBeTruthy();
+      expect(transport!.status).toBeTruthy();
+    });
+
+    it('returns null for non-existent transport', async () => {
+      try {
+        const result = await getTransport(client.http, client.safety, 'ZZZK999999');
+        // Some SAP systems return empty result, some throw 404
+        expect(result === null || result?.id === '').toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i]);
+      }
+    });
+  });
+
+  // ─── getTransportInfo (read-only pre-flight) ────────────────────
+
+  describe('getTransportInfo', () => {
+    it('accepts and echoes create and modify operations without mutating CTS', async () => {
+      const objectUrl = '/sap/bc/adt/oo/classes/zcl_arc1_transport_check';
+
+      const createInfo = await getTransportInfo(client.http, client.safety, objectUrl, '$TMP', 'I');
+      const modifyInfo = await getTransportInfo(client.http, client.safety, objectUrl, '$TMP', '');
+
+      expect(createInfo.operation).toBe('I');
+      expect(modifyInfo.operation).toBe('');
+      expect(createInfo.isLocal).toBe(true);
+      expect(modifyInfo.isLocal).toBe(true);
+      expect(createInfo.recording).toBe(false);
+      expect(modifyInfo.recording).toBe(false);
+      expect(createInfo.existingTransports).toEqual([]);
+      expect(modifyInfo.existingTransports).toEqual([]);
+    });
+  });
+
+  // ─── createTransport ───────────────────────────────────────────
+
+  describe('createTransport', () => {
+    it('creates a transport without explicit package (defaults to $TMP)', async () => {
+      const desc = `ARC-1 IT default-tmp ${Date.now()}`;
+      const id = trackTransport(await createTransport(client.http, client.safety, desc));
+
+      expect(id).toBeTruthy();
+      // SAP transport IDs follow pattern: <SID>K<number>
+      expect(id).toMatch(/^[A-Z0-9]+K\d+$/);
+
+      // Verify the created transport can be retrieved and has the right description + owner
+      const transport = await getTransport(client.http, client.safety, id);
+      expect(transport).not.toBeNull();
+      expect(transport!.id).toBe(id);
+      expect(transport!.description).toBe(desc);
+      expect(transport!.owner).toBeTruthy();
+    });
+
+    it('creates a transport with explicit target package', async (ctx) => {
+      const pkg = process.env.TEST_TRANSPORT_PACKAGE;
+      requireOrSkip(ctx, pkg, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      const desc = `ARC-1 IT pkg ${Date.now()}`;
+      const id = trackTransport(await createTransport(client.http, client.safety, desc, pkg));
+      expect(id).toBeTruthy();
+      expect(id).toMatch(/^[A-Z0-9]+K\d+$/);
+    });
+
+    it('accepts a transportLayer override and reports the resolved target', async () => {
+      // The transportLayer query param is accepted by the CreateCorrectionRequest
+      // endpoint regardless of whether the system has matching transport routes.
+      // The resolved target is read back via getTransport — on a route-less system it
+      // is empty ("Local Change Requests"); on a routed system it carries the target.
+      const desc = `ARC-1 IT layer ${Date.now()}`;
+      const id = trackTransport(await createTransport(client.http, client.safety, desc, undefined, undefined, 'SAP'));
+      expect(id).toMatch(/^[A-Z0-9]+K\d+$/);
+
+      const transport = await getTransport(client.http, client.safety, id);
+      expect(transport).not.toBeNull();
+      // The parser now surfaces target/targetDesc on every request (may be empty strings).
+      expect(typeof transport!.target).toBe('string');
+      expect(typeof transport!.targetDesc).toBe('string');
+    });
+  });
+
+  // ─── createTransportWithTarget (explicit Transportziel / TR_TARGET) ───
+
+  describe('createTransportWithTarget', () => {
+    it('rejects an unknown transport target with a clear server error', async () => {
+      // SAP validates the target server-side; a target that doesn't exist on this system
+      // (no STMS routes / no such group) must be rejected, not silently created as local.
+      const desc = `ARC-1 IT bad-target ${Date.now()}`;
+      try {
+        const id = await createTransportWithTarget(client.http, client.safety, desc, '/ZZNOPE/', 'MARIAN');
+        // If the system unexpectedly accepts it, track for cleanup and fail.
+        trackTransport(id);
+        throw new Error(`Expected an unknown target to be rejected, but request ${id} was created.`);
+      } catch (err) {
+        expectSapFailureClass(err, [400, 404], [/does not exist/i, /target/i]);
+      }
+    });
+
+    it('creates a request with the configured target when one is provided', async (ctx) => {
+      // Needs a system with a real transport target (extended transport control). Provide
+      // a known-good target via TEST_TRANSPORT_TARGET (e.g. "/TRG/" or "C11") to exercise it.
+      const target = process.env.TEST_TRANSPORT_TARGET;
+      requireOrSkip(ctx, target, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      const desc = `ARC-1 IT target ${Date.now()}`;
+      const id = trackTransport(await createTransportWithTarget(client.http, client.safety, desc, target as string));
+      expect(id).toMatch(/^[A-Z0-9]+K\d+$/);
+
+      const transport = await getTransport(client.http, client.safety, id);
+      expect(transport?.target).toBe(target);
+    });
+  });
+
+  // ─── listTransportLayers (discovery) ───────────────────────────
+
+  describe('listTransportLayers', () => {
+    it('lists the transport layers available on the system', async () => {
+      const layers = await listTransportLayers(client.http, client.safety);
+      expect(Array.isArray(layers)).toBe(true);
+      // Shape contract: every entry has string name + description; target optional.
+      for (const layer of layers) {
+        expect(typeof layer.name).toBe('string');
+        expect(typeof layer.description).toBe('string');
+        if (layer.target !== undefined) expect(typeof layer.target).toBe('string');
+      }
+    });
+  });
+
+  // ─── listTransportTargets (official target value-help) ─────────
+
+  describe('listTransportTargets', () => {
+    it('lists the valid transport targets via the official value help', async (ctx) => {
+      // The value-help endpoint exists only on releases whose ADT stack supports explicit
+      // targets; NW 7.50/7.51 return 404. Skip cleanly there rather than fail.
+      let targets: Awaited<ReturnType<typeof listTransportTargets>>;
+      try {
+        targets = await listTransportTargets(client.http, client.safety);
+      } catch (err) {
+        if (err instanceof AdtApiError && err.isNotFound) {
+          requireOrSkip(ctx, undefined, SkipReason.BACKEND_UNSUPPORTED);
+          return;
+        }
+        throw err;
+      }
+      expect(Array.isArray(targets)).toBe(true);
+      for (const t of targets) {
+        expect(typeof t.name).toBe('string');
+        expect(t.name.length).toBeGreaterThan(0);
+        expect(typeof t.description).toBe('string');
+      }
+    });
+  });
+
+  // ─── listTransports ────────────────────────────────────────────
+
+  describe('listTransports', () => {
+    it('lists transports for current user', async () => {
+      const transports = await listTransports(client.http, client.safety);
+      expect(Array.isArray(transports)).toBe(true);
+      // At minimum, the transports created above should exist
+      // (but they might already be released or the user may have pre-existing ones)
+      for (const t of transports) {
+        expect(t.id).toBeTruthy();
+        expect(typeof t.description).toBe('string');
+        expect(typeof t.owner).toBe('string');
+        expect(typeof t.status).toBe('string');
+      }
+    });
+  });
+
+  // ─── getObjectTransports ───────────────────────────────────────
+
+  describe('getObjectTransports (current object lock lookup)', () => {
+    it('$TMP fixture object returns no related transports', async (ctx) => {
+      try {
+        const result = await getObjectTransports(client.http, client.safety, '/sap/bc/adt/oo/classes/zcl_arc1_test');
+        expect(result.relatedTransports.length).toBe(0);
+        expect(result.lockedTransport).toBeUndefined();
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.NO_FIXTURE}: ZCL_ARC1_TEST not found — run npm run test:e2e:fixtures first`,
+        );
+      }
+    });
+
+    it('supports probing a transportable object when configured', async (ctx) => {
+      const transportPkg = process.env.TEST_TRANSPORT_PACKAGE;
+      requireOrSkip(ctx, transportPkg, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      const objectName = process.env.TEST_TRANSPORT_OBJECT_NAME;
+      requireOrSkip(ctx, objectName, 'TEST_TRANSPORT_OBJECT_NAME not configured');
+
+      const objectUrl = `/sap/bc/adt/oo/classes/${encodeURIComponent(objectName.toLowerCase())}`;
+      try {
+        const result = await getObjectTransports(client.http, client.safety, objectUrl);
+        expect(Array.isArray(result.relatedTransports)).toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: configured TEST_TRANSPORT_OBJECT_NAME "${objectName}" is not available`,
+        );
+      }
+    });
+  });
+
+  // ─── deleteTransport ───────────────────────────────────────────
+
+  describe('deleteTransport', () => {
+    it('creates and deletes a transport', async () => {
+      const id = trackTransport(await createTransport(client.http, client.safety, `ARC-1 IT delete ${Date.now()}`));
+      expect(id).toBeTruthy();
+
+      await deleteTransport(client.http, client.safety, id);
+      createdTransportIds.delete(id);
+
+      // Verify transport is gone or returns null
+      try {
+        const result = await getTransport(client.http, client.safety, id);
+        expect(result === null || result?.id === '').toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404, 400], [/not found/i, /does not exist/i]);
+      }
+    }, 30_000);
+  });
+
+  // K/W/T transport type is no longer driven by the request body — the
+  // CreateCorrectionRequest endpoint infers the type from the target
+  // package's transport route in TADIR. Per-type integration tests would
+  // need separate Customizing/Workbench packages and aren't portable, so
+  // they're removed.
+
+  // ─── reassignTransport ────────────────────────────────────────
+
+  describe('reassignTransport', () => {
+    it('reassigns a transport to same user', async (ctx) => {
+      let id = '';
+      try {
+        id = trackTransport(await createTransport(client.http, client.safety, `ARC-1 IT reassign ${Date.now()}`));
+        expect(id).toBeTruthy();
+
+        const transport = await getTransport(client.http, client.safety, id);
+        const currentOwner = transport!.owner;
+
+        // Reassign to same user (safe — we know the user exists)
+        await reassignTransport(client.http, client.safety, id, currentOwner);
+
+        const updated = await getTransport(client.http, client.safety, id);
+        expect(updated!.owner).toBe(currentOwner);
+      } catch (err) {
+        // NW 7.5x ADT_TM gap: PUT body attributes are silently dropped, so
+        // tm:targetuser arrives empty and SAP responds 400 "User  does not
+        // exist in the system (or locked)" (note the double space — empty
+        // interpolation). NW 7.5x accepts the same operation as URL-query
+        // params, but S/4HANA needs the body — incompatible without
+        // release-aware fallback. Tracked separately from PR #228.
+        if (isUnsupportedBackend(err))
+          return skipTest(
+            ctx,
+            'NW 7.5x ADT_TM gap: reassign requires URL-query params on that release; needs release-aware fallback',
+          );
+        throw err;
+      } finally {
+        if (id) {
+          await deleteTrackedTransport(id);
+        }
+      }
+    }, 30_000);
+  });
+
+  // ─── Transportable Package Write with corrNr Propagation ──────
+
+  describe('transportable package write with auto-corrNr', () => {
+    it('update succeeds without explicit transport via lock corrNr propagation', async (ctx) => {
+      requireOrSkip(
+        ctx,
+        transportPackageWriteTestsEnabled ? true : undefined,
+        SkipReason.TRANSPORT_PACKAGE_WRITES_DISABLED,
+      );
+      const pkg = process.env.TEST_TRANSPORT_PACKAGE;
+      requireOrSkip(ctx, pkg, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      const testName = generateUniqueName('ZARC1_TR');
+      const objectUrl = `/sap/bc/adt/programs/programs/${testName.toLowerCase()}`;
+      const sourceUrl = `${objectUrl}/source/main`;
+
+      // Create object in transportable package (needs a transport)
+      // First create a transport for the create operation
+      const transportId = trackTransport(
+        await createTransport(client.http, client.safety, `ARC-1 IT corrNr ${Date.now()}`, pkg),
+      );
+      expect(transportId).toBeTruthy();
+
+      const xml = buildCreateXml('PROG', testName, pkg, 'ARC-1 corrNr propagation test');
+      await createObject(
+        client.http,
+        client.safety,
+        '/sap/bc/adt/programs/programs',
+        xml,
+        'application/xml',
+        transportId,
+      );
+      trackTransportableObject(objectUrl, 'PROG', testName, transportId);
+
+      // Update WITHOUT explicit transport — should auto-use lock corrNr
+      const newSource = `REPORT ${testName.toLowerCase()}.\nWRITE: / 'corrNr auto-propagated'.`;
+      await safeUpdateSource(client.http, client.safety, objectUrl, sourceUrl, newSource);
+
+      // Verify update succeeded
+      const { source } = await client.getProgram(testName);
+      expect(source).toContain('corrNr auto-propagated');
+    }, 60_000);
+
+    it('explicit transport overrides lock corrNr', async (ctx) => {
+      requireOrSkip(
+        ctx,
+        transportPackageWriteTestsEnabled ? true : undefined,
+        SkipReason.TRANSPORT_PACKAGE_WRITES_DISABLED,
+      );
+      const pkg = process.env.TEST_TRANSPORT_PACKAGE;
+      requireOrSkip(ctx, pkg, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      const testName = generateUniqueName('ZARC1_TR');
+      const objectUrl = `/sap/bc/adt/programs/programs/${testName.toLowerCase()}`;
+      const sourceUrl = `${objectUrl}/source/main`;
+
+      // Create transport and object
+      const transportId = trackTransport(
+        await createTransport(client.http, client.safety, `ARC-1 IT explicit ${Date.now()}`, pkg),
+      );
+      expect(transportId).toBeTruthy();
+
+      const xml = buildCreateXml('PROG', testName, pkg, 'ARC-1 explicit transport test');
+      await createObject(
+        client.http,
+        client.safety,
+        '/sap/bc/adt/programs/programs',
+        xml,
+        'application/xml',
+        transportId,
+      );
+      trackTransportableObject(objectUrl, 'PROG', testName, transportId);
+
+      // Update WITH explicit transport — should use that, not lock corrNr
+      const newSource = `REPORT ${testName.toLowerCase()}.\nWRITE: / 'explicit transport used'.`;
+      await safeUpdateSource(client.http, client.safety, objectUrl, sourceUrl, newSource, transportId);
+
+      // Verify update succeeded
+      const { source } = await client.getProgram(testName);
+      expect(source).toContain('explicit transport used');
+    }, 60_000);
+  });
+
+  // ─── Pre-release inactive-objects check (FEAT-63) ───────────────────
+  // Non-destructive: the release handler must FAIL FAST (return before releasing) when the transport
+  // contains inactive objects. Drives whatever transport-assigned inactive objects already exist on
+  // the system (live-verified shape on a4h 758). Skips cleanly where none exist (e.g. systems whose
+  // inactive objects are all $TMP/unassigned — observed on the 816 and 7.50 boxes 2026-06-24).
+  describe('pre-release inactive-objects guard', () => {
+    it('blocks releasing a transport that still has inactive objects', async (ctx) => {
+      const client = getTransportEnabledClient();
+      const inactive = await client.getInactiveObjects();
+      const candidate = inactive.find((o) => o.parentTransport || o.transport);
+      requireOrSkip(ctx, candidate, SkipReason.NO_FIXTURE);
+
+      const requestId = candidate.parentTransport?.split('/').pop() || candidate.transport || '';
+      // The pure correlation must pick the object up for its request id...
+      expect(inactiveObjectsForTransport(inactive, requestId).length).toBeGreaterThan(0);
+      // ...and the release handler must fail-fast (non-destructive — returns before the release POST).
+      const result = await handleToolCall(client, DEFAULT_CONFIG, 'SAPTransport', {
+        action: 'release',
+        id: requestId,
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain('cannot be released');
+    }, 60_000);
+
+    // Deterministic counterpart: self-seed a transport with an inactive object so the guard is
+    // verified end-to-end (not dependent on pre-existing inactive state, which is all $TMP/unassigned
+    // on some boxes). Gated like the other transportable-write tests above. Self-cleans in `finally`
+    // with removeLockedObjects=true rather than the shared tracker — an inactive object locks its
+    // task, which the tracker's plain recursive delete cannot strip (live-verified on a4h 758).
+    it('blocks releasing a self-seeded transport holding an inactive object', async (ctx) => {
+      requireOrSkip(
+        ctx,
+        transportPackageWriteTestsEnabled ? true : undefined,
+        SkipReason.TRANSPORT_PACKAGE_WRITES_DISABLED,
+      );
+      const pkg = process.env.TEST_TRANSPORT_PACKAGE;
+      requireOrSkip(ctx, pkg, SkipReason.NO_TRANSPORT_PACKAGE);
+
+      // A fresh transport + a created-but-not-activated program = an inactive object on the request.
+      const requestId = await createTransport(client.http, client.safety, `ARC-1 IT inactive-guard ${Date.now()}`, pkg);
+      expect(requestId).toBeTruthy();
+      const testName = generateUniqueName('ZARC1_TR');
+      const objectUrl = `/sap/bc/adt/programs/programs/${testName.toLowerCase()}`;
+      try {
+        await createObject(
+          client.http,
+          client.safety,
+          '/sap/bc/adt/programs/programs',
+          buildCreateXml('PROG', testName, pkg, 'ARC-1 inactive-objects guard'),
+          'application/xml',
+          requestId,
+        );
+        await safeUpdateSource(
+          client.http,
+          client.safety,
+          objectUrl,
+          `${objectUrl}/source/main`,
+          `REPORT ${testName.toLowerCase()}.\nWRITE: / 'inactive guard'.`,
+          requestId,
+        );
+
+        // The pure correlation must pick the inactive object up for its request id (live-verified on
+        // a4h 758: a created-not-activated PROG is listed with parentTransport = the request URI)...
+        const inactive = await client.getInactiveObjects();
+        expect(inactiveObjectsForTransport(inactive, requestId).length).toBeGreaterThan(0);
+        // ...and the release handler must fail-fast (returns before the release POST).
+        const result = await handleToolCall(client, DEFAULT_CONFIG, 'SAPTransport', {
+          action: 'release',
+          id: requestId,
+        });
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain('cannot be released');
+      } finally {
+        // removeLockedObjects=true strips the inactive object's task lock AND drops the object in one
+        // shot; recursive=true releases the child task. best-effort-cleanup (afterAll leak-net catches
+        // any residue).
+        await deleteTransport(client.http, client.safety, requestId, true, true).catch(() => {});
+      }
+    }, 90_000);
+  });
+});

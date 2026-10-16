@@ -1,0 +1,20 @@
+{
+  "commits": [
+    {
+      "id": "1f2e3d4c",
+      "author": "Developer",
+      "authorMail": "developer@example.com",
+      "date": "2026-04-17T10:20:30Z",
+      "message": "Initial import",
+      "description": "Initial import of package"
+    },
+    {
+      "id": "2a3b4c5d",
+      "author": "Developer",
+      "authorMail": "developer@example.com",
+      "date": "2026-04-18T12:00:00Z",
+      "message": "Adjust class implementation",
+      "description": "Implementation update"
+    }
+  ]
+}

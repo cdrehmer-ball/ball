@@ -1,0 +1,60 @@
+/** Long SAPWrite descriptions kept separate from the schema builder's line-budgeted implementation. */
+
+/**
+ * Opening line for SAPWrite. The description used to begin with MINIMAL PAYLOAD — ~1,100 characters
+ * of argument hygiene — so a model choosing a tool read a lecture about null values before learning
+ * what the tool is for. Leading with purpose is the documentation fix; no routing-accuracy claim is
+ * attached to it.
+ *
+ * Composed into the exported descriptions below rather than in tools.ts, which is line-budgeted.
+ */
+const SAPWRITE_LEAD =
+  'Change ABAP objects in the SAP system: create, update, delete, and targeted source edits. Use it ' +
+  'when the request is to PERSIST a change — write, add, implement, refactor, or remove ABAP code ' +
+  'or DDIC metadata. Reading is SAPRead; searching is SAPSearch; dependency analysis is SAPContext; ' +
+  'local lint/formatting is SAPLint; SAP syntax checks use SAPRead(type="SYNTAX"). ';
+
+const SAPWRITE_BODY_ONPREM =
+  // The purpose and supported types already live in SAPWRITE_LEAD and the type property.
+  'Handles lock/modify/unlock automatically. TTYP needs rowType + optional rowTypeKind. ' +
+  'ENQU: SAPRead JSON in source; create needs primaryTable. Entries need explicit lockMode/parameterWanted; update refuses lockParameters=[]. Then SAPActivate. ' +
+  'Type codes are auto-normalized and case-insensitive (e.g., "CLAS/OC" → "CLAS"). For delete, only type and name are required (plus optional transport). ' +
+  'Source objects (PROG/CLAS/INTF/DDLS/DCLS/DDLX/BDEF/SRVD/TABL/INCL) write via /source/main. CLAS update: pass include=definitions|implementations|macros|testclasses to write a local include; omit for source/main. ' +
+  'TABL create: "TABL"/"TABL/DT" → transparent table (16-char name); "TABL/DS" → structure (30-char, namespaces OK); update/delete/activate auto-discover the subtype. ' +
+  'Metadata-XML writes (not /source/main): DOMA/DTEL (dataType, length, fixedValues, typeKind, labels, searchHelp; deactivateInputHistory=true disables input history); MSAG (messages array of {number, shortText}); SRVB (serviceDefinition, odataVersion V2/V4, optional category 0=UI/1=Web API; bindingType like "ODataV4-UI" auto-normalized). ' +
+  'SKTD/KTD (Markdown docs on a KTD-capable object; KTD aliases SKTD): create needs refObjectType (parent type+subtype, e.g. "DDLS/DF"); "name" MUST equal the parent name; update takes Markdown in source; then SAPActivate(type="SKTD"). ' +
+  // "group"/FUGR-must-exist and processingType live on their own property descriptions — not repeated here.
+  'FUNC: needs "group"; pass structured `parameters` for the signature (read back via SAPRead includeSignature=true). ' +
+  "INCL with group=: create/delete FUGR structural includes ([/NS/]L<GROUP>…, e.g. /NS/LFOOF01); verify the main program's INCLUDE line after create. " +
+  'edit_method: replace one CLAS method body via source (95% fewer tokens than full-class). Local-class methods use the qualified specifier (e.g. "lhc_project~approve_project"); auto-routing: lhc_*/lcl_* → implementations, ltc_* → testclasses (override with include=); zif_*~* stays on /source/main. ' +
+  'edit_unit/add_unit: replace/add one FORM/MODULE in PROG/INCL using unit+source; group= supports FUGR includes. ' +
+  'batch_create: preflight all objects, then create+activate in dependency order; failures report per-object persistence. scaffold_rap_handlers / generate_behavior_implementation: derive RAP behavior-pool handlers from the BDEF (the latter auto-discovers the BDEF via rootEntityRef and activates by default). ' +
+  'Server-driven objects (discovery-gated): AFF JSON source (DTSC/DSFD/DTDC/DRTY: DDL); create/update/delete. APLO/UIAD save active; others need SAPActivate. SAJC/SAJT create require source.generalInformation.className/catalogName. ' +
+  'edit_text_symbols: CLAS/PROG/FUGR textPart=symbols (default; one "@MaxLength:NN\\nNNN=text" per symbol, blank-line separated), selections ("PARAM=Label") or headings. CLAS: symbols only. Immediately active; needs ADT textelements. ' +
+  'Full per-type field reference: docs_page SAPWrite. ';
+
+const SAPWRITE_BODY_BTP =
+  'BTP ABAP Environment: handles lock/modify/unlock automatically. ' +
+  'Must use ABAP Cloud language version (no classic statements); only Z*/Y* namespace. Type codes are auto-normalized (e.g. "CLAS/OC" → "CLAS"). For delete, only type and name are required (plus optional transport). ' +
+  'Source objects (CLAS/INTF/DDLS/DCLS/DDLX/BDEF/SRVD/TABL) write via /source/main. CLAS update: pass include=definitions|implementations|macros|testclasses for a local include; omit for source/main. ' +
+  'Metadata-XML writes (not /source/main): DOMA/DTEL (dataType, length, fixedValues, typeKind, labels, searchHelp; deactivateInputHistory=true disables input history); MSAG (messages array of {number, shortText}); SRVB (serviceDefinition, odataVersion V2/V4, optional category 0=UI/1=Web API). ' +
+  'SKTD/KTD (Markdown docs on a KTD-capable object; KTD aliases SKTD): create needs refObjectType (e.g. "DDLS/DF"); "name" MUST equal the parent name; update takes Markdown in source; then SAPActivate(type="SKTD"). ' +
+  'edit_method: replace one CLAS method body via source. Local-class methods use the qualified specifier (e.g. "lhc_project~approve_project"); auto-routing lhc_*/lcl_* → implementations, ltc_* → testclasses (override with include=). ' +
+  'batch_create: preflight all objects, then create+activate in dependency order; failures report per-object persistence. scaffold_rap_handlers / generate_behavior_implementation: derive RAP behavior-pool handlers from the BDEF (the latter auto-discovers via rootEntityRef and activates by default). ' +
+  'ENQU: SAPRead JSON in source; create needs primaryTable. Entries need explicit lockMode/parameterWanted; update refuses lockParameters=[]. Then SAPActivate. ' +
+  'Server-driven objects (discovery-gated): AFF JSON source (DTSC/DSFD/DTDC/DRTY: DDL); create/update/delete. APLO/UIAD save active; others need SAPActivate. SAJC/SAJT create require source.generalInformation.className/catalogName. ' +
+  'Full per-type field reference: docs_page SAPWrite. ';
+
+// Appended to both SAPWrite descriptions (see the composition at the bottom). The schema lists every
+// optional field for every object type/action, but each call uses only a small subset — GPT/OpenAI
+// callers tend to fill the rest with empty/null/placeholder values. Runtime normalization is the
+// backstop. Keep this guide compact: restoring the older field-by-field version exceeds the
+// enforced standard and BTP full-tool token ratchets. Detailed field guidance lives in docs_page/.
+const SAPWRITE_MINIMAL_PAYLOAD_GUIDE =
+  'MINIMAL PAYLOAD: send only required fields; omit unrelated empty, null, or placeholder values. ' +
+  'Do NOT send `include` unless type=CLAS. Delete needs only {action, type, name} (plus optional transport). ';
+
+// Purpose first, per-type reference, then payload hygiene last: the guide is call-time guidance and
+// does not belong where a model is deciding which tool to pick.
+export const SAPWRITE_DESC_ONPREM = SAPWRITE_LEAD + SAPWRITE_BODY_ONPREM + SAPWRITE_MINIMAL_PAYLOAD_GUIDE;
+export const SAPWRITE_DESC_BTP = SAPWRITE_LEAD + SAPWRITE_BODY_BTP + SAPWRITE_MINIMAL_PAYLOAD_GUIDE;

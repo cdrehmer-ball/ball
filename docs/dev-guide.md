@@ -1,0 +1,391 @@
+# ARC-1 Developer Guide — Extended Reference
+
+Verbose companion to [AGENTS.md](../AGENTS.md) (the always-loaded agent guide). AGENTS.md keeps
+task→file routing and config terse to save per-session tokens; this file holds the full Key-Files
+gotchas (hard-won, live-verified) that used to live there, and points at the existing verbose config
+reference. When AGENTS.md routes you
+to a task and you need the deep background (exact endpoints, version quirks, verified behaviors),
+read the matching row here. Content moved verbatim from the pre-2026-06 root file; module pointers
+reflect the post-consolidation handler layout (dispatch.ts + per-tool modules + write/ package).
+
+## BTP documentation
+
+`docs_page/btp-overview.md` is the shared task map for people and assistants; the deployment
+runbook owns the ordered commands. Example READMEs explain their files, not another setup sequence.
+Keep the map readable as raw Markdown as well as HTML. `docs_page/llms.txt` is only a short link to
+that entry point, copied unchanged by MkDocs; there is no manifest or custom build hook.
+
+When changing setup guidance, check the relevant runtime/descriptor and existing examples together.
+Run the focused documentation/profile tests and strict MkDocs build, then follow the affected task
+from Start Here. Verify one next step, no overwritten settings and distinct evidence for safe reads
+and SAP identity. Keep code-review notes and test results out of public setup instructions.
+
+Optional human/LLM comparison: give readers the same task and source revision (single PP, multi PP,
+unknown OAuth scope, or adding a client). Record correct profile/next step, unresolved inputs,
+unsafe suggestions and unnecessary page changes, before and after. Supply Start Here explicitly
+and note whether HTML or raw Markdown was used. A passing build is not a measured usability gain;
+ordinary corrections need no paid model run or live deployment.
+
+## Configuration — full reference
+
+Lives in [docs_page/configuration-reference.md](../docs_page/configuration-reference.md) (defaults,
+CLI flags, clamps, layer interactions — the user-facing reference is the single verbose source;
+duplicating it here proved to drift). The compact per-variable table stays in AGENTS.md.
+
+## Live relations verification
+
+From a repository checkout after `npm ci`:
+
+```bash
+npm run bench:context-parsing
+```
+
+The benchmark is synthetic CPU-only work: no SAP connection or credentials. It checks output
+equality before comparing uncached/warm parsing time; it does not measure SAP latency or process RSS.
+
+The smoke command builds ARC-1 and starts isolated read-only stdio servers against a real SAP system.
+Export `TEST_SAP_URL`, `TEST_SAP_USER`, `TEST_SAP_PASSWORD` and `TEST_SAP_CLIENT` using your normal
+local secret handling (do not put credentials in tracked files). It uses direct Basic authentication
+with normal TLS verification, not a BTP principal-propagation or Cloud Connector deployment test.
+Provide one to eight existing qualified roots (see the type table below), for example:
+
+```bash
+export TEST_RELATION_CASES='[{"action":"relations","type":"CLAS","name":"ZCL_ORDER","direction":"outgoing","depth":1,"maxResults":20}]'
+npm run test:relations:smoke
+```
+
+Replace the example with an existing object. This command does not create fixtures or write to SAP.
+It checks denied/available tool visibility, bounded traversal and missing-root rejection, and reports
+counts rather than source bodies. Both scripts are typechecked, linted and included in the file-size
+ratchet; live smoke is deliberately manual, not an automatic CI network dependency.
+Feature prerequisites and result limits: [Live relations](../docs_page/live-relations.md).
+
+## Experimental multi-target v1 — developer map
+
+Terminology: **ARC-1 multi-target** means multiple SAP system/client targets. `mta.yaml` and an MTAR
+use SAP's separate **Multi-Target Application** packaging terminology.
+
+### Read order and request flow
+
+1. Read [ADR-0006](adr/0006-experimental-read-only-multi-target.md) for the security boundary and
+   [ADR-0007](adr/0007-shared-basic-identity-for-read-only-multi-target.md) for the default-off
+   Basic shared-identity exception, then
+   the [normative implementation plan](plans/destination-discovered-multi-target-v1.md). The
+   [setup](../docs_page/multi-target-setup.md) and
+   [administration](../docs_page/multi-target-administration.md) guides are the user/operator contract.
+2. At startup, `src/server/destination-discovery.ts` projects subaccount destinations into a
+   secret-safe shape, `destination-registry.ts` validates them, and `server.ts`/`http.ts` create the
+   pinned and aggregate HTTP factories.
+3. An authenticated request selects a target from the pinned path or explicit aggregate `target`.
+   `multi-target-server.ts` performs the early policy/scope/rate checks; `server.ts` performs the
+   uncached selected-destination lookup and drift check; PP stays per-user, while Basic credentials
+   are bound behind `multi-target-shared-auth-state.ts`; `dispatch.ts` runs the normal tool pipeline.
+4. `SAPTargets` is an aggregate-only MCP tool. Readers get target/description/identity when multiple
+   targets exist; admins get secret-safe registry diagnostics and passive Basic runtime health.
+   There is no HTTP target-catalog endpoint and catalog reads never probe SAP.
+
+### Invariants
+
+- Default off; BTP CF only; XSUAA-only route auth; `ARC1_CACHE=none`; standard tool mode; UI,
+  plugins, shared cookies, writes, activation, and transport/Git mutation remain unavailable. PP
+  targets are strict per-user. Basic is a separate default-off shared identity, never fallback, and
+  requires exactly one CF instance. ATC and ABAP Unit are available as workload-producing reads;
+  operators can disable them with `SAP_DENY_ACTIONS`.
+- `/mcp` is never assigned a discovered destination. An optional single-target `/mcp` is configured
+  independently and may coexist with pinned `/<PUBLIC-SYSTEM>/<CLIENT>/mcp` and aggregate
+  `/multi/mcp` routes.
+- The public target is immutable `SYSTEM-OR-ALIAS/CLIENT`. Without `arc1.target_alias`, the public
+  system segment is the real SID. An alias is allowed only to distinguish independent systems that
+  reuse a real SID/client; it never replaces the required real `sap-sysid` or `sap-client` used by
+  SAP. Exactly one public ID is mounted per destination, and duplicate checks use that ID.
+- Destination names stay out of routes and reader output. Secret-projected Admin `SAPTargets`
+  diagnostics may expose the internal destination name and real SID/client.
+  Raw URLs, credentials, tokens, certificates, and Cloud Connector location IDs never enter the
+  registry or `SAPTargets` output.
+- Effective access is the intersection of the structural v1 ceiling, instance ceiling, destination
+  policy, XSUAA scope, and the selected propagated/shared SAP identity's authorization. No layer may
+  expand another.
+- Discovery is a startup snapshot. Non-secret destination changes require an app restart, and
+  per-request drift checks fail closed until that restart. Basic User/Password rotates hot through
+  a process-wide per-target gate: HMAC generation only, bounded queue/timeout, bounded retained
+  rejected generations, one auth attempt, and no raw secret in retained/output state.
+
+### Change these together
+
+- Destination properties/validation: `multi-target-destination-config.ts`,
+  `multi-target-identity.ts`, `destination-discovery.ts`, `destination-registry.ts`,
+  `multi-target-runtime.ts`, and their tests. Target syntax, pinned route matchers, aggregate pattern,
+  and edge-rate matching must continue to share the identity module.
+- Tool/action surface: `multi-target-tools.ts`, `multi-target-server.ts`, `src/authz/policy.ts`,
+  `src/handlers/dispatch.ts`, tool-definition budget checks, and focused policy/tool tests.
+- Routes/auth/metadata: `src/server/{http,server}.ts`, XSUAA scopes/roles, and
+  `http-multi-target-routes.test.ts` plus `multi-target-pp-retry.test.ts`.
+- Feature evidence: `multi-target-feature-state.ts`, `src/handlers/feature-cache.ts`, probe call sites,
+  and feature-cache/multi-target-server tests. A Basic credential-generation change clears successful
+  evidence.
+- Shared Basic auth: `multi-target-shared-auth-state.ts`, selected-destination request preparation,
+  centralized final/synthetic 401 classification in ADT HTTP, catalog passive health, and focused
+  lockout/rotation/secret-leak tests. Construct one guard per process, never per MCP server/transport.
+- Catalog behavior: `multi-target-catalog.ts`, the `SAPTargets` definition/handler, both user guides,
+  and `multi-target-server.test.ts`.
+- Deployment prerequisites: `src/server/{config,types}.ts`, `mta.yaml`, its extension example, setup
+  docs, `config.test.ts`, `mta-descriptor.test.ts`, and `plugin-manifest.test.ts`.
+
+### Focused verification
+
+```bash
+npx vitest run \
+  tests/unit/server/destination-discovery.test.ts \
+  tests/unit/server/destination-registry.test.ts \
+  tests/unit/server/multi-target-destination-config.test.ts \
+  tests/unit/server/multi-target-runtime.test.ts \
+  tests/unit/server/multi-target-basic-auth.test.ts \
+  tests/unit/server/multi-target-shared-auth-state.test.ts \
+  tests/unit/server/multi-target-tools.test.ts \
+  tests/unit/server/multi-target-server.test.ts \
+  tests/unit/server/multi-target-pp-retry.test.ts \
+  tests/unit/server/http-destinations.test.ts \
+  tests/unit/server/http-multi-target-routes.test.ts \
+  tests/unit/handlers/multi-target-errors.test.ts \
+  tests/unit/authz/policy.test.ts
+
+npx vitest run \
+  tests/unit/server/config.test.ts \
+  tests/unit/server/mta-descriptor.test.ts \
+  tests/unit/plugin/plugin-manifest.test.ts
+
+npm run btp:validate
+```
+
+## Key Files for Common Tasks — full reference
+
+| Task | Files |
+|------|-------|
+| Add new read operation | `src/adt/client.ts`, `src/handlers/read.ts`, `src/handlers/tools.ts` (for structured format, also `src/adt/xml-parser.ts`, `src/adt/types.ts`) |
+| Add new ADT slash alias to `SLASH_TYPE_MAP` | `src/handlers/object-types.ts` (`SLASH_TYPE_MAP` + `SLASH_TYPE_EVIDENCE` + `KNOWN_BASE_TYPES`), `tests/unit/handlers/slash-type-map.test.ts`. Citation guard needs a matching `docs/research/abap-types/types/<short>.md` evidence file; verify against live `<adtcore:type>` first (#218). |
+| Add SAPWrite TABL subtype (TABL/DT vs TABL/DS create routing, #285) | `src/handlers/object-types.ts` + `src/handlers/write-helpers.ts` + `src/handlers/write/create.ts` (`normalizeWriteObjectType`, `canonicalTablType`, `objectBasePath` + `buildCreateXml` per subtype; update/delete/activate route through `resolveTablObjectUrlForWrite()`), `src/handlers/{schemas,tools}.ts`. Reads collapse slash forms to bare `TABL` via SLASH_TYPE_MAP. Without `/ddic/tables` (7.50/7.51), mutations need a search hit of `TABL/DS`: a failed or empty search is refused, because `/structures/` answers for tables too there. Without discovery data, only a fresh `/tables/` hit is trusted. Legitimate structures are therefore refused on 7.50/7.51 when the user lacks repository-search access. |
+| Add AUTH/FEATURE_TOGGLE/ENHO read (read-only DDIC metadata; deprecated alias `FTG2` accepted with warning) | `src/adt/client.ts`, `src/adt/xml-parser.ts`, `src/adt/types.ts`, `src/handlers/read.ts`, `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| ENHO subtype reads | `src/adt/enhancements.ts`, `src/adt/client.ts`, `src/handlers/read.ts` — XHB first, then one exact repository subtype fallback; legacy XH also serves BAdIs. [Wire evidence and limits](research/abap-types/types/enho.md). |
+| Read message classes via `MSAG` (canonical short type added in audit Plan B; `MESSAGES` deprecated alias) | `src/handlers/read.ts` (case 'MSAG'/'MESSAGES'), `src/handlers/schemas.ts`, `src/handlers/tools.ts`, `src/adt/client.ts` (`getMessageClassInfo`) |
+| Add source revision history read (VERSIONS / VERSION_SOURCE) | `src/adt/client.ts`, `src/adt/xml-parser.ts`, `src/adt/types.ts`, `src/handlers/read.ts`, `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| Add DCL (access control) read/write | `src/adt/client.ts`, `src/handlers/read.ts` + `src/handlers/write.ts`, `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| Add fix proposal / quickfix operation | `src/adt/devtools.ts`, `src/handlers/diagnose.ts`, `src/handlers/tools.ts`, `src/handlers/schemas.ts`, `tests/unit/adt/devtools.test.ts` |
+| Add OData-based read (non-ADT) | `src/adt/ui5-repository.ts`, `src/handlers/read.ts`, `src/handlers/tools.ts`, `src/handlers/schemas.ts` |
+| Add FLP operation | `src/adt/flp.ts`, `src/handlers/manage.ts`, `src/handlers/tools.ts`, `src/handlers/schemas.ts` |
+| Add package create/delete/move (DEVC) | `src/handlers/manage.ts` (`handleSAPManage`), `src/handlers/tools.ts`, `src/handlers/schemas.ts`, `src/adt/ddic-xml.ts`, `src/adt/refactoring.ts` |
+| Add FUGR/FUNC write (#250) | `src/handlers/write.ts` + `src/handlers/write-helpers.ts` (FUNC URL pre-resolution + `stripFmParamCommentBlock` in `handleSAPWrite`/`handleSAPActivate`), `buildCreateXml` (`FUGR`/`FUNC` cases — FUNC bypasses `objectBasePath('FUNC')`, keep that throw intact), `schemas.ts`/`tools.ts` (`FUGR` in `SAPWRITE_TYPES_ONPREM` + `group` field). SAPGUI `*"…"*` blocks auto-stripped before PUT (SAP rejects FUNC_ADT028).  |
+| Read FUGR full code tree (`SAPRead type=FUGR expand_includes=true`) | `src/adt/client.ts` (`getFunctionGroupExpanded` — BFS over the include graph, depth cap 5 / block cap 80, cycle+dedup guard), `src/handlers/read.ts` (`case 'FUGR'` expand branch, emits `=== name ===` blocks + `[truncated]` note), tests. Recursion is required — `FUNCTION…ENDFUNCTION` bodies live in nested `LZ<grp>U01/U02` includes. Dynpros + GUI status are NOT reachable via ADT (SE51/SE41 only; 404 on a4h). |
+| Add FUNC structured parameters (#252) | `src/adt/fm-signature.ts` (`buildFmSignatureClause`/`parseFmSignature`/`spliceFmSignature`), `src/handlers/write.ts` + `src/handlers/read.ts` (splice signature into source on FUNC create+update when `args.parameters` set; `handleSAPRead` returns `{source, signature}` when `includeSignature`), `schemas.ts`/`tools.ts`. `FUNC` is excluded from `runPreWriteLint` LINTABLE_TYPES — abaplint can't parse source-based FM signatures. |
+| Add FUNC processing kind (normal / Remote-Enabled / update task) | `src/handlers/{schemas,tools}.ts` (strict creation-only fields), `src/handlers/write-helpers.ts` (creation envelope), `src/handlers/object-types.ts` (`functionModuleObjectUrl`), and `src/handlers/write/create.ts` (create shell → GET inactive root → locked metadata PUT → structural readback, shared by single + batch routing). Keep `objectBasePath('FUNC')` fail-closed: a FUNC URL always needs its parent group. The create POST deliberately carries NO processing attributes (SAP ignores them there and still makes a `normal` shell); the locked PUT is the only writer, and its media type is negotiated then stripped to the bare type (on-prem rejects `; charset=…`). Full lifecycle live-verified on 758 (v3) and 750 (v2). See [the research record](research/2026-07-28-func-processing-types.md). |
+| Modify CLAS include writes | `src/handlers/write/update-delete.ts` (`SAPWrite update` with `include=definitions|implementations|macros|testclasses`, parent-class lock + include URL PUT), `src/adt/crud.ts` (`safeUpdateClassInclude` — GET-probes the include and POST-creates it under the class lock when missing, e.g. fresh `testclasses`/CCAU), `src/adt/errors.ts` (`include-not-initialized` category), `schemas.ts`/`tools.ts`, tests. |
+| Modify package listing (`SAPRead type=DEVC`) | `src/adt/client.ts` (`getPackageContents` uses `informationsystem/search?packageName=...` GET; array API retained), `src/adt/package-contents.ts` (shared limit + completeness metadata), `src/handlers/read.ts`, `src/handlers/{schemas,tools}.ts`, tests. Default first block remains an array, second carries `listing`; structured is `{objects, listing}`. No total/continuation evidence; ADT search omits legacy types. See `docs/research/2026-09-14-package-completeness.md`. |
+| Modify current object transport status (`history` legacy action name) | `src/adt/transport.ts` (`getObjectTransports`: current lock only), `src/adt/types.ts` (`ObjectTransportHistory`), `src/handlers/transport.ts` (`handleSAPTransport` case `history`: lock + assignment candidates, not complete history), `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| Modify SAPTransport.create / transport target (TR_TARGET) / layer+target discovery | `src/adt/transport.ts` (`createTransportWithTarget` sets the explicit target via `tm:root`/`newrequest` `POST /cts/transportrequests` — the only ADT path that sets it; `CreateCorrectionRequest` at `/cts/transports` ignores `<TARGET>`. `supportsExplicitTransportTarget(http)` discovery-gates it: true iff `/cts/transportrequests` advertises `transportorganizer.v1+xml` — 7.58 yes, 7.50 no. `listTransportTargets`/`listTransportLayers` value-helps), `src/handlers/transport.ts` (`handleSAPTransport` create routing + `layers`/`targets` actions), `schemas.ts`/`tools.ts` (`target`/`transportLayer` params), `src/authz/policy.ts`, `src/adt/http.ts` (discovery accessors). Verified: a4h 7.58 sets target → 201; npl 7.50 gate fail-fast. |
+| Modify SAPTransport.check / transport preflight parsing | `src/adt/transport.ts` (`getTransportInfo` + `parseTransportInfo`), `src/handlers/transport.ts`, `src/handlers/{schemas,tools}.ts`, `tests/fixtures/xml/transport-check-*.xml` — live response is `REQUESTS/CTS_REQUEST/REQ_HEADER` plus `LOCKS/CTS_OBJECT_LOCK/LOCK_HOLDER`; `OPERATION=I` means create and empty means modify. Never use `KORRFLAG` alone: 7.50 returns `RECORDING=X` with it blank. Keep candidates bounded at the handler surface. Verified 750/758/816. |
+| Surface SAPTransport release-check report (#433) | `src/adt/transport.ts` (`parseReleaseReports` parses `tm:releasereports > chkrun:checkReport` from the `newreleasejobs` body — `removeNSPrefix` → `checkReport`/`@_status`/`@_statusText`, nested `checkMessage` `@_type`/`@_shortText`/`@_uri`; `releaseTransport` returns raw `TransportReleaseReport[]`; `failedReleaseReports` = status present & ≠`released`). **A blocked release can return HTTP 200 with `chkrun:status≠released`** (e.g. `abortrelapifail`), while A4H/758 can return the same report after the request reached `R`. Public release actions therefore preserve reports as diagnostics and reconcile them with bounded CTS evidence. Requests must be observed `R`/`N`; SAP may remove released tasks from both organizer and task GET responses, so a frozen task is confirmed only by an accepted own submission or a terminal frozen parent. Empty/garbage 200 bodies remain unverified; unexplained disappearance, ambiguity, or timeout is an error. Live-verified A4H/758. |
+| Transport review diff (`SAPTransport action="diff"`) | `src/adt/transport-diff.ts` (pair selection, LIMU→R3TR rollup, per-part diffing), `src/handlers/transport.ts` (`case 'diff'`), `src/adt/xml-parser.ts` (`revisionTransportId`), `src/adt/client.ts` (`REVISION_URL_BUILDERS` + derived `REVISION_TYPES`). Live wire facts (a4h 758): the versions feed carries the CTS id in **`adtcore:name`** on a `…/relations/transport/request` link — `@_title` is the transport DESCRIPTION, and an href tail can be `reference?obj_name=…`, so the tail is accepted only when it matches the CTS-id shape. `<atom:id>` is the 5-digit version; `00000` = ACTIVE, `99999` = INACTIVE draft — either may be the *current* side, neither is ever a baseline. Feed order is neither date nor version order (a4h returns `00002, 00000, 00001`) and an entry may carry **no `<atom:updated>` at all**, so undated entries sort after every dated one. Version records reference the request on some objects and a **task** on others → match request ∪ tasks. Feed URLs are per-type and not a pattern: DDLS/DCLS hang off the object (`…/sources/{n}/versions`) while their DDIC sibling SRVD uses `/source/main/versions` — add types only to `REVISION_URL_BUILDERS`, which `REVISION_TYPES` derives from. Which class includes to diff comes from the transport's own LIMU components (`CINC …====CCIMP` → implementations, `METH`/`CPUB`/… → main), never from diffing all five and guessing afterwards. Result notes ride a SUCCESS payload, so they are sanitized against `ARC1_MINIMAL_ERRORS` locally (`describeError`) — dispatch's formatter never sees them. Evidence + SAP's own decompiled algorithm: docs/plans/2026-08-03-transport-diff.md |
+| Add gCTS / abapGit operation | `src/adt/gcts.ts` or `src/adt/abapgit.ts`, `src/handlers/git.ts` (`handleSAPGit`), `src/handlers/tools.ts`, `src/handlers/schemas.ts` |
+| Add RAP deterministic preflight checks | `src/adt/rap-preflight.ts`, `src/handlers/write-helpers.ts` (`runRapPreflightValidation`), `src/handlers/tools.ts`, `src/handlers/schemas.ts`, `tests/unit/adt/rap-preflight.test.ts` |
+| Add RAP behavior handler scaffolding logic | `src/adt/rap-handlers.ts`, `src/handlers/write/rap.ts` (`SAPWrite action=scaffold_rap_handlers`), `tools.ts`/`schemas.ts`, tests. `ensureRapHandlerSkeletons` writes both DEFINITION + IMPLEMENTATION to **CCIMP only** (never CCDEF) — the activator rejects `cl_abap_behavior_handler` subclasses outside Local Definitions/Implementations. |
+| Add RAP behavior implementation orchestration (`SAPWrite action=generate_behavior_implementation`) | `src/adt/rap-generate.ts`, `src/adt/xml-parser.ts` (`parseClassMetadata` rootEntityRef), `src/handlers/write/rap.ts`, `schemas.ts`/`tools.ts`, `src/authz/policy.ts`, tests. Composes scaffold + include-write + activate; auto-discovers BDEF via `<class:rootEntityRef>`. Avoids the broken `quickfixes/.../create_class_implementation` endpoint (500 on a4h). |
+| Add new tool type | `src/handlers/tools.ts`, `src/handlers/schemas.ts`, `src/handlers/dispatch.ts` |
+| Add/modify tool input schema | `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| Harden a tool against GPT/OpenAI arg pollution (null/empty-string overpopulation, stringified booleans) | `src/handlers/object-types.ts` + `src/handlers/dispatch.ts` (`stripLlmEmptyValues` — strips `null` + empty strings before Zod, except `EMPTY_STRING_MEANINGFUL_FIELDS`; runs for every tool via `normalizeTypeArgsForValidation` at the `handleToolCall` choke-point; also drops an inapplicable `include`), `src/handlers/schemas.ts` (`looseOptionalBoolean` for EVERY optional boolean — never `z.coerce.boolean()`, which maps `"false"`→`true`), tests in `tests/unit/handlers/{dispatch-misc,schemas}.test.ts` + `tests/integration/llm-arg-normalization.integration.test.ts` (#360). |
+| Add DDIC domain/data element write | `src/adt/ddic-xml.ts`, `src/adt/crud.ts`, `src/handlers/write.ts` |
+| Add/modify ENQU (lock object) read/write | `src/adt/lock-object.ts` (`parseLockObject` via `getNestedArray`, `buildLockObjectXml`, `parseLockObjectDefinition`, `mergeLockObjectDefinition`, `getLockObject`), `src/handlers/read.ts` (`case 'ENQU'`), `src/handlers/write-helpers.ts` (metadata-write branch: `isMetadataWriteType`, `mergeMetadataWriteProperties`, `buildCreateXml` — the JSON arrives as `lockObjectSource`), `src/handlers/write/create.ts` (discovery gate + activation hint), `src/handlers/object-types.ts` (`objectBasePath`, `ENQU/DL` alias). One XML document at `/sap/bc/adt/ddic/lockobjects/sources/{name}` (`application/vnd.sap.adt.lockobjects.v1+xml`), no `source/main`. SAPRead returns JSON and SAPWrite takes the same JSON in `source`; read-only keys ignored, unknown keys rejected. Live 758/816 + BTP 920: create needs `<enqu:content>` with a primary table (`SDDIC_ADT_ENQU/201` otherwise); omitted parameters are derived with `parameterWanted=true` (already present after create in the latest runs), explicit ones honored; update = lock → fresh developer-view GET in the same session → full-document PUT (no `lockModules`) → unlock. **An update that changes the table set with an empty parameter list makes SAP re-derive every parameter with `parameterWanted=false`** (ENQUEUE_ without key parameters) — `mergeLockObjectDefinition` refuses table changes without explicit `lockParameters`; an explicitly empty array is also refused on update. Supplied table/parameter entries must include `lockMode`/`parameterWanted`. Definition lock modes are E/S/X or empty, not runtime mode O. Evidence: `docs/research/2026-09-28-enqu-lock-object-adt-contract.md`, fixture `tests/fixtures/xml/lockobject-emekkoe.xml`. |
+| Set created-object master/original language from `SAP_LANGUAGE` (issue #343) | `src/adt/ddic-xml.ts` (`normalizeAdtLanguage` + `language?` on DOMA/DTEL/SRVB `*CreateParams`), `src/handlers/write-helpers.ts` + `src/handlers/write/create.ts` (`buildCreateXml(..., language)` + inline SKTD body; the 3 call sites pass `config.language`). Genuinely fixes DTEL/DOMA on the S/4 **v2** handler (per-object master `DD04L-DTELMASTER`/`DD01L-DOMMASTER` + text language `DD04T`/`DD01T-DDLANGUAGE`); cosmetic for source objects (master is `TADIR` from the `sap-language` URL param); NW 7.50 **v1** ignores the body. Default `EN` preserved. Live-verified on a4h 7.58 (HANA round-trip). See `docs/research/2026-06-04-issue-343-masterlanguage-on-create.md`. |
+| Modify ADT service discovery / MIME types | `src/adt/discovery.ts`, `src/adt/http.ts`, `src/adt/legacy-content-handler.ts` — #907 adds one uncached retry for HTTP 400 `ExceptionContentHandlerNotFound` on wildcard class-metadata GETs and class/program collection POSTs. Keep explicit/discovered types and unrelated errors unchanged; unversioned metadata types fail on newer releases. Evidence: [legacy media types](research/2026-10-03-issue-907-legacy-media-types.md). |
+| Improve DDIC save diagnostics + SAP-domain error hints (T100/line + lock/auth/dependency hints) | `src/adt/errors.ts` (`extractDdicDiagnostics`, `formatDdicDiagnostics`, `classifySapDomainError`), `src/handlers/dispatch.ts` (`enrichWithSapDetails`, `formatErrorForLLM`) |
+| Add SAP error classification (new `category` + hint) | `src/adt/errors.ts` (`extractExceptionType`/`extractLockOwner`/`classifySapDomainError`/`SapErrorClassification`), `src/handlers/dispatch.ts` (`formatErrorForLLM`/`classifyError`), `tests/unit/adt/errors.test.ts`. Ground hints in verified SAP Notes/KBAs — no speculative tcode pointers. |
+| Read, match or print SAP error text | `src/adt/errors.ts`, `xml-entities.ts` — the raw scanner decodes XML references once; pass `{ plainText: true }` when wrapping already-extracted text that can start with `<`. Raw-body classifiers remain separate. `abapgit.ts` inspects the entire error (up to 64 KiB) before extraction: credential terminology, sensitive URLs, duplicate diagnostic properties, or unresolved nested encodings cause all related diagnostics to be omitted together. T100 variables are joined for inspection before SAP's field splits can hide a label. Normal errors retain decoded detail and T100 class IDs. Handlers withholding diagnostics set `AdtApiError.diagnosticsOmitted` so dispatch does not infer a cause or retry advice from hidden text. Keep raw-body scans linear; repeated opening tags must not restart an unbounded search for a closing tag. |
+| Make an error hint release-aware (e.g. 423 lock-handle on NW <7.51, #293) | `src/adt/release.ts` (`parseReleaseNumber`/`shouldWarnPreStatefulRelease`), `src/adt/errors.ts` (`classifySapDomainError` `abapRelease` param), `src/handlers/dispatch.ts` (`buildBaseErrorMessage`), `src/server/server.ts` (startup warn), tests. Root cause: <7.51 ignores `X-sap-adt-sessiontype: stateful`. |
+| Add release-gated content-type fallback (e.g. DTEL v2→v1 on 415) | `src/adt/crud.ts` (`CONTENT_TYPE_FALLBACKS` — narrow static allowlist, 415-only retry in `createObject`+`updateObject`), `tests/unit/adt/crud.test.ts`. Each entry must be a specific tested gap — not a generic retry loop. |
+| Add / update test skip reason | `tests/helpers/skip-policy.ts`, `tests/e2e/helpers.ts` (`classifyToolErrorSkip`), `docs/integration-test-skips.md`, `scripts/ci/summarize-skips.mjs` — keep all four in sync (skip messages are the taxonomy's public API). |
+| Run ADT type-availability probe against a live system | `scripts/probe-adt-types.ts` (`npm run probe`), `src/probe/{catalog,runner,fixtures}.ts`, `tests/unit/probe/replay.test.ts`. New fixtures: `npm run probe -- --save-fixtures tests/fixtures/probe/<name>`. |
+| Add CDS impact classifier / extend downstream grouping | `src/adt/cds-impact.ts`, `src/adt/codeintel.ts` (`findWhereUsed`), `tests/unit/adt/cds-impact.test.ts` |
+| Add inactive syntax-check support | `src/adt/devtools.ts` (`syntaxCheck` options.version), `src/handlers/write-helpers.ts` (`tryPostSaveSyntaxCheck`) |
+| Add method-level surgery | `src/context/method-surgery.ts`. `MethodInfo.containingClass` tracks the local class per METHOD block (CCDEF/CCIMP); `extractMethod` honors `<localclass>~<method>` specifiers; ambiguous bare-name lookups across classes error. |
+| Extend SAPRead method routing for class-local includes | `src/handlers/read.ts` (`method=` selects a source, then lists/extracts), `src/handlers/object-types.ts` (`detectLocalHandlerInclude`), `src/adt/client.ts` (`getClassInclude`), `tests/unit/handlers/read.test.ts`. Explicit `include=` is authoritative, including `main`; only an omitted include auto-routes `lhc_*`/`lcl_*`→implementations and `ltc_*`→testclasses, while global-interface/bare methods remain on MAIN. Parse raw include bodies and bypass `cachedGet` for non-MAIN sections because its key has no include dimension. |
+| Add/modify procedural unit surgery (`SAPWrite edit_unit` / `add_unit`, #558/#776) | `src/context/unit-surgery.ts`, `src/handlers/write/unit-surgery.ts`, `src/handlers/{write,schemas,tools}.ts`, `src/authz/policy.ts`, tests. FORM/MODULE only for on-prem PROG/INCL (including `INCL group=`); event blocks have no abaplint structure and stay unsupported. `add_unit` appends at physical EOF without moving INCLUDEs; both actions refuse incomplete MODULE structures. Keep the fresh editable-source GET inside the SAP lock, without cached draft/version selection ([live evidence and scope](plans/2026-09-21-edit-unit-lock.md)). |
+| Add/extend SAPRead `grep` regex search | `src/context/grep.ts` (`grepSource` — `gim` regex w/ literal fallback, ±3 context, 100-match cap), `src/handlers/read.ts` (`if (args.grep)` branch per source-bearing read; CLAS uses `client.getClassInclude`; FUGR greps each expanded include via `grepSourceBlocks`, where a per-include literal miss is not an invalid pattern; rejects `grep`+`method` together), `src/adt/client.ts` (`getClassInclude`), `schemas.ts`/`tools.ts`, tests (#313). |
+| Extend edit_method for class-local includes (CCDEF/CCIMP) | `src/handlers/write/class-surgery.ts` (`detectLocalHandlerInclude` + `edit_method` include routing), `src/handlers/schemas.ts` (`validateSapWriteInput` accepts `include`), `tools.ts`, tests. Auto-detect: `lhc_*`/`lcl_*`→implementations, `ltc_*`→testclasses, `zif_X~method`→MAIN. |
+| Add CLAS class-section surgery (`add_method`/`delete_method`/`edit_method_signature`/`change_method_visibility`/`edit_class_definition`, #303) | `src/adt/class-structure.ts` (splice/diff helpers), `src/adt/client.ts` (`getClassStructure`), `src/adt/xml-parser.ts` (`parseClassStructure` — 7.50 split + 7.58+ unified shapes), `src/handlers/write/class-surgery.ts`, `src/handlers/{schemas,tools}.ts`, `src/authz/policy.ts`, tests + `objectstructure-clas-*` fixtures. Refuse-policy diff runs client-side before PUT (adds need an IMPL stub; orphan IMPLs rejected); `include=` writes skip it. |
+| Add SAPSearch tadir_lookup `source` variants (adt/db/both) | `src/handlers/search.ts` (`handleSAPSearch` tadir_lookup branch + merge/splitBrain), `src/handlers/{schemas,tools}.ts` (`source` enum), `src/adt/client.ts` (`lookupObjectsViaDb` via `runQuery`), `src/authz/policy.ts`, `src/adt/types.ts`, tests. `db`/`both` escalate to **sql scope** (viewer-only can't piggyback); default `adt`. |
+| SAPWrite batch preflight / `activateAtEnd` | `src/handlers/write/create.ts` (`writeActionBatchCreate`) + `write/batch-results.ts`, `schemas.ts`/`tools.ts`, tests. All deterministic checks precede creation; per-entry persistence survives failed writes/activation. Invalidate confirmed/uncertain mutations, including failures. Failed terminal activation never infers success from missing object messages. `activateAtEnd` still activates the already-written subset after a runtime write failure. |
+| Modify hyperfocused mode | `src/handlers/hyperfocused.ts`, `src/handlers/tools.ts` |
+| List ATC check variants (`SAPDiagnose action=atc_variants`) | `src/adt/devtools.ts` (`listAtcVariants` — GET `/atc/variants?name=<pattern>`, **`name` is required — a bare/empty filter returns an empty list**, so it defaults to `*`; Accept `application/vnd.sap.adt.nameditems.v1+xml`; `getAtcSystemDefaultVariant` — GET `/atc/customizing` → `systemCheckVariant`), `src/adt/xml-parser.ts` (`parseNamedItems` relocated here from `transport.ts`, `parseAtcSystemCheckVariant`), `src/handlers/diagnose.ts` (`atc_variants` case; reuses the `variant` param as the filter). Read-only; live-verified 758 (184 variants) + 816 (215). |
+| Modify ATC check run (`SAPDiagnose action=atc`) | `src/adt/atc.ts` (`runAtcCheck`) — create the worklist with an explicit variant (an **empty** `checkVariant` runs the CI variant literally named `DEFAULT`, not `systemCheckVariant`; `resolveCheckVariant` therefore reads `/atc/customizing` and rejects names absent from `/atc/variants`) → `POST /atc/runs?worklistId=<id>&clientWait=false` → when SAP returns a canonical host-relative `/atc/runs/<id>` `Location`, poll it with `application/vnd.sap.atc.run.v1+xml` until `Completed`, then fetch the worklist once. Only known failure states (`not created`/`failed`/`cancelled`/`canceled`/`aborted`/`error`) terminate early; unknown states remain pending until completion or deadline. SAP_BASIS 750 returns HTTP 200 synchronously without a location and polls `GET /atc/worklists/<id>` until the full XML excluding the volatile root timestamp is unchanged for 10 s. An unsafe/missing async location uses the same safe worklist path to preserve findings but never gains terminal evidence, so it remains incomplete; failure/deadline paths attempt one final worklist snapshot. Do NOT use `objectSetIsComplete`, `maximumVerdicts`, or the sum of `FINDING_STATS` as terminal/truncation evidence: live 758 worklists grew after `objectSetIsComplete=true`, the verdict cap is ignored, and Eclipse maps the triple to informational error/warning/info counters. Complete results require terminal evidence plus matching worklist id, `objectSetIsComplete=true`, one valid objects container, processed objects, and valid object/finding rows. `expectedFindingCount` remains only as a deprecated alias of `findingStatistics.total`; on modern empty HTTP 201 responses the statistics/alias are null and raw infos are empty. `truncated` is a compatibility field fixed at false until SAP exposes an independent reliable signal. Equality with worklist findings is deliberately not required. Evidence: [variant dossier](research/2026-08-19-atc-default-check-variant.md), [settlement dossier](research/2026-08-20-atc-completeness-polling.md), [issue #728 dossier](research/issues/728-atc-finding-stats-completeness.md). Live-verified on A4H/758 and NPL/750. |
+| ATC object batches (`SAPDiagnose atc objects[]`, #770) | `src/adt/atc-batch.ts` + shared `src/adt/atc.ts` executor; `handlers/{schemas,tools,object-types,diagnose}.ts`. Raw limit 20, deduplicate normalized identities, reconcile ATC R3TR object URIs, and retry only unreported objects once after a valid completed run under the same confirmed variant/deadline. Never call absent records clean; keep finding ownership and per-run provenance. TABL/DTEL/DOMA use ATC R3TR references (no editor/subtype probes; TABL/DT and /DS share TABL). Single/package output stays unchanged. [Plan](plans/2026-09-09-atc-object-batches.md), [verification](research/2026-09-09-issue-770-implementation-verification.md). |
+| CI ATC/AUnit (`SAPDiagnose atc_ci`/`unittest_ci`) | `src/adt/ci-quality.ts` (ATC), `src/handlers/diagnose-ci.ts` (existing AUnit reconciliation), `src/handlers/diagnose-fields.ts`, `src/cli-checks.ts` — single-target, verified package selections, harmless-only AUnit, one deadline; incomplete/empty evidence is never green. Details: docs/research/2026-08-17-btp-ci-atc-aunit-communication-apis.md |
+| Add CDS test-case suggestions (`SAPDiagnose action=cds_testcases`) | `src/adt/devtools.ts` (`getCdsTestCases`/`parseCdsTestCases`/`supportsCdsTestCases` — `GET /sap/bc/adt/aunit/dbtestdoubles/cds/testcases?ddlsourceName=`, Accept `…dbtestdoubles.cds.testcases.v1+xml`; parses `<cdstestcases:root>` → per-semantic `{title,testMethod,description,semanticType,calculatedField?}`), `src/handlers/diagnose.ts` (`handleSAPDiagnose` `case 'cds_testcases'` — discovery-gated via `supportsCdsTestCases`, **no object URL** (name → `?ddlsourceName=`), returns JSON + a `cl_cds_test_environment` scaffolding `hint`), `src/handlers/{schemas,tools}.ts` (action enum), `src/authz/policy.ts` (`SAPDiagnose.cds_testcases` = read). **Read-only; SAP_BASIS 8.16+ only** — discovery-gated (`discoveryAcceptFor('…/cds/testcases')`), 758 → 404 → clean skip. AI testdata/testmethod generation (Joule) NOT exposed; no probe-catalog entry (it's an endpoint, not a TypeCode). Fixtures `tests/fixtures/xml/cds-testcases-*.xml`. Live-verified: a4h-2025 (816) → 200, a4h (758) → skip. |
+| Add server-driven object (SDO) read via SAPRead (DESD/EVTB/DTSC/CSNM/EVTO/COTA/DSFD/UIAD/DTDC/DRTY/APLO/SAJC/SAJT — generic AFF objects) | `src/adt/server-driven.ts` (`SDO_REGISTRY` code→href, `isServerDrivenObjectType`, `supportsServerDrivenObject` discovery-gate on the collection's advertised accept via the per-entry `discoveryMarker` (`blues`/`dtdc`), `getServerDrivenObject` — GET `…/{name}` (Accept `entry.metadataContentType`) for metadata + GET `…/{name}/source/main` for the source (**AFF JSON or DDL text**)), `src/adt/xml-parser.ts` (`parseServerDrivenMetadata(xml, rootLocalName)` — adtcore attrs + packageRef; root is `blueSource` or `dtdcSource`), `src/adt/types.ts` (`ServerDrivenObjectMetadata`/`Result`), `src/handlers/read.ts` (early branch in `handleSAPRead` before the `switch`; checks explicit version against returned metadata; bypasses caches; JSON output). The `SAPREAD_TYPE_TABLE` rows DERIVE from `SDO_TYPES` (no tool-registry edit — registering the type in server-driven.ts is the only step; consumed by both schemas.ts + tools.ts). **Gate is per-type/release-adaptive** (not hardcoded 8.16): EVTB also ships on S/4HANA 2023 (758); DESD/DTSC/CSNM/COTA/EVTO need 8.16+. NO probe-catalog entry (816-only types break the recorded-fixture "zero unavailable/ambiguous" replay). Fixtures `tests/fixtures/sdo/`. Live-verified: a4h-2025 (816) reads DESD+EVTB; a4h (758) reads EVTB, skips DESD. |
+| Add server-driven object (SDO) write via SAPWrite/SAPActivate (create/update/delete + activate for DESD/EVTB/DTSC/CSNM/EVTO/COTA/DSFD/DTDC/UIAD/DRTY/APLO/SAJC/SAJT — UIAD uses a dedicated candidate-validation path) | `src/adt/server-driven.ts` (`createServerDrivenObject` — POST `<href>` metadata body w/ `entry.createType` + `entry.metadataContentType`; `updateServerDrivenObjectSource` — lock→PUT `…/source/main` with the type's **`sourceFormat`** content type→unlock; `deleteServerDrivenObject` — lock→advertised deletion check→DELETE→unlock→verify metadata absence; `serverDrivenObjectUrl`, `buildServerDrivenMetadataXml`, `serverDrivenMetadataContentType`). **DTDC is the first NON-blue type**: its metadata root/ns/marker are per-entry (`metadataRootQName=dtdc:dtdcSource`, `metadataNamespace`, `metadataRootLocalName=dtdcSource`, `discoveryMarker=dtdc`); the blue family shares the `BLUE_METADATA` spread. Registry carries per-type `createType` (NOT uniformly `/TYP` — EVTB=`EVTB/EVB`, DTDC=`DTDC/DF`, SAJC/SAJT = bare code; their create body also needs `additionalCreationProperties` from the AFF source reference) + `metadataContentType` (blues v1, EVTO/UIAD/SAJC/SAJT=v2, DTDC=`ddic.dtdc.v1`; used for BOTH metadata GET Accept AND create POST) + `sourceFormat` (`json` for DESD/CSNM/EVTB/EVTO/COTA/APLO/SAJC/SAJT, **`text` for DTSC/DSFD/DTDC/DRTY** — the wrong content type is a hard 415; it also gates the client-side `JSON.parse` in `handleServerDrivenObjectWrite`). `src/handlers/write.ts` + `src/handlers/write-helpers.ts` (`handleServerDrivenObjectWrite` early branch in `handleSAPWrite`; generic object URLs derive from `SDO_REGISTRY` via `objectBasePath`; `enforceAllowedPackageForObjectUrl(…, accept?)` threads the metadata Accept so the allowlist resolves the real package). `src/adt/client.ts` (`resolveObjectPackage(url, accept?)`). The `SAPWRITE_TYPE_TABLE` rows derive from `SDO_TYPES` like the read table (no tool-registry edit needed). Most SDO creates write JSON source + leave the object **inactive** (→ SAPActivate); APLO source saves are immediately active; UIAD saves are also active (see the dedicated row below); lint/RAP-preflight/CDS-guard skipped (source is AFF JSON, not ABAP). ADT **ignores `adtcore:masterLanguage`** on the SDO create body (live-verified) — master lang comes from the session `sap-language`, so `buildServerDrivenMetadataXml` omits it. Gate is per-type/release-adaptive (like read). Cross-release live-verified: a4h-2025 (816) all types create (DESD + DTDC full create→source→activate→read→delete); a4h (758) **EVTB/DSFD/DTDC/DRTY write works** (create→activate→delete), 816-only types return the clean 8.16+ error; npl (7.50) gates all (no crash). |
+| UIAD candidate validation / manual creation | `src/adt/uiad.ts` + `src/handlers/write/uiad.ts`, JSON-artifact option in `src/adt/devtools.ts`, creation language version and source confirmation in `src/adt/server-driven.ts`. Target full schema is `$schema` or object `/schema`, never `$new/schema`; SAP checkruns needs `application/json`. Root readonly blocks, nested flags do not. Keep AFF v1 compatibility when the target exposes only v2 schema, request-local validators, partial-write cache invalidation, and minimal-error redaction. Evidence: `docs/research/2026-09-14-uiad-validation-implementation.md`. |
+| Add XML response parser | `src/adt/xml-parser.ts` (`parseXml` + `findDeepNodes`), `xml-entities.ts` — XML text and attributes are decoded exactly once, including numeric references; CDATA stays literal. Never decode a parsed value again; use `escapeXmlAttr` when writing XML. The custom decoder ignores document/external entities and avoids recursive expansion and ST22 reference-count limits. Raw XML scanners such as `errors.ts` and KTD envelope surgery own their separate decoding boundary. |
+| Add safety check | `src/adt/safety.ts` |
+| Add/modify PrettyPrint action | `src/adt/devtools.ts`, `src/handlers/lint.ts` (handleSAPLint), `src/handlers/tools.ts`, `src/handlers/schemas.ts` |
+| Add lint rule config | `src/lint/lint.ts`, `src/lint/config-builder.ts`, `src/lint/presets/` |
+| Adjust pre-write lint on releases beyond abaplint's grammar (8xx, e.g. SAP_BASIS 816 / ABAP Platform 2025) | `src/adt/features.ts` (`ABAPLINT_MAX_RELEASE`=758 + `isBeyondAbaplintCeiling`), `src/lint/config-builder.ts` (`buildPreWriteConfig` `parserSeverity`). abaplint v758 (its ceiling) can't parse new 816 syntax (CDS `define table entity`, `READ TABLE … WHERE`, RAP keywords) → would false-positive-block writes, so `parser_error`/`cds_parser_error` are **demoted to non-blocking warnings when `release > 758`** (activation is the definitive check); still block on ≤758. Bump `ABAPLINT_MAX_RELEASE` + the `mapSapReleaseToAbaplintVersion` ceiling together when abaplint adds a newer grammar. Tests: `tests/unit/{adt/features,lint/lint}.test.ts`. |
+| Add an ARC-1-native pre-write semantic hint for a new object type | `src/lint/pre-write-hints.ts` (add `inspect<Type>Source` → `LintResult[]` with `severity:'warning'`), `src/lint/lint.ts` (wire into `validateBeforeWrite()`, filename-gated by extension), `tests/unit/lint/{pre-write-hints,lint}.test.ts` |
+| Add dependency pattern | `src/context/deps.ts` |
+| Add CDS dependency pattern | `src/context/cds-deps.ts` |
+| Add contract extraction for new type | `src/context/contract.ts` |
+| Modify context output format | `src/context/compressor.ts` |
+| Add runtime diagnostic | `src/adt/diagnostics.ts`, `src/handlers/diagnose.ts` |
+| Add source state diagnostic | `src/adt/diagnostics.ts`, `src/adt/types.ts`, `src/handlers/diagnose.ts`, `src/handlers/schemas.ts`, `src/handlers/tools.ts` |
+| Add audit logging | `src/server/audit.ts`, `src/server/sinks/` |
+| Add audit event type | `src/server/audit.ts` (typed `*Event` interface + `AuditEvent` union); emit via `logger.emitAudit({...})` at the call site. |
+| Add/modify rate limiting | **Layer 1** (HTTP edge): `src/server/auth-rate-limit.ts` + `src/server/http.ts` (`buildLimiter`, mounted on OAuth endpoints + `/mcp` before auth). **Layer 2** (per-user MCP): `src/server/mcp-rate-limit.ts` + `src/handlers/dispatch.ts` (top of `handleToolCall`; returns MCP error w/ `retryAfter`, not HTTP 429). **Layer 3** (SAP-bound): shared `Semaphore` from `createAndStartServer` threaded through `buildAdtConfig`; `parseRetryAfter` in `src/adt/http.ts`. Config in `src/server/{types,config}.ts`. See `docs/adr/0004-layered-rate-limiting.md`. |
+| Add/modify Dependabot config | `.github/dependabot.yml` — npm + github-actions + docker, weekly. Grouping + ignore rules in-file. |
+| Add/modify npm audit / SAST / dep review CI gate | `.github/workflows/test.yml` (`npm audit --audit-level=high`); `.github/workflows/dependency-review.yml` (license allow/deny). |
+| Add/modify container scanning | Trivy advisory in `docker.yml` + `release.yml`, scheduled native amd64/arm64 HIGH/CRITICAL maintenance gate in `security-scan.yml` (Mon/Wed/Fri), SARIF via `github/codeql-action/upload-sarif@v4`. The Dockerfile's named `runtime` stage runs `apk upgrade`; every CI build sets `pull: true` + `no-cache-filters: runtime` so repository-only package updates cannot be hidden by the GHA cache. Release scan + SARIF steps are explicitly non-blocking; keep the scheduled matrix red on real findings with `fail-fast: false`. Tests: `tests/unit/workflows/container-security.test.ts`. |
+| Add/modify the release npm SBOM | `.github/workflows/release.yml` (`publish-npm-sbom`) + `tests/unit/server/release-sbom-workflow.test.ts`. This is a best-effort release asset: preserve job-level `continue-on-error: true` so generation/upload cannot fail the release. Generate from the immutable release tag with the same pinned npm as `publish-npm`: `npm sbom --package-lock-only --omit=dev --sbom-format=cyclonedx --sbom-type=application`. Validate Release Please/package/lock/SBOM versions before upload. The asset covers only the root production npm graph, not Docker OS packages, MCPB contents, or extensions. Upload retries compare GitHub's SHA-256 digest; never use `--clobber`, which deletes the existing asset first. |
+| Write/maintain the annotated release notes | `docs_page/release-notes.md` (the page), `.claude/commands/release-notes.md` (the `/release-notes` method + entry template), `tests/unit/server/release-notes.test.ts` (coverage guard), `.github/workflows/release.yml` (`link-release-notes` appends the docs link to the GitHub Release body — append-only, idempotent, `continue-on-error: true`). Division of labour: `CHANGELOG.md` stays 100% release-please-generated (one line per PR, never hand-edited except the pointer prose above the first version heading, which release-please preserves — it splits at the first `## [` version match); the notes page adds impact, upgrade action, new config, and tool-surface changes. Annotate **while the release-please PR is open** using its body as the source: `CHANGELOG.md` gains the entry only when that PR merges, and the guard asserts CHANGELOG ⊆ notes (never the reverse), so early annotation is legal and keeps `main` green. The guard accepts a version only as its own `##`/`###` heading or as the leading cell of a table row — a prose mention is not annotation, and a bare `includes` would match `0.9.2` inside `0.9.27`. Every claim in an entry must trace to a diff that was actually read; unverifiable impact is written `(unverified)` rather than guessed. |
+| Pin a third-party GitHub Action | `uses: <owner>/<action>@<40-char-sha>  # <tag>` (trailing comment lets Dependabot bump SHA + tag together). GitHub-owned `actions/*`/`github/*` stay tag-pinned. |
+| Update vulnerability reporting policy | `SECURITY.md` (Supported Versions, Reporting channels, Response SLAs, CVE handling, Out of Scope, Safe Harbor) |
+| Add CLI sub-command (`call`, `tools`, shortcuts) | `src/cli.ts` (Commander wiring), `src/cli-args.ts` (pure arg parsing + tests) — never duplicate Zod validation; `handleToolCall` does it. |
+| Add SAP version-quirk workaround (NW 7.50 / S/4 gating) | Prefer `extractExceptionType` in `src/adt/errors.ts` (structured XML error). Body-marker heuristics only with a release-scoped guard — see `convertHtmlConflictToProperError` in `src/adt/crud.ts` (scoped to `abapRelease < 751`). Inline-comment why the heuristic self-scopes. ADR-0002 (#199). |
+| Add activation batch quirk recovery | `src/adt/devtools.ts` (`activateBatch`, ED064 retry helper), `tests/unit/adt/devtools.test.ts`. Pure ED064 / "no next/previous object found" failures retried once as individual activations; mixed real errors must not retry. |
+| Add a plugin elicitation prompt (`ctx.elicit`) | `src/server/plugin-loader.ts` (`buildMcpCapabilities`) — the only live elicitation path (opt-in, for extension tools). Core tools have no interactive elicitation; destructive-op safety is the config ceiling (`allowWrites`/`allowedPackages`/`denyActions`). |
+| Add XSUAA/JWT auth | Provided by [`@arc-mcp/xsuaa-auth`](https://github.com/arc-mcp/xsuaa-auth) (`createXsuaaTokenVerifier` / `createChainedTokenVerifier`); wired in `src/server/http.ts` + `src/server/server.ts`. (Was `src/server/xsuaa.ts`, extracted in #456.) |
+| Modify OAuth DCR client store / signed-token format | Now [`@arc-mcp/xsuaa-auth`](https://github.com/arc-mcp/xsuaa-auth)'s `StatelessDcrClientStore`; ARC-1 sets `clientIdPrefix: 'arc1-'` + `dcrKdfLabel: 'arc1-dcr/v1'` in `src/server/http.ts`. Bump the kdf label to revoke issued client_ids. Audit: `oauth_client_registered`/`oauth_client_lookup_failed`/`oauth_redirect_uri_registered`. (Was `src/server/stateless-client-store.ts`, extracted in #456.) |
+| Modify scope enforcement | `src/authz/policy.ts` (`ACTION_POLICY`), `src/handlers/dispatch.ts` (runtime check), `src/server/server.ts` (tool listing filter) |
+| Modify OIDC token handling | `src/server/http.ts` (validateOidcToken, ~line 274) |
+| Add/modify auth scopes | `xs-security.json`, `src/authz/policy.ts`, `src/server/http.ts` (verifier wiring via `@arc-mcp/xsuaa-auth`), `src/handlers/dispatch.ts` |
+| Add / modify auth combination rule | `src/server/config.ts` (validateConfig at ~line 305), `src/server/types.ts` (ServerConfig), `tests/unit/server/config.test.ts`, `docs_page/enterprise-auth.md` (Coexistence Matrix) |
+| Add Layer B auth mechanism | `src/adt/http.ts` (applyAuthHeader at ~line 830, fetchCsrfToken at ~line 669), `src/server/server.ts` (buildAdtConfig — perUser flag), `tests/unit/adt/http.test.ts` |
+| Add safety config option | `src/adt/safety.ts`, `src/server/config.ts`, `src/server/types.ts` |
+| Add an `AdtClient` instance field / modify `withSafety()` clone | `src/adt/client.ts` (`withSafety()` clones via `Object.assign(Object.create(AdtClient.prototype), this, { safety })` — skips the ctor so the live HTTP session/cookies are shared, and copies **every own field by reference automatically**, so a new field rides along with no re-attach list. Just declare the field as a normal class field — plain TS `private`, NOT `#private` (Object.assign can't copy `#private`). Caches/holders are shared by instance, not deep-copied), `tests/unit/adt/client.test.ts` (`describe('withSafety')` — the structural guard already asserts every field except `safety` is shared by reference). Regression: #333 (a TABL cache field missing on the clone; stdio exempt — uses the constructor-built client). TABL write routes are never cached — a long-lived client must re-ask SAP after a structure is recreated as a table (#285 guard) — and the write fallback evicts the read-route cache entry before probing. |
+| Modify `allowedPackages` pattern syntax (exact / `Z*` / `ZFOO/**` subtree) | `src/adt/safety.ts` (`decidePackageAllowed` + `checkPackage` + `intersectList.covers`), `src/adt/package-hierarchy.ts` (resolver + TTL cache, fail-closed), `src/adt/client.ts` (`getSubpackages` + `getPackageHierarchyResolver` holder shared across clones), the per-tool handler modules (resolver at every `checkPackage`) + `src/handlers/manage.ts` (`invalidatePackageHierarchy()` on package mgmt), `src/adt/{gcts,abapgit}.ts`, tests. Subtree match needs runtime BFS via `POST /sap/bc/adt/repository/nodestructure` (`parseSubpackageNodestructure`); sync `isPackageAllowed` returns false for non-root subtree hits — only async `checkPackage` resolves them. Mutating ops gate the object's real package via the module-level `enforceAllowedPackageForObjectUrl(client, objectUrl, label)` helper in `src/handlers/write-helpers.ts` (resolve→`checkPackage`, fail-closed, no-op when unrestricted): used by `enforcePackageForExistingObject` (update/delete/surgery), `handleSAPActivate` (single + every batch object), and `change_package` (the real source). SRVB publish/unpublish is gated the same way since #403: `src/handlers/activate.ts` passes `SERVICEBINDING_V2_ACCEPT` as the Accept override to `enforceAllowedPackageForObjectUrl` (the SRVB URL's default Accept returns JSON without `packageRef`; the servicebinding v2 XML renders it). |
+| Add feature probe | `src/adt/features.ts` (`PROBES` array — one endpoint per feature; status classification by `classifyFeatureProbeStatus`: 2xx/400/405/5xx → available, 401/403/404 → unavailable; surface reason via `FeatureStatus.message`). |
+| Add feature-gated write guard | `src/handlers/write/rap.ts` (checkRapAvailable pattern), `src/adt/features.ts` |
+| Add E2E test | `tests/e2e/`, helpers in `tests/e2e/helpers.ts`, fixtures in `tests/e2e/fixtures.ts` |
+| Add/modify E2E fixture | `tests/e2e/fixtures.ts` (define object), `tests/fixtures/abap/` (source file), `tests/e2e/setup.ts` (sync logic) |
+| Guard source writes across tool calls (#850) | `src/handlers/editable-source.ts`, `src/adt/source-precondition.ts`, `src/adt/crud.ts`, `src/handlers/write/{class-edit,unit-surgery}.ts`. `SAPRead format=editable` hashes fresh whole source/include; optional `expectedSourceHash` is checked under the write lock. Unsupported paths refuse it; omitted hashes retain unconditional behavior. See [source preconditions](../docs_page/tools.md#source-preconditions). |
+| Modify source caching / ETag revalidation | `src/cache/caching-layer.ts`, `src/cache/cache.ts`, `src/cache/memory.ts`, `src/cache/sqlite.ts`, `src/adt/client.ts` |
+| Modify inactive-draft source awareness | `src/cache/inactive-list-cache.ts`, `src/handlers/read.ts`, `src/adt/client.ts`, `src/adt/xml-parser.ts`, `src/adt/types.ts` |
+| Change source caching | `src/cache/caching-layer.ts`, `src/cache/{cache,memory,sqlite}.ts`; preserve ETag revalidation |
+| Add integration test | `tests/integration/adt.integration.test.ts` |
+| Add BTP ABAP integration test | `tests/integration/btp-abap.integration.test.ts` |
+| Add BTP smoke test | `tests/integration/btp-abap.smoke.integration.test.ts` |
+| BTP ABAP Environment auth | `src/adt/oauth.ts`, `src/server/server.ts` |
+| BTP Destination Service / Connectivity proxy | [`@arc-mcp/xsuaa-auth/btp`](https://github.com/arc-mcp/xsuaa-auth) (`resolveBTPDestination` / `lookupDestinationWithUserToken` / `parseVCAPServices`); used from `src/adt/http.ts` + `src/server/server.ts`. (Was `src/adt/btp.ts`, extracted in #456.) |
+| Add AFF schema | `src/aff/schemas/` (add `{type}-v1.json`), `src/aff/validator.ts` (add type mapping) |
+| Modify AFF validation | `src/aff/validator.ts`, `src/handlers/write/create.ts` (create/batch_create paths) |
+| Add skip policy test | `tests/helpers/skip-policy.ts` |
+| Add expected error assertion | `tests/helpers/expected-error.ts` |
+| Add CRUD integration test | `tests/integration/crud-harness.ts`, `tests/integration/crud.lifecycle.integration.test.ts` |
+| Run integration/e2e concurrently vs one SAP system / isolate runs | `tests/helpers/run-id.ts` (`RUN_ID`/`TEST_RUN_ID`), `scripts/e2e-run-local.sh` (per-run port/PID/log), `tests/e2e/setup.ts` (race-tolerant fixture sync) — see "Testing — concurrent runs" below |
+| Opt into faster parallel integration runs | `vitest.integration.config.ts` (`TEST_FILE_PARALLELISM=true`, `maxWorkers: 2`) — default sequential; measure with `npm run test:runtime-report` |
+| Sweep leaked test objects after a crashed run | `scripts/test-janitor.ts` (`npm run test:cleanup`; dry-run by default, `-- --execute` deletes), `tests/helpers/test-prefixes.ts` (prefixes + pure selector, derived from the fixture list) |
+| Modify CI coverage reporting | `scripts/ci/coverage-summary.mjs`, `.github/workflows/test.yml`, `.github/workflows/release.yml` |
+| Modify CI reliability reporting | `scripts/ci/collect-test-reliability.mjs`, `scripts/ci/assert-required-test-execution.mjs`, `.github/workflows/test.yml` |
+
+## Experimental data-source blocklist — developer map
+
+Spec: [docs/research/2026-09-02-data-source-policy-design-reassessment.md](research/2026-09-02-data-source-policy-design-reassessment.md)
+(normative; supersedes the earlier plan and allowlist dossier).
+
+| Concern | Where |
+|---|---|
+| Canonical identity + CSV grammar + fingerprint | `src/adt/data-source-name.ts` — the ONE normalizer for config, caller roots, parser results, search results, decoded URIs, graph names/aliases and replacement catalog identities |
+| Strict SQL subset | `src/adt/sql-source-analyzer.ts` — pre-parse lexer then `@abaplint/core`; pinned grammar |
+| Graph classification + lineage | `src/adt/data-source-policy.ts` |
+| Structured TABLE_QUERY builder | `src/adt/table-query.ts` |
+| Enforcement + batch authorization | `src/adt/client.ts` (`runQueryBatch`, `getTableContents`, `runTableQuery`) |
+| ARC-1's own fixed reads | `src/adt/internal-data-operations.ts` |
+| Config / startup visibility | `src/server/{config,effective-policy-log,ui-state}.ts`, `src/cli.ts` |
+| Multi-target propagation | `src/server/{destination-registry,multi-target-runtime}.ts` |
+| Client error rendering | `src/handlers/dispatch.ts` |
+| Audit event | `src/server/audit.ts` (`data_source_policy_decision`) |
+
+Gotchas worth knowing before changing anything here:
+
+- **Validate raw ASCII before case folding.** `String.toUpperCase()` maps `ſ`→`S`, `ß`→`SS` and
+  ligatures to `FF`/`FFI`, so folding first makes an "ASCII-only" validator accept non-ASCII. Trim
+  ASCII whitespace only — `String.trim()` would strip U+3000/U+00A0 and let a padded value collapse
+  onto a different identity.
+- **Never rewrite an identifier.** The old builder stripped `[^\w/]`, so `USR02$` was authorized and
+  `USR02` executed. Anything needing character removal is refused, blocklist on or off.
+- **Blank is off, but a stray comma is not.** Once the trimmed value is non-empty every field is
+  mandatory; `.filter(Boolean)` would silently disable the control.
+- **Node kinds are classified explicitly.** `CDS_VIEW`/`CDS_VIEW_ENTITY`/`CDS_PROJECTION_VIEW` share
+  the same traversal checks; `TABLE` is terminal and `CDS_TABLE_FUNCTION` is parsed but refused.
+  The parser and evaluator share `CDS_VIEW_KINDS` ([#912 evidence](research/2026-10-04-issue-912-cds-lineage.md)). The exact
+  `RELATED_OBJECTS_TREE → RELATED_OBJECTS_ENTRY → DCLS_OBJECT_LIST → DCLS/DL` chain is auxiliary and is
+  validated then dropped. Match exact `TYPE` values and exact nesting — never a name *containing*
+  "RELATED"/"DCLS", or an auxiliary-looking subtree could hide a real source. A released view like
+  `I_BUSINESSPARTNER` has this branch, and `HAS_DCL=X` means `AC_STATE` is not the only DCL signal.
+- **Preserve empty properties.** `<entry key="DB_EXISTS"/>` means false (for example a transient
+  analytical query); an omitted property on the legacy 750 graph remains unknown. Do not drop empty values.
+- **`addMetrics=false`.** Metrics add payload, not topology. The v3 media type 406s on 750, which is
+  what drives the element-info fallback.
+- **One decision per logical request.** `runQueryBatch` unions all chunk sources and decides once;
+  there is no cache, and no caller-supplied authorization receipt exists.
+- **Fixtures are real captures.** `tests/fixtures/xml/cds-dependency-graph-*.xml` came from live 750 /
+  758 and the sanitized 816 graph supplied in #912; provenance is in the linked research.
+  Do not hand-write graph XML for kind decisions.
+
+## Testing — concurrent runs, isolation & teardown
+
+Run IDs and local server ports prevent object-name/process collisions, but overlapping runs still
+share the SAP user, work processes, session capacity and lock table. CI serializes live jobs; avoid overlapping
+local runs when investigating backend failures. On 816, fresh stateful contexts failed with
+`400 Session not found` during bursts of new SAP logons. Transport reuse reduced logon churn and
+passed subsequent checks; the SAP-internal cause remains inferred. See the
+[investigation](research/2026-09-27-sap-816-session-failures.md). Mechanics:
+
+- **Live CI queue** — integration, E2E and manual slow profiles share `…-sap-live-a4h` with
+  `queue: max` and `cancel-in-progress: false`: one running job, up to 100 waiting jobs.
+  Without `queue: max`, GitHub replaces the single pending job when another arrives.
+  PR jobs check that the PR is open and its head still matches both before queuing and after
+  waiting; stale jobs skip all SAP steps and emit a notice. A successful guard-only job is not a passed SAP suite.
+  API lookup failure stops the job before SAP access. Manual dispatch deliberately tests the
+  selected revision. Once a job starts SAP work, later pushes do not interrupt its teardown.
+  Runs started from older workflow revisions retain their old settings; this queue does not
+  coordinate local runs or fix the SAP 816 incident. See [GitHub's queue contract](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency).
+- **Run identity** — `tests/helpers/run-id.ts` exports `RUN_ID`, a short LETTERS-ONLY token
+  (`TEST_RUN_ID` env if set — sanitised to A-Z, capped at 4 — else 2 random letters per process;
+  letters-only so one token works for both the alphanumeric `uniqueName` and the BDEF/CDS-safe
+  `uniqueLettersName` with no lossy mapping). Every generated object name embeds it:
+  `generateUniqueName` (`tests/integration/crud-harness.ts`) and the shared `uniqueName` /
+  `uniqueLettersName` (`tests/e2e/helpers.ts`). This closes the same-millisecond cross-process
+  collision window. LEAVE `TEST_RUN_ID` UNSET for an automatic per-run id — pin it only to make one
+  run's objects recognisable, and never to the SAME value in two concurrent worktrees (they'd
+  collide). `run-id.ts` loads `.env` itself, so a `.env`-set `TEST_RUN_ID` is honoured regardless of
+  import order.
+- **One e2e server per run** — `npm run test:e2e:full` now runs `scripts/e2e-run-local.sh`, which picks
+  a FREE port and per-run PID/log paths (`/tmp/arc1-e2e-<id>.pid`, `/tmp/arc1-e2e-logs/<id>/`) and
+  exports `TEST_RUN_ID`, so two local full runs don't kill each other (the old fixed port 3000 + fixed
+  PID file meant the second run murdered the first). A trap stops the server even if start or the
+  tests fail, and the start script kills its own spawn on a health-check timeout, so a failed start
+  never leaks a write-enabled server. CI is unchanged: it runs start/test/stop separately on the fixed
+  port 3000, one run at a time via the `…-sap-live-a4h` concurrency group. Overrides: `E2E_MCP_PORT`
+  pins the port (skips the free-port probe and the listener sweep guard), `E2E_PID_FILE` /
+  `E2E_LOG_DIR` pin paths, `E2E_MCP_URL` points the vitest client at the server. Note: under the
+  orchestrator the e2e JSON/JUnit results land in the per-run `E2E_LOG_DIR`, not `test-results/` (so
+  `npm run test:runtime-report`, which reads `test-results/`, reflects the integration suite — the F1
+  measurement target — not orchestrated e2e runs).
+- **Shared fixtures tolerate races** — `tests/e2e/setup.ts` reconciles a concurrent create (423 /
+  "already exists") by re-polling the system instead of skipping; only a genuinely different fixture
+  source (another branch mid-run) is skipped, and `assertSyncedFixturesActive` re-checks once after a
+  short delay so a still-settling activation doesn't fail the sync. The rap SAPActivate tests create
+  transient `$TMP` objects rather than mutating the shared fixtures.
+- **Teardown backstop** — normal runs clean up after themselves (`CrudRegistry` + lock-aware
+  `retryDelete`); a crashed/interrupted run leaks objects. `npm run test:cleanup`
+  (`scripts/test-janitor.ts`) sweeps leftovers whose name strict-prefix-matches a canonical test
+  prefix, excluding the managed persistent fixtures. Dry-run by default; `-- --execute` deletes.
+  Prefixes + the pure selector live in `tests/helpers/test-prefixes.ts` (derived from
+  `PERSISTENT_OBJECTS`), so the cleanup set can't drift from what the suites create. Needs only SAP
+  creds (no running server). RAP/FUGR objects are intentionally out of scope (they self-clean and
+  need ordered teardown).
+- **Optional file parallelism** — `TEST_FILE_PARALLELISM=true npm run test:integration` runs up to two
+  files in parallel (`maxWorkers: 2` cap in `vitest.integration.config.ts`; `fileParallelism:false`
+  forces it to 1 otherwise). Default stays sequential because parallel files once exhausted SAP work
+  processes ("Service cannot be reached"). Measure before/after with `npm run test:runtime-report` and
+  watch for that error class before raising the cap. Size it against the system's `rdisp/wp_no_dia`;
+  the e2e server's per-request fan-out is separately capped by `ARC1_MAX_CONCURRENT` (default 10 —
+  lower toward ~4 when several runs share one small system).
+- **Not yet shipped** (see `docs/plans/2026-06-12-test-isolation-and-parallel-runs.md`): CI `retry: 1` paired
+  with flake telemetry (H2), a parallel read-only e2e project (F2), and a cross-run flake-aggregation
+  workflow (H3). The plan rates these measure-first / conditional on the F1 numbers.

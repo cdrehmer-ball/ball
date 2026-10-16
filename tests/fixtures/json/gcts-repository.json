@@ -1,0 +1,13 @@
+{
+  "result": [
+    {
+      "rid": "ZARC1",
+      "name": "ZARC1",
+      "url": "https://github.com/example/arc1.git",
+      "branch": "main",
+      "role": "source",
+      "type": "ABAP",
+      "vSID": "A4H"
+    }
+  ]
+}

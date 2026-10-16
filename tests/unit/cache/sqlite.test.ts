@@ -1,0 +1,286 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { hashSource } from '../../../src/cache/cache.js';
+import { SqliteCache } from '../../../src/cache/sqlite.js';
+
+function fileMode(filePath: string): number {
+  return fs.statSync(filePath).mode & 0o777;
+}
+
+// Compatibility fixtures use raw SQL: retired aggregate access is not a runtime API.
+function legacyDb(cache: SqliteCache): Database.Database {
+  return (cache as unknown as { db: Database.Database }).db;
+}
+
+describe('SqliteCache', () => {
+  let cache: SqliteCache;
+
+  beforeEach(() => {
+    // Use in-memory SQLite for tests (no file cleanup needed)
+    cache = new SqliteCache(':memory:');
+  });
+
+  afterEach(() => {
+    cache.close();
+  });
+
+  it('creates file-backed cache databases with private file permissions', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc1-cache-mode-'));
+    const dbPath = path.join(dir, 'cache.db');
+    const fileCache = new SqliteCache(dbPath);
+
+    try {
+      expect(fileMode(dbPath)).toBe(0o600);
+    } finally {
+      fileCache.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('repairs permissive permissions on an existing cache database', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc1-cache-mode-'));
+    const dbPath = path.join(dir, 'cache.db');
+    fs.writeFileSync(dbPath, '', { mode: 0o666 });
+    fs.chmodSync(dbPath, 0o666);
+
+    const fileCache = new SqliteCache(dbPath);
+    try {
+      expect(fileMode(dbPath)).toBe(0o600);
+    } finally {
+      fileCache.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stores and retrieves API objects', () => {
+    cache.putApi({
+      name: 'CL_ABAP_REGEX',
+      type: 'CLAS',
+      releaseState: 'released',
+      cleanCoreLevel: 'A',
+    });
+    const api = cache.getApi('CL_ABAP_REGEX', 'CLAS');
+    expect(api).not.toBeNull();
+    expect(api?.cleanCoreLevel).toBe('A');
+  });
+
+  it('clears all data', () => {
+    cache.putApi({ name: 'X', type: 'CLAS', releaseState: 'released' });
+    cache.clear();
+    expect(cache.stats().apiCount).toBe(0);
+  });
+
+  it('returns correct stats', () => {
+    cache.putApi({ name: 'X', type: 'CLAS', releaseState: 'released' });
+    const stats = cache.stats();
+    expect(stats.apiCount).toBe(1);
+  });
+
+  it('stores and retrieves source with active version by default', () => {
+    cache.putSource('CLAS', 'ZCL_TEST', 'CLASS zcl_test DEFINITION.');
+    const src = cache.getSource('CLAS', 'ZCL_TEST');
+    expect(src).not.toBeNull();
+    expect(src?.source).toBe('CLASS zcl_test DEFINITION.');
+    expect(src?.objectType).toBe('CLAS');
+    expect(src?.objectName).toBe('ZCL_TEST');
+    expect(src?.version).toBe('active');
+    expect(src?.hash).toBe(hashSource('CLASS zcl_test DEFINITION.'));
+  });
+
+  it('stores etag when provided', () => {
+    cache.putSource('PROG', 'ZTEST', 'REPORT ztest.', { etag: '20231201001' });
+    expect(cache.getSource('PROG', 'ZTEST')?.etag).toBe('20231201001');
+  });
+
+  it('keeps active and inactive source entries separate', () => {
+    cache.putSource('CLAS', 'ZCL_TEST', 'active body');
+    cache.putSource('CLAS', 'ZCL_TEST', 'inactive body', { version: 'inactive' });
+    expect(cache.getSource('CLAS', 'ZCL_TEST')?.source).toBe('active body');
+    expect(cache.getSource('CLAS', 'ZCL_TEST', 'inactive')?.source).toBe('inactive body');
+  });
+
+  it('returns null for missing source', () => {
+    expect(cache.getSource('CLAS', 'MISSING')).toBeNull();
+  });
+
+  it('invalidateSource defaults to active version', () => {
+    cache.putSource('PROG', 'ZTEST', 'active');
+    cache.putSource('PROG', 'ZTEST', 'inactive', { version: 'inactive' });
+    cache.invalidateSource('PROG', 'ZTEST');
+    expect(cache.getSource('PROG', 'ZTEST')).toBeNull();
+    expect(cache.getSource('PROG', 'ZTEST', 'inactive')?.source).toBe('inactive');
+  });
+
+  it("invalidateSource with explicit 'inactive' clears that view only", () => {
+    cache.putSource('PROG', 'ZTEST', 'active');
+    cache.putSource('PROG', 'ZTEST', 'inactive', { version: 'inactive' });
+    cache.invalidateSource('PROG', 'ZTEST', 'inactive');
+    expect(cache.getSource('PROG', 'ZTEST')?.source).toBe('active');
+    expect(cache.getSource('PROG', 'ZTEST', 'inactive')).toBeNull();
+  });
+
+  it("invalidateSource with 'all' clears both views", () => {
+    cache.putSource('PROG', 'ZTEST', 'active');
+    cache.putSource('PROG', 'ZTEST', 'inactive', { version: 'inactive' });
+    cache.invalidateSource('PROG', 'ZTEST', 'all');
+    expect(cache.getSource('PROG', 'ZTEST')).toBeNull();
+    expect(cache.getSource('PROG', 'ZTEST', 'inactive')).toBeNull();
+  });
+
+  it('lists source metadata without source bodies', () => {
+    cache.putSource('CLAS', 'ZCL_ALPHA', 'CLASS zcl_alpha DEFINITION.', { etag: 'abc' });
+    cache.putSource('PROG', 'ZREPORT', 'REPORT zreport.');
+
+    const result = cache.listSources({ objectType: 'CLAS', limit: 10 });
+
+    expect(result.total).toBe(1);
+    expect(result.items[0]).toMatchObject({
+      objectType: 'CLAS',
+      objectName: 'ZCL_ALPHA',
+      version: 'active',
+      etagPresent: true,
+      sourceLength: 'CLASS zcl_alpha DEFINITION.'.length,
+    });
+    expect(result.items[0]).not.toHaveProperty('source');
+  });
+
+  it('filters source metadata by name query and version', () => {
+    cache.putSource('CLAS', 'ZCL_ALPHA', 'alpha');
+    cache.putSource('CLAS', 'ZCL_BETA', 'beta', { version: 'inactive' });
+
+    const result = cache.listSources({ query: 'beta', version: 'inactive' });
+
+    expect(result.total).toBe(1);
+    expect(result.items[0]?.objectName).toBe('ZCL_BETA');
+  });
+
+  it('migrates an old sources table by dropping and recreating', () => {
+    const dbPath = path.join(os.tmpdir(), `arc1-migrate-test-${Date.now()}.db`);
+    const rawDb = new Database(dbPath);
+    rawDb.exec(
+      'CREATE TABLE sources (cache_key TEXT PRIMARY KEY, object_type TEXT, object_name TEXT, source TEXT, hash TEXT, cached_at TEXT);',
+    );
+    rawDb
+      .prepare('INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?)')
+      .run('PROG:Z_OLD', 'PROG', 'Z_OLD', 'REPORT.', 'h1', '2025-01-01');
+    rawDb.close();
+
+    const migrated = new SqliteCache(dbPath);
+    const cols = (migrated as unknown as { db: Database.Database }).db
+      .prepare("PRAGMA table_info('sources')")
+      .all()
+      .map((c) => (c as { name: string }).name);
+    expect(cols).toContain('etag');
+    expect(cols).toContain('version');
+    expect(migrated.getSource('PROG', 'Z_OLD')).toBeNull();
+    migrated.close();
+    fs.unlinkSync(dbPath);
+  });
+
+  it('retires repository graph tables while preserving normal cache data', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc1-retire-graph-'));
+    const dbPath = path.join(dir, 'cache.db');
+    const source = 'CLASS zcl_keep DEFINITION. ENDCLASS.';
+    const sourceHash = hashSource(source);
+    const rawDb = new Database(dbPath);
+    rawDb.exec(`
+      CREATE TABLE nodes (id TEXT PRIMARY KEY, object_type TEXT, object_name TEXT, package_name TEXT, cached_at TEXT, valid INTEGER);
+      CREATE TABLE edges (from_id TEXT, to_id TEXT, edge_type TEXT, discovered_at TEXT, valid INTEGER, PRIMARY KEY (from_id, to_id, edge_type));
+      CREATE TABLE sources (cache_key TEXT PRIMARY KEY, object_type TEXT NOT NULL, object_name TEXT NOT NULL, version TEXT NOT NULL, source TEXT NOT NULL, hash TEXT NOT NULL, etag TEXT, cached_at TEXT NOT NULL);
+      CREATE TABLE dep_graphs (source_hash TEXT PRIMARY KEY, object_name TEXT NOT NULL, object_type TEXT NOT NULL, contracts TEXT NOT NULL, cached_at TEXT NOT NULL);
+    `);
+    rawDb
+      .prepare('INSERT INTO nodes VALUES (?, ?, ?, ?, ?, ?)')
+      .run('CLAS:ZCL_OLD', 'CLAS', 'ZCL_OLD', '$TMP', '2026-01-01', 1);
+    rawDb.prepare('INSERT INTO edges VALUES (?, ?, ?, ?, ?)').run('ZCL_OLD', 'ZCL_KEEP', 'USES', '2026-01-01', 1);
+    rawDb
+      .prepare('INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('CLAS:ZCL_KEEP:active', 'CLAS', 'ZCL_KEEP', 'active', source, sourceHash, 'etag-1', '2026-01-01');
+    rawDb
+      .prepare('INSERT INTO dep_graphs VALUES (?, ?, ?, ?, ?)')
+      .run(sourceHash, 'ZCL_KEEP', 'CLAS', '[]', '2026-01-01');
+    rawDb.close();
+
+    let migrated: SqliteCache | undefined;
+    let reopened: SqliteCache | undefined;
+    try {
+      migrated = new SqliteCache(dbPath);
+      expect(migrated.getSource('CLAS', 'ZCL_KEEP')?.source).toBe(source);
+      expect(
+        legacyDb(migrated).prepare('SELECT object_name FROM dep_graphs WHERE source_hash = ?').get(sourceHash),
+      ).toEqual({ object_name: 'ZCL_KEEP' });
+      expect(migrated.stats().contractCount).toBe(1);
+      const tables = (migrated as unknown as { db: Database.Database }).db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .all()
+        .map((row) => (row as { name: string }).name);
+      expect(tables).not.toContain('nodes');
+      expect(tables).not.toContain('edges');
+      migrated.close();
+      migrated = undefined;
+
+      reopened = new SqliteCache(dbPath);
+      expect(reopened.getSource('CLAS', 'ZCL_KEEP')?.etag).toBe('etag-1');
+      expect(reopened.stats().contractCount).toBe(1);
+      reopened.close();
+      reopened = undefined;
+    } finally {
+      migrated?.close();
+      reopened?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('has no aggregate read/write API and never parses legacy payloads for stats', () => {
+    expect(cache).not.toHaveProperty('putDepGraph');
+    expect(cache).not.toHaveProperty('getDepGraph');
+    legacyDb(cache)
+      .prepare('INSERT INTO dep_graphs VALUES (?, ?, ?, ?, ?)')
+      .run('old', 'ZCL_OLD', 'CLAS', 'not valid JSON', '2026-01-01');
+    expect(cache.stats().contractCount).toBe(1);
+  });
+
+  it('stores and retrieves function group mapping', () => {
+    cache.putFuncGroup('Z_MY_FUNC', 'Z_MY_GROUP');
+    expect(cache.getFuncGroup('Z_MY_FUNC')).toBe('Z_MY_GROUP');
+  });
+
+  it('returns null for missing function group', () => {
+    expect(cache.getFuncGroup('MISSING_FUNC')).toBeNull();
+  });
+
+  it('resolves function groups case-insensitively', () => {
+    cache.putFuncGroup('z_my_func', 'z_my_group');
+    expect(cache.getFuncGroup('Z_MY_FUNC')).toBe('Z_MY_GROUP');
+  });
+
+  it('returns correct stats including sourceCount and contractCount', () => {
+    cache.putSource('CLAS', 'ZCL_A', 'source a');
+    cache.putSource('PROG', 'ZTEST', 'source b');
+    legacyDb(cache)
+      .prepare('INSERT INTO dep_graphs VALUES (?, ?, ?, ?, ?)')
+      .run('h1', 'ZCL_A', 'CLAS', '[]', '2026-01-01');
+    const stats = cache.stats();
+    expect(stats.sourceCount).toBe(2);
+    expect(stats.contractCount).toBe(1);
+  });
+
+  it('clears all data including sources, dep graphs, and func groups', () => {
+    cache.putApi({ name: 'X', type: 'CLAS', releaseState: 'released' });
+    cache.putSource('CLAS', 'ZCL_A', 'source');
+    legacyDb(cache)
+      .prepare('INSERT INTO dep_graphs VALUES (?, ?, ?, ?, ?)')
+      .run('h1', 'ZCL_A', 'CLAS', '[]', '2026-01-01');
+    cache.putFuncGroup('Z_FUNC', 'Z_GROUP');
+    cache.clear();
+
+    expect(cache.stats().apiCount).toBe(0);
+    expect(cache.stats().sourceCount).toBe(0);
+    expect(cache.stats().contractCount).toBe(0);
+    expect(cache.getSource('CLAS', 'ZCL_A')).toBeNull();
+    expect(cache.getFuncGroup('Z_FUNC')).toBeNull();
+  });
+});

@@ -1,0 +1,29 @@
+_schema-version: "3.1"
+ID: arc1-mcp-ui-approuter
+extends: arc1-mcp
+
+modules:
+  - name: arc1-mcp-server
+    properties:
+      ARC1_UI: "web"
+
+  - name: arc1-ui-router
+    build-parameters:
+      supported-platforms:
+        - CF
+    parameters:
+      # Extensions cannot add a resource dependency on this optional module.
+      # Use one globally unique host for the module and its XSUAA callback.
+      host: arc1-ui-${space-guid}
+
+resources:
+  - name: arc1-xsuaa
+    parameters:
+      config:
+        oauth2-configuration:
+          redirect-uris:
+            - ~{arc1-mcp-api/url}/oauth/callback
+            - ~{arc1-mcp-api/url}/oauth/logged-out
+            - https://arc1-ui-${space-guid}.${default-domain}/login/callback
+    requires:
+      - name: arc1-mcp-api

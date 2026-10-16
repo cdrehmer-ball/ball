@@ -1,0 +1,1140 @@
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it } from 'vitest';
+import {
+  AdtApiError,
+  classifyAbapgitError,
+  classifyGctsError,
+  classifySapDomainError,
+  destinationPpHint,
+  extractExceptionType,
+  extractLockOwner,
+  extractUnknownColumn,
+  formatUnknownColumnHint,
+} from '../../../src/adt/errors.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FIXTURES_DIR = join(__dirname, '..', '..', 'fixtures', 'xml');
+const PROBE_FIXTURES_DIR = join(__dirname, '..', '..', 'fixtures', 'probe');
+const loadXmlFixture = (name: string): string => readFileSync(join(FIXTURES_DIR, name), 'utf-8');
+
+describe('AdtApiError', () => {
+  describe('extractCleanMessage', () => {
+    it('extracts localizedMessage from SAP XML exception', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Object PROG ZZZNOTEXIST999 does not exist</exc:localizedMessage>
+  <exc:exception_id>NOT_FOUND</exc:exception_id>
+</exc:exception>`;
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('Object PROG ZZZNOTEXIST999 does not exist');
+    });
+
+    it('extracts localizedMessage without namespace prefix', () => {
+      const xml = '<exception><localizedMessage lang="EN">Lock conflict on object</localizedMessage></exception>';
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('Lock conflict on object');
+    });
+
+    it('extracts message element as fallback', () => {
+      const xml = '<error><message lang="EN">Syntax error in line 5</message></error>';
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('Syntax error in line 5');
+    });
+
+    it('extracts title from HTML error page', () => {
+      const html =
+        '<html><head><title>503 Service Unavailable</title></head><body><h1>Service Unavailable</h1></body></html>';
+      expect(AdtApiError.extractCleanMessage(html)).toBe('503 Service Unavailable');
+    });
+
+    it('extracts h1 from HTML without title', () => {
+      const html = '<html><body><h1>Gateway Timeout</h1></body></html>';
+      expect(AdtApiError.extractCleanMessage(html)).toBe('Gateway Timeout');
+    });
+
+    it('returns plain text as-is', () => {
+      expect(AdtApiError.extractCleanMessage('Session timed out')).toBe('Session timed out');
+    });
+
+    it('truncates long plain text', () => {
+      const long = 'A'.repeat(500);
+      expect(AdtApiError.extractCleanMessage(long)).toBe('A'.repeat(300));
+    });
+
+    it('strips tags from unrecognized XML', () => {
+      const xml = '<root><nested>Some error text</nested><other>more</other></root>';
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('Some error text more');
+    });
+
+    it('handles empty string', () => {
+      expect(AdtApiError.extractCleanMessage('')).toBe('Unknown error');
+    });
+
+    it('handles XML with only tags and no text', () => {
+      expect(AdtApiError.extractCleanMessage('<root><empty/></root>')).toBe(
+        'SAP returned an error (no readable message)',
+      );
+    });
+
+    it('handles repeated malformed tags without backtracking', () => {
+      const raw = '<localizedMessage'.repeat(500);
+      expect(AdtApiError.extractCleanMessage(raw)).toBe('SAP returned an error (no readable message)');
+    });
+
+    // The tag end is found quote-aware, so a quoted run may hold a ">". The attribute parser stopped
+    // at that ">" and never moved on: every one of these bodies hung the process in the constructor.
+    // Run separately so a regression fails by timeout instead of hanging the test worker.
+    it('finishes on malformed attributes and repeated unclosed HTML openers', () => {
+      const source = new URL('../../../src/adt/errors.ts', import.meta.url).href;
+      const inputs = ['<a "b>c">', '{"message":"x < y \\"quoted > text\\" z > w"}', 'a < 5 and "x>y" > 3'];
+      const child = spawnSync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--input-type=module',
+          '-e',
+          `
+        import { AdtApiError } from ${JSON.stringify(source)};
+        // Build the large input here so it does not exceed the OS argument-size limit.
+        for (const raw of [...${JSON.stringify(inputs)}, \`x\${' <html>'.repeat(300_000)}\`]) {
+          new AdtApiError(raw, 500, '/p', raw);
+          AdtApiError.extractProperties(raw);
+          AdtApiError.extractAllMessages(raw);
+        }
+      `,
+        ],
+        { timeout: 5000, encoding: 'utf8' },
+      );
+      expect(child.error).toBeUndefined();
+      expect(child.status, child.stderr).toBe(0);
+    }, 10000);
+
+    it('extracts msgText from SAP HTML 500 error page', () => {
+      const html = `<!DOCTYPE html>
+<html><head><title>Application Server Error</title></head><body>
+<p class="detailText"><span id="msgText">Syntax error in program ZC_FBCLUBTP===================BD        .</span></p>
+</body></html>`;
+      expect(AdtApiError.extractCleanMessage(html)).toBe(
+        'Application Server Error: Syntax error in program ZC_FBCLUBTP===================BD        .',
+      );
+    });
+
+    it('extracts msgText without title context', () => {
+      const html = '<html><body><span id="msgText">The ASSERT condition was violated.</span></body></html>';
+      expect(AdtApiError.extractCleanMessage(html)).toBe('The ASSERT condition was violated.');
+    });
+
+    it('extracts detailText paragraph', () => {
+      const html = '<html><body><p class="detailText">Session expired for user DEVELOPER</p></body></html>';
+      expect(AdtApiError.extractCleanMessage(html)).toBe('Session expired for user DEVELOPER');
+    });
+  });
+
+  describe('constructor deep error extraction', () => {
+    it('extracts msgText from full responseBody when truncated message only yields HTML title', () => {
+      // Simulate: first 500 chars only contain the HTML head (title), but full body has msgText deeper
+      const shortHtml = `<html><head><title>Application Server Error</title></head><body>${'x'.repeat(400)}`;
+      const fullHtml =
+        shortHtml +
+        '<p class="detailText"><span id="msgText">Syntax error in program ZC_FBCLUBTP===================BD</span></p></body></html>';
+      const err = new AdtApiError(shortHtml, 500, '/sap/bc/adt/activation', fullHtml);
+      expect(err.message).toContain('Syntax error in program ZC_FBCLUBTP');
+    });
+
+    // The tag stripper is for raw SAP bodies. Run over a composed message it deleted "<id>"-style
+    // placeholders and everything after a lone "<".
+    it('keeps angle brackets in a composed plain-text message', () => {
+      const err = new AdtApiError('Include <ZFOO_TOP> not found; length < 5 required', 400, '/p');
+      expect(err.message).toBe('ADT API error: status 400 at /p: Include <ZFOO_TOP> not found; length < 5 required');
+    });
+
+    it('still cleans a raw body that starts with whitespace', () => {
+      const err = new AdtApiError('\n <error><message lang="EN">Syntax error in line 5</message></error>', 400, '/p');
+      expect(err.message).toBe('ADT API error: status 400 at /p: Syntax error in line 5');
+    });
+  });
+
+  // SAP error bodies never pass through `parseXml`; the raw scanner in errors.ts is their one decode.
+  describe('XML entity decoding', () => {
+    const exception = (inner: string): string =>
+      `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">${inner}</exc:exception>`;
+
+    it('decodes &amp; &lt; &gt; in an exception message', () => {
+      const xml = exception(
+        '<message lang="EN">invalid URI: /sap/bc/adt/x?sap-client=001&amp;x=1 &lt;tag&gt;</message>',
+      );
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('invalid URI: /sap/bc/adt/x?sap-client=001&x=1 <tag>');
+    });
+
+    it('decodes the URI-mapping error recorded live on SAP_BASIS 758', () => {
+      // The recording's own `errorMessage` field predates this decode and still shows `&amp;`.
+      const recorded = JSON.parse(
+        readFileSync(
+          join(
+            PROBE_FIXTURES_DIR,
+            's4hana-2023-onprem-abap-trial/responses/GET__sap_bc_adt_bo_behaviordefinitions.json',
+          ),
+          'utf-8',
+        ),
+      ) as { url: string; statusCode: number; body: string };
+      const uri = '/sap/bc/adt/bo/behaviordefinitions?sap-client=001&';
+
+      const err = new AdtApiError(recorded.body.slice(0, 500), recorded.statusCode, recorded.url, recorded.body);
+      expect(err.message).toBe(
+        `ADT API error: status 400 at /sap/bc/adt/bo/behaviordefinitions: URI-Mapping cannot be performed due to invalid URI: ${uri}`,
+      );
+      expect(AdtApiError.extractProperties(recorded.body)['T100KEY-V1']).toBe(uri);
+    });
+
+    it('keeps a chained &amp;lt; as the literal text &lt;', () => {
+      const xml = exception('<message>a &amp;lt; b &amp;amp; c</message>');
+      expect(AdtApiError.extractCleanMessage(xml)).toBe('a &lt; b &amp; c');
+      expect(new AdtApiError(xml, 400, '/p', xml).message).toBe('ADT API error: status 400 at /p: a &lt; b &amp; c');
+    });
+
+    it('decodes everything the scanner returns: extra messages, property keys and values, DDIC diagnostics', () => {
+      const xml = exception(
+        '<localizedMessage>Save failed</localizedMessage>' +
+          '<localizedMessage>Field &quot;&lt;LS_DATA&gt;&quot; is unknown</localizedMessage>' +
+          '<properties><entry key="T100KEY-MSGID">SBD</entry><entry key="T100KEY-V1">R&amp;D</entry>' +
+          '<entry key="A&amp;B">x &gt; y</entry></properties>',
+      );
+      expect(AdtApiError.extractAllMessages(xml)).toEqual(['Field "<LS_DATA>" is unknown']);
+      expect(AdtApiError.extractProperties(xml)).toEqual({
+        'T100KEY-MSGID': 'SBD',
+        'T100KEY-V1': 'R&D',
+        'A&B': 'x > y',
+      });
+      expect(AdtApiError.formatDdicDiagnostics(xml)).toContain('[SBD/?] V1=R&D: Field "<LS_DATA>" is unknown');
+    });
+
+    it('decodes an HTML error page once, whichever element carries the message', () => {
+      expect(
+        AdtApiError.extractCleanMessage(
+          '<html><head><title>Application Server Error &amp; more</title></head><body><p class="detailText">' +
+            '<span id="msgText">Field &quot;&lt;LS_DATA&gt;&quot; is unknown, see &amp;lt;docs&amp;gt;</span></p></body></html>',
+        ),
+      ).toBe('Application Server Error & more: Field "<LS_DATA>" is unknown, see &lt;docs&gt;');
+      expect(AdtApiError.extractCleanMessage('<html><body><p class="detailText">a &lt; b</p></body></html>')).toBe(
+        'a < b',
+      );
+      expect(AdtApiError.extractCleanMessage('<html><head><title>A &amp; B</title></head></html>')).toBe('A & B');
+      expect(AdtApiError.extractCleanMessage('<html><body><h1>A &gt; &amp;gt; B</h1></body></html>')).toBe(
+        'A > &gt; B',
+      );
+    });
+
+    it('decodes once when the constructor falls back from the truncated page to the full body', () => {
+      const head = `<html><head><title>Application Server Error</title></head><body>${'x'.repeat(400)}`;
+      const full = `${head}<span id="msgText">Unknown &lt;LS_DATA&gt; &amp; &amp;lt;fs&amp;gt;</span></body></html>`;
+      expect(new AdtApiError(head, 500, '/p', full).message).toBe(
+        'ADT API error: status 500 at /p: Application Server Error: Unknown <LS_DATA> & &lt;fs&gt;',
+      );
+    });
+
+    it('decodes the tag-stripping fallback, which a message cut by the 500-character slice takes', () => {
+      const body = exception(`<message lang="EN">a &amp; b &lt;c&gt; &amp;lt; ${'y'.repeat(600)}</message>`);
+      expect(new AdtApiError(body.slice(0, 500), 400, '/p', body).message).toMatch(/ at \/p: a & b <c> &lt; y+$/);
+    });
+
+    it('never rescans text that is not a markup document', () => {
+      // A plain-text body is not XML, so its `&amp;` is literal.
+      expect(AdtApiError.extractCleanMessage('Forbidden &amp; denied')).toBe('Forbidden &amp; denied');
+      // ARC-1's own message keeps its `<placeholder>`.
+      expect(new AdtApiError('Pass group=<function group>.', 400, '/p').message).toBe(
+        'ADT API error: status 400 at /p: Pass group=<function group>.',
+      );
+      // An extracted message fed back in — e.g. re-wrapped in a new AdtApiError — is returned unchanged:
+      // a second pass would strip the literal `<tag>` and turn `&lt;` into `<`.
+      const xml = exception('<message>a &amp;lt; b &lt;tag&gt; c</message>');
+      const message = new AdtApiError(xml, 400, '/p', xml).message;
+      expect(message).toBe('ADT API error: status 400 at /p: a &lt; b <tag> c');
+      expect(new AdtApiError(message, 400, '/p').message).toBe(`ADT API error: status 400 at /p: ${message}`);
+      // The same holds for a direct call, not only through the constructor.
+      expect(AdtApiError.extractCleanMessage(message)).toBe(message);
+    });
+
+    it('does not replace a composed message with details from an unrelated response body', () => {
+      const message = 'Application Server Error: sanitized';
+      const body = '<html><title>Application Server Error</title><span id="msgText">unrelated detail</span></html>';
+      expect(new AdtApiError(message, 500, '/p', body).message).toBe(`ADT API error: status 500 at /p: ${message}`);
+    });
+
+    it('keeps explicitly composed text starting with an angle bracket intact', () => {
+      expect(new AdtApiError('<ZFOO> &lt; rejected', 400, '/p', undefined, { plainText: true }).message).toBe(
+        'ADT API error: status 400 at /p: <ZFOO> &lt; rejected',
+      );
+    });
+
+    it('matches decoded HTML attributes and decodes numeric references once', () => {
+      expect(AdtApiError.extractCleanMessage('<html><span id="msg&#84;ext">&#60;X&#62; &amp;lt;</span></html>')).toBe(
+        '<X> &lt;',
+      );
+    });
+  });
+
+  describe('extractAllMessages', () => {
+    it('extracts additional messages beyond the first', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">DDL source could not be saved</exc:localizedMessage>
+  <exc:localizedMessage lang="EN">Field POSITION is a reserved keyword (line 5, col 3)</exc:localizedMessage>
+  <exc:localizedMessage lang="EN">Check CDS documentation</exc:localizedMessage>
+</exc:exception>`;
+      const messages = AdtApiError.extractAllMessages(xml);
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toBe('Field POSITION is a reserved keyword (line 5, col 3)');
+      expect(messages[1]).toBe('Check CDS documentation');
+    });
+
+    it('returns empty array for single message', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Object not found</exc:localizedMessage>
+</exc:exception>`;
+      expect(AdtApiError.extractAllMessages(xml)).toHaveLength(0);
+    });
+
+    it('returns empty array for empty XML', () => {
+      expect(AdtApiError.extractAllMessages('')).toHaveLength(0);
+    });
+
+    it('returns empty array for HTML response', () => {
+      expect(AdtApiError.extractAllMessages('<html><body>Error</body></html>')).toHaveLength(0);
+    });
+
+    it('handles messages without namespace prefix', () => {
+      const xml = `<exception>
+  <localizedMessage lang="EN">First error</localizedMessage>
+  <localizedMessage lang="EN">Second error on line 10</localizedMessage>
+</exception>`;
+      const messages = AdtApiError.extractAllMessages(xml);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toBe('Second error on line 10');
+    });
+
+    it('returns empty array for repeated malformed localizedMessage tags', () => {
+      expect(AdtApiError.extractAllMessages('<localizedMessage'.repeat(500))).toEqual([]);
+    });
+  });
+
+  describe('extractProperties', () => {
+    it('extracts key-value properties from SAP XML', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Syntax error</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-NO">039</entry>
+    <entry key="LINE">15</entry>
+    <entry key="COLUMN">8</entry>
+  </exc:properties>
+</exc:exception>`;
+      const props = AdtApiError.extractProperties(xml);
+      expect(props['T100KEY-NO']).toBe('039');
+      expect(props.LINE).toBe('15');
+      expect(props.COLUMN).toBe('8');
+    });
+
+    it('returns empty object for XML without properties', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Not found</exc:localizedMessage>
+</exc:exception>`;
+      expect(AdtApiError.extractProperties(xml)).toEqual({});
+    });
+
+    it('returns empty object for empty input', () => {
+      expect(AdtApiError.extractProperties('')).toEqual({});
+    });
+
+    it('extracts multiple properties correctly', () => {
+      const xml = `<properties>
+  <entry key="MSG_ID">CL</entry>
+  <entry key="MSG_NO">001</entry>
+  <entry key="SEVERITY">E</entry>
+</properties>`;
+      const props = AdtApiError.extractProperties(xml);
+      expect(Object.keys(props)).toHaveLength(3);
+      expect(props.MSG_ID).toBe('CL');
+      expect(props.SEVERITY).toBe('E');
+    });
+  });
+
+  describe('extractDdicDiagnostics', () => {
+    it('extracts structured diagnostics from SBD_MESSAGES-style response', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Can&apos;t save due to errors in source</exc:localizedMessage>
+  <exc:localizedMessage lang="EN">Missing required annotation @AbapCatalog.enhancement.category</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-MSGID">SBD_MESSAGES</entry>
+    <entry key="T100KEY-MSGNO">007</entry>
+    <entry key="T100KEY-V1">ZI_TRAVEL</entry>
+    <entry key="T100KEY-V2">FIELD_NAME</entry>
+    <entry key="LINE">5</entry>
+    <entry key="COLUMN">12</entry>
+  </exc:properties>
+</exc:exception>`;
+      const diagnostics = AdtApiError.extractDdicDiagnostics(xml);
+      expect(diagnostics.length).toBeGreaterThan(0);
+      expect(diagnostics[0]?.messageId).toBe('SBD_MESSAGES');
+      expect(diagnostics[0]?.messageNumber).toBe('007');
+      expect(diagnostics[0]?.variables).toEqual(['ZI_TRAVEL', 'FIELD_NAME']);
+      expect(diagnostics[0]?.lineNumber).toBe(5);
+    });
+
+    it('extracts V1-V4 message variables when present', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Generic DDIC failure</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-MSGID">SBD</entry>
+    <entry key="T100KEY-MSGNO">007</entry>
+    <entry key="T100KEY-V1">V1</entry>
+    <entry key="T100KEY-V2">V2</entry>
+    <entry key="T100KEY-V3">V3</entry>
+    <entry key="T100KEY-V4">V4</entry>
+  </exc:properties>
+</exc:exception>`;
+      const diagnostics = AdtApiError.extractDdicDiagnostics(xml);
+      expect(diagnostics[0]?.variables).toEqual(['V1', 'V2', 'V3', 'V4']);
+    });
+
+    it('parses line number from line/column properties and message text', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Field "POSITION" invalid at line 17</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-MSGID">SBD</entry>
+    <entry key="T100KEY-MSGNO">007</entry>
+    <entry key="LINE">17</entry>
+  </exc:properties>
+</exc:exception>`;
+      const diagnostics = AdtApiError.extractDdicDiagnostics(xml);
+      expect(diagnostics[0]?.lineNumber).toBe(17);
+    });
+
+    it('returns empty array for empty XML', () => {
+      expect(AdtApiError.extractDdicDiagnostics('')).toEqual([]);
+    });
+
+    it('returns empty array for non-DDIC XML with single localizedMessage', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Object not found</exc:localizedMessage>
+</exc:exception>`;
+      expect(AdtApiError.extractDdicDiagnostics(xml)).toEqual([]);
+    });
+
+    it('extracts diagnostics from multiple localized messages even without properties', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Can&apos;t save due to errors in source</exc:localizedMessage>
+  <exc:localizedMessage lang="EN">Line 9: Unknown type ABAP.XXX</exc:localizedMessage>
+</exc:exception>`;
+      const diagnostics = AdtApiError.extractDdicDiagnostics(xml);
+      expect(diagnostics).toHaveLength(2);
+      expect(diagnostics[1]?.lineNumber).toBe(9);
+    });
+  });
+
+  it('extracts the HTML title after a proxy preamble', () => {
+    const error = new AdtApiError('Proxy error 502 <html><head><title>Bad Gateway</title></head></html>', 502, '/p');
+    expect(error.message).toBe('ADT API error: status 502 at /p: Bad Gateway');
+  });
+
+  it('preserves a closing-tag example in a composed plain-text message', () => {
+    const error = new AdtApiError('Expected </body> after <body>', 400, '/p');
+    expect(error.message).toBe('ADT API error: status 400 at /p: Expected </body> after <body>');
+  });
+
+  describe('formatDdicDiagnostics', () => {
+    it('uses the message class key returned by the live abapGit bridge', () => {
+      const xml =
+        '<exception><localizedMessage>Repository not found</localizedMessage><properties>' +
+        '<entry key="T100KEY-ID">00</entry><entry key="T100KEY-NO">001</entry></properties></exception>';
+      expect(AdtApiError.formatDdicDiagnostics(xml)).toContain('[00/001]');
+      expect(classifyAbapgitError(xml).t100Key).toBe('00/001');
+    });
+    it('prefers MSGID when both message-class keys are present', () => {
+      const xml =
+        '<exception><entry key="T100KEY-MSGID">PRIMARY</entry><entry key="T100KEY-ID">FALLBACK</entry><entry key="T100KEY-NO">001</entry></exception>';
+      expect(AdtApiError.formatDdicDiagnostics(xml)).toContain('[PRIMARY/001]');
+      expect(classifyAbapgitError(xml).t100Key).toBe('PRIMARY/001');
+    });
+
+    it('formats structured DDIC diagnostics as bullet list', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Can&apos;t save due to errors in source</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-MSGID">SBD_MESSAGES</entry>
+    <entry key="T100KEY-MSGNO">007</entry>
+    <entry key="T100KEY-V1">FIELD_A</entry>
+    <entry key="LINE">5</entry>
+  </exc:properties>
+</exc:exception>`;
+      const formatted = AdtApiError.formatDdicDiagnostics(xml);
+      expect(formatted).toContain('DDIC diagnostics:');
+      expect(formatted).toContain('[SBD_MESSAGES/007]');
+      expect(formatted).toContain('V1=FIELD_A');
+      expect(formatted).toContain('Line 5');
+    });
+
+    it('returns empty string when no DDIC diagnostics exist', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Object not found</exc:localizedMessage>
+</exc:exception>`;
+      expect(AdtApiError.formatDdicDiagnostics(xml)).toBe('');
+    });
+  });
+
+  describe('extractExceptionType', () => {
+    it('extracts type id from standard SAP XML', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionResourceNotFound"/>
+  <exc:localizedMessage lang="EN">Object not found</exc:localizedMessage>
+</exc:exception>`;
+      expect(extractExceptionType(xml)).toBe('ExceptionResourceNotFound');
+    });
+
+    it('extracts type id with namespace prefix', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:type id="ExceptionNotAuthorized"></exc:type>
+</exc:exception>`;
+      expect(extractExceptionType(xml)).toBe('ExceptionNotAuthorized');
+    });
+
+    it('returns undefined for HTML input', () => {
+      expect(extractExceptionType('<html><body>403 Forbidden</body></html>')).toBeUndefined();
+    });
+
+    it('returns undefined for plain text input', () => {
+      expect(extractExceptionType('authorization failed')).toBeUndefined();
+    });
+
+    it('returns undefined for empty input', () => {
+      expect(extractExceptionType('')).toBeUndefined();
+    });
+  });
+
+  describe('extractLockOwner', () => {
+    it('extracts user and transport from lock message', () => {
+      const owner = extractLockOwner('Object is locked by user DEVELOPER in task E19K900001');
+      expect(owner).toEqual({ user: 'DEVELOPER', transport: 'E19K900001' });
+    });
+
+    it('extracts user only when transport is missing', () => {
+      const owner = extractLockOwner('Request is currently being edited by user MARIAN');
+      expect(owner).toEqual({ user: 'MARIAN' });
+    });
+
+    it('extracts transport only when user is missing', () => {
+      const owner = extractLockOwner('Resource is locked in transport A4HK900502');
+      expect(owner).toEqual({ transport: 'A4HK900502' });
+    });
+
+    it('extracts user from "User X is currently editing Y" format', () => {
+      const owner = extractLockOwner('User MARIAN is currently editing ZARC1_TEST_REPORT');
+      expect(owner).toEqual({ user: 'MARIAN' });
+    });
+
+    it('returns undefined when no lock owner details exist', () => {
+      expect(extractLockOwner('Syntax error in line 5')).toBeUndefined();
+    });
+
+    it('extracts MARIAN from real S/4 lock-conflict body (T100KEY-V1 wins over LONGTEXT "another user")', () => {
+      // The captured S/4 body contains BOTH:
+      //   <message>User MARIAN is currently editing ZARC1_BAT1_MNW93T2K</message>
+      //   <entry key="LONGTEXT">…being edited by another user…</entry>
+      //   <entry key="T100KEY-V1">MARIAN</entry>
+      // Without the T100 path, the regex chain matched "by another" first → bug.
+      const owner = extractLockOwner(loadXmlFixture('lock-conflict-s4.xml'));
+      expect(owner?.user).toBe('MARIAN');
+    });
+
+    it('falls back to regex when T100KEY-V1 is absent', () => {
+      expect(extractLockOwner('User DEVELOPER is currently editing ZTEST')).toEqual({ user: 'DEVELOPER' });
+    });
+
+    it('rejects placeholder "another" capture and falls through to undefined', () => {
+      // Body has the LONGTEXT-style phrasing but no structured T100 and no specific message.
+      // Without the placeholder filter, the old chain captured "another" as a userid.
+      const owner = extractLockOwner('This object is currently being edited by another user.');
+      expect(owner).toBeUndefined();
+    });
+
+    it('rejects placeholder words (case-insensitive)', () => {
+      expect(extractLockOwner('locked by Another')).toBeUndefined();
+      expect(extractLockOwner('locked by THE backend')).toBeUndefined();
+    });
+  });
+
+  describe('classifySapDomainError', () => {
+    it('classifies lock conflicts and extracts lock owner details', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionResourceLockedByAnotherUser"/>
+  <exc:localizedMessage lang="EN">Object is locked by user DEVELOPER in task E19K900001</exc:localizedMessage>
+</exc:exception>`;
+      const classification = classifySapDomainError(409, xml);
+      expect(classification?.category).toBe('lock-conflict');
+      expect(classification?.hint).toContain('DEVELOPER');
+      expect(classification?.hint).toContain('E19K900001');
+      expect(classification?.transaction).toBe('SM12');
+    });
+
+    it('classifies the BTP data-preview 400 "No authorization to view data" distinctly (T-2/T-3)', () => {
+      // Live-captured on BTP 919 for both table preview and freestyle SQL on standard tables.
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionDataPreviewGeneral"/><message lang="EN">No authorization to view data</message><properties><entry key="T100KEY-ID">ADT_DATAPREVIEW_MSG</entry><entry key="T100KEY-NO">023</entry></properties></exc:exception>`;
+      const classification = classifySapDomainError(400, xml);
+      expect(classification?.category).toBe('data-view-not-authorized');
+      expect(classification?.hint).toMatch(/released CDS view|custom Z\* table/i);
+      // Must NOT be mistaken for a generic lock/auth case.
+      expect(classification?.category).not.toBe('lock-conflict');
+      expect(classification?.category).not.toBe('authorization');
+    });
+
+    it('classifies the BTP package-create email-deserialize 400 (SPAK_ST_PACKAGES)', () => {
+      // Live-captured 919: an IAS email as adtcore:responsible breaks the package deserialize ST.
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionInvalidData"/><message lang="EN">An error occurred when deserializing in the simple transformation program SPAK_ST_PACKAGES</message><properties><entry key="T100KEY-ID"></entry><entry key="T100KEY-NO">001</entry></properties></exc:exception>`;
+      const c = classifySapDomainError(400, xml);
+      expect(c?.category).toBe('package-create-invalid');
+      expect(c?.hint).toMatch(/internal ABAP user|XUBNAME/i);
+      expect(c?.category).not.toBe('lock-conflict');
+    });
+
+    it('classifies the BTP package-create TR/458 not-a-valid-software-component 400', () => {
+      // Live-captured 919: naming ZLOCAL as a root SC instead of nesting under it.
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionResourceCreationFailure"/><message lang="EN">ZLOCAL is not a valid software component for package ZARC1_X</message><properties><entry key="T100KEY-ID">TR</entry><entry key="T100KEY-NO">458</entry></properties></exc:exception>`;
+      const c = classifySapDomainError(400, xml);
+      expect(c?.category).toBe('package-create-invalid');
+      expect(c?.hint).toMatch(/structure package|superPackage/i);
+    });
+
+    it('does not misclassify an unrelated exception as package-create-invalid (negative path)', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionSomethingElse"/><message lang="EN">whatever</message></exc:exception>`;
+      expect(classifySapDomainError(400, xml)?.category).not.toBe('package-create-invalid');
+    });
+
+    it('classifies lock conflicts from 403 with "currently editing" (SAP A4H pattern)', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">User MARIAN is currently editing ZARC1_TEST_REPORT</exc:localizedMessage>
+</exc:exception>`;
+      const classification = classifySapDomainError(403, xml);
+      expect(classification?.category).toBe('lock-conflict');
+      expect(classification?.hint).toContain('MARIAN');
+      expect(classification?.hint).toContain('SM12');
+      expect(classification?.transaction).toBe('SM12');
+      expect(classification?.details?.user).toBe('MARIAN');
+    });
+
+    it('classifies lock conflicts from 403 with "being edited by" pattern', () => {
+      const classification = classifySapDomainError(403, 'Resource is being edited by user DEVELOPER');
+      expect(classification?.category).toBe('lock-conflict');
+      expect(classification?.hint).toContain('DEVELOPER');
+    });
+
+    it('classifies ExceptionResourceNoAccess as lock-conflict (PR-γ / ADR-0002)', () => {
+      // CX_ADT_RES_NO_ACCESS surfaces as ExceptionResourceNoAccess in structured XML;
+      // the classifier now treats it the same as ExceptionResourceLockedByAnotherUser.
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionResourceNoAccess"/>
+</exc:exception>`;
+      const classification = classifySapDomainError(409, xml);
+      expect(classification?.category).toBe('lock-conflict');
+    });
+
+    it('classifies a create-time structure-package 403 as authorization, NOT a lock (no SM12) — review fix', () => {
+      // Live BTP 919: creating into a structure package → 403 ExceptionResourceNoAccess + PAK/149
+      // "Structure packages cannot contain development objects". Must NOT get the misleading SM12 lock hint.
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionResourceNoAccess"/><message lang="EN">Structure packages cannot contain development objects</message></exc:exception>`;
+      const classification = classifySapDomainError(403, xml);
+      expect(classification?.category).toBe('authorization');
+      expect(classification?.category).not.toBe('lock-conflict');
+      // Not the lock path: no SM12 transaction, and the hint is the package/auth guidance.
+      expect(classification?.transaction).not.toBe('SM12');
+      expect(classification?.hint).toMatch(/not a lock|package/i);
+    });
+
+    it('does not misclassify 403 auth error as lock conflict', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionNotAuthorized"/>
+  <exc:localizedMessage lang="EN">Not authorized for S_DEVELOP</exc:localizedMessage>
+</exc:exception>`;
+      const classification = classifySapDomainError(403, xml);
+      expect(classification?.category).toBe('authorization');
+    });
+
+    it('classifies an un-activated ICF node (403 "Service cannot be reached" HTML) as icf-service-inactive', () => {
+      const html =
+        '<html><head><title>Service cannot be reached</title></head><body>' +
+        '<span class="errorTextHeader"> 403 Forbidden </span></body></html>';
+      const classification = classifySapDomainError(403, html, '/sap/bc/stmc/data');
+      expect(classification?.category).toBe('icf-service-inactive');
+      expect(classification?.transaction).toBe('SICF');
+      expect(classification?.hint).toContain('/sap/bc/stmc/data');
+    });
+
+    it('does not mistake an ADT object-not-found (XML ExceptionResourceNotFound) for an inactive ICF node', () => {
+      const xml2 =
+        '<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">' +
+        '<type id="ExceptionResourceNotFound"/>' +
+        '<message lang="EN">Resource /sap/bc/adt/foo does not exist.</message></exc:exception>';
+      const classification = classifySapDomainError(404, xml2, '/sap/bc/adt/foo');
+      expect(classification?.category).not.toBe('icf-service-inactive');
+    });
+
+    it('does not classify structured ADT XML as inactive ICF even if the message says service cannot be reached', () => {
+      const xml =
+        '<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">' +
+        '<type id="ExceptionResourceNotFound"/>' +
+        '<message lang="EN">Service cannot be reached</message></exc:exception>';
+      const classification = classifySapDomainError(404, xml, '/sap/bc/adt/foo');
+      expect(classification?.category).not.toBe('icf-service-inactive');
+    });
+
+    it('still classifies a plain 403 auth body as authorization, not icf-service-inactive', () => {
+      const classification = classifySapDomainError(403, 'Not authorized: S_ADT_RES check failed', '/sap/bc/adt/x');
+      expect(classification?.category).toBe('authorization');
+    });
+
+    it('classifies enqueue errors for 423 (release unknown → combined guidance)', () => {
+      const classification = classifySapDomainError(423, 'Lock handle invalid');
+      expect(classification?.category).toBe('enqueue-error');
+      // First-line advice: retry (transient expiry is the common case).
+      expect(classification?.hint).toContain('Retry first');
+      // Release unknown → still point at the real fix for < 7.51 systems
+      // (abapfs_extensions) so the hint is actionable even without detection.
+      expect(classification?.hint).toContain('abapfs_extensions');
+      // SAP Note 2727890 is kept only as a "separate, narrow bug" mention — NOT the fix.
+      expect(classification?.hint).toContain('2727890');
+    });
+
+    it('423 on SAP_BASIS < 7.51 leads with the abapfs_extensions fix', () => {
+      for (const release of ['700', '740', '750']) {
+        const classification = classifySapDomainError(423, 'x', undefined, release);
+        expect(classification?.category).toBe('enqueue-error');
+        expect(classification?.hint).toContain('abapfs_extensions');
+        expect(classification?.hint).toContain(release);
+      }
+    });
+
+    it('423 on SAP_BASIS >= 7.51 does NOT mention abapfs_extensions (transient/real-lock)', () => {
+      for (const release of ['751', '758']) {
+        const classification = classifySapDomainError(423, 'x', undefined, release);
+        expect(classification?.category).toBe('enqueue-error');
+        expect(classification?.hint).not.toContain('abapfs_extensions');
+        expect(classification?.hint).toContain('Retry first');
+        expect(classification?.transaction).toBe('SM12');
+      }
+    });
+
+    it('classifies 404 "No suitable resource found" as ICF handler not bound', () => {
+      const classification = classifySapDomainError(
+        404,
+        '<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionResourceNotFound"/><message lang="EN">No suitable resource found</message></exc:exception>',
+      );
+      expect(classification?.category).toBe('icf-handler-not-bound');
+      expect(classification?.hint).toContain('SICF');
+      // The hint distinguishes the ADT-framework-level "No suitable resource"
+      // path from a regular missing-object 404.
+      expect(classification?.hint).toContain('Handler List');
+      expect(classification?.transaction).toBe('SICF');
+    });
+
+    it('classifies the CCAU "does not have any inactive version" 500 as include-not-initialized', () => {
+      const xml =
+        '<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionResourceSaveFailure"/><message lang="EN">ZCL_X==============CCAU does not have any inactive version</message></exc:exception>';
+      const classification = classifySapDomainError(500, xml);
+      expect(classification?.category).toBe('include-not-initialized');
+      expect(classification?.hint).toMatch(/testclasses|auto-creates/i);
+      // Must NOT be mis-classified as activation-dependency (that branch also matches /inactive/).
+      expect(classification?.category).not.toBe('activation-dependency');
+    });
+
+    it('does NOT classify an unrelated 500 as include-not-initialized', () => {
+      const classification = classifySapDomainError(
+        500,
+        '<exc:exception><type id="ExceptionInternalError"/><message>Internal server error</message></exc:exception>',
+      );
+      expect(classification?.category).not.toBe('include-not-initialized');
+    });
+
+    it('does NOT treat generic 404 "does not exist" as ICF handler not bound', () => {
+      // "does not exist" is the normal missing-object path and gets no domain
+      // classification — the default "not found" message already tells the LLM
+      // what to do.
+      const classification = classifySapDomainError(
+        404,
+        '<exc:exception><type id="ExceptionResourceNotFound"/><message>Resource /sap/bc/adt/ddic/domains does not exist.</message></exc:exception>',
+      );
+      expect(classification).toBeUndefined();
+    });
+
+    it('classifies authorization errors via XML type', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionNotAuthorized"/>
+  <exc:localizedMessage lang="EN">Not authorized</exc:localizedMessage>
+</exc:exception>`;
+      const classification = classifySapDomainError(403, xml);
+      expect(classification?.category).toBe('authorization');
+      expect(classification?.hint).toContain('SU53');
+      expect(classification?.hint).toContain('S_DEVELOP');
+      expect(classification?.transaction).toBe('SU53');
+    });
+
+    it('emits a dump-detail-specific 403 hint when path is /runtime/dump/{id}', () => {
+      // Typical SAP body when a user can list dumps but lacks read on the detail resource.
+      const body = 'No authorization to access the resource /sap/bc/adt/runtime/dump/...';
+      const classification = classifySapDomainError(
+        403,
+        body,
+        '/sap/bc/adt/runtime/dump/20260101120000app01_SYS_00%20%20%20DEVUSER%20100%2042',
+      );
+      expect(classification?.category).toBe('authorization');
+      expect(classification?.transaction).toBe('SU53');
+      // Names the dump-detail resource and the typical SAP authorization objects.
+      expect(classification?.hint).toContain('short-dump detail');
+      expect(classification?.hint).toContain('DUMP_INFO');
+      expect(classification?.hint).toContain('DUMP_CUSER');
+      expect(classification?.hint).toContain('DUMP_CCLNT');
+      expect(classification?.hint).toContain('S_ABAPDUMP');
+      expect(classification?.hint).toContain('7.58');
+      expect(classification?.hint).toContain('ST22');
+      expect(classification?.hint).toContain('`S_ADT_RES` with `URI`');
+      expect(classification?.hint).toContain('/sap/bc/adt/runtime/dump/');
+      expect(classification?.hint).toContain('SU53');
+    });
+
+    it('emits a dump-list-specific 403 hint when path is /runtime/dumps', () => {
+      const classification = classifySapDomainError(
+        403,
+        'No authorization to access the resource /sap/bc/adt/runtime/dumps',
+        '/sap/bc/adt/runtime/dumps?$top=50',
+      );
+      expect(classification?.category).toBe('authorization');
+      // Different wording from the detail case: "Listing" not "Reading the ... detail".
+      expect(classification?.hint).toContain('Listing short dumps');
+      expect(classification?.hint).toContain('S_ABAPDUMP');
+      expect(classification?.hint).toContain('7.58');
+      expect(classification?.hint).toContain('ST22');
+      expect(classification?.hint).toContain('`S_ADT_RES` with `URI`');
+      expect(classification?.hint).not.toContain('short-dump detail');
+    });
+
+    it('emits a gateway-error-log-specific 403 hint when path is /gw/errorlog', () => {
+      const classification = classifySapDomainError(
+        403,
+        'No authorization to access the resource /sap/bc/adt/gw/errorlog/...',
+        '/sap/bc/adt/gw/errorlog/FrontendError/0050568D-8DF7-1ED0-AABB-CCDDEEFF0011',
+      );
+      expect(classification?.category).toBe('authorization');
+      expect(classification?.hint).toContain('SAP Gateway error log');
+      expect(classification?.hint).toContain('/IWFND/ERROR_LOG');
+      expect(classification?.hint).toContain('STAUTHTRACE');
+      expect(classification?.hint).toContain('`S_ADT_RES` with `URI`');
+      expect(classification?.hint).toContain('/sap/bc/adt/gw/errorlog/');
+    });
+
+    it('falls back to the generic authorization hint when the path is unknown', () => {
+      const classification = classifySapDomainError(
+        403,
+        'No authorization for S_DEVELOP',
+        '/sap/bc/adt/programs/programs/ZSOMETHING/source/main',
+      );
+      expect(classification?.category).toBe('authorization');
+      // Generic hint mentions S_DEVELOP / S_ADT_RES / S_TRANSPRT; no endpoint-specific advice.
+      expect(classification?.hint).toContain('S_DEVELOP');
+      expect(classification?.hint).toContain('S_TRANSPRT');
+      expect(classification?.hint).not.toContain('short-dump');
+      expect(classification?.hint).not.toContain('/IWFND/ERROR_LOG');
+    });
+
+    it('falls back to the generic authorization hint when path is not provided', () => {
+      // Backwards compatibility: callers that don't pass `path` still work.
+      const xml = `<exc:exception><type id="ExceptionNotAuthorized"/></exc:exception>`;
+      const classification = classifySapDomainError(403, xml);
+      expect(classification?.category).toBe('authorization');
+      expect(classification?.hint).toContain('S_DEVELOP');
+      expect(classification?.hint).not.toContain('short-dump');
+    });
+
+    it('classifies object-exists errors', () => {
+      const classification = classifySapDomainError(
+        409,
+        '<exc:exception><type id="ExceptionResourceCreationFailure"/><localizedMessage>Object already exists</localizedMessage></exc:exception>',
+      );
+      expect(classification?.category).toBe('object-exists');
+      expect(classification?.hint).toContain('already exists');
+    });
+
+    it('classifies non-extensible base BDEF create errors', () => {
+      const classification = classifySapDomainError(
+        400,
+        '<exc:exception><localizedMessage>Behavior Definition ZR_BASE is not marked as extensible</localizedMessage></exc:exception>',
+      );
+      expect(classification?.category).toBe('bdef-base-not-extensible');
+      expect(classification?.hint).toContain('base behavior definition is not extensible');
+      expect(classification?.hint).toContain('mapping ... corresponding extensible');
+    });
+
+    it('classifies the DDLS006 View Extend source-type restriction', () => {
+      const classification = classifySapDomainError(
+        400,
+        `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <type id="ExceptionResourceSaveFailure"/>
+  <exc:localizedMessage lang="EN">Object type View Extend is not allowed in this system</exc:localizedMessage>
+  <exc:properties><entry key="T100KEY-NO">006</entry><entry key="T100KEY-V1">View Extend</entry></exc:properties>
+</exc:exception>`,
+        '/sap/bc/adt/ddic/ddl/sources/Z_EXT/source/main',
+      );
+
+      expect(classification?.category).toBe('ddls-view-extend-restriction');
+      expect(classification?.details?.exceptionType).toBe('ExceptionResourceSaveFailure');
+      expect(classification?.hint).toContain('type="DDLS"');
+      expect(classification?.hint).toContain('Standard ABAP');
+      expect(classification?.hint).toContain('SAP Note 3567464');
+      expect(classification?.hint).toContain('not a general workaround');
+    });
+
+    it('classifies the structured View Extend T100 diagnostic independently of message language', () => {
+      const classification = classifySapDomainError(
+        400,
+        '<exc:exception><localizedMessage>DDL-Quelle konnte nicht gesichert werden</localizedMessage><properties><entry key="T100KEY-NO">006</entry><entry key="T100KEY-V1">View Extend</entry></properties></exc:exception>',
+      );
+
+      expect(classification?.category).toBe('ddls-view-extend-restriction');
+    });
+
+    it('does not classify other object-type restrictions as a View Extend restriction', () => {
+      expect(classifySapDomainError(400, 'Object type Data Definition is not allowed in this system')).toBeUndefined();
+    });
+
+    it('does not classify generic "already exists" messages without creation context', () => {
+      const classification = classifySapDomainError(
+        409,
+        '<exc:exception><localizedMessage>Activation failed: element already exists in metadata extension</localizedMessage></exc:exception>',
+      );
+      expect(classification).toBeUndefined();
+    });
+
+    it('classifies activation dependency errors from message text', () => {
+      const classification = classifySapDomainError(
+        400,
+        'Activation failed because dependency ZI_TRAVEL is inactive and not active',
+      );
+      expect(classification?.category).toBe('activation-dependency');
+      expect(classification?.hint).toContain('INACTIVE_OBJECTS');
+    });
+
+    it('classifies adjustment mode errors and points to SPAU', () => {
+      const classification = classifySapDomainError(400, 'System is in adjustment mode (SPAU_ENH)');
+      expect(classification?.category).toBe('transport-issue');
+      expect(classification?.transaction).toBe('SPAU');
+    });
+
+    it('classifies method-not-supported errors', () => {
+      const classification = classifySapDomainError(
+        405,
+        '<exc:exception><type id="ExceptionMethodNotSupported"/></exc:exception>',
+      );
+      expect(classification?.category).toBe('method-not-supported');
+    });
+
+    it('returns undefined for unclassifiable errors', () => {
+      expect(classifySapDomainError(418, 'teapot')).toBeUndefined();
+    });
+
+    it('returns undefined when response body is missing for non-special status', () => {
+      expect(classifySapDomainError(400, undefined)).toBeUndefined();
+    });
+
+    it('still classifies 423 when response body is undefined', () => {
+      const classification = classifySapDomainError(423, undefined);
+      expect(classification?.category).toBe('enqueue-error');
+    });
+  });
+
+  describe('isServerError', () => {
+    it('returns true for 500', () => {
+      const err = new AdtApiError('Server error', 500, '/sap/bc/adt/test');
+      expect(err.isServerError).toBe(true);
+    });
+
+    it('returns true for 502', () => {
+      const err = new AdtApiError('Bad gateway', 502, '/sap/bc/adt/test');
+      expect(err.isServerError).toBe(true);
+    });
+
+    it('returns true for 503', () => {
+      const err = new AdtApiError('Service unavailable', 503, '/sap/bc/adt/test');
+      expect(err.isServerError).toBe(true);
+    });
+
+    it('returns false for 400', () => {
+      const err = new AdtApiError('Bad request', 400, '/sap/bc/adt/test');
+      expect(err.isServerError).toBe(false);
+    });
+
+    it('returns false for 404', () => {
+      const err = new AdtApiError('Not found', 404, '/sap/bc/adt/test');
+      expect(err.isServerError).toBe(false);
+    });
+  });
+
+  describe('constructor strips XML from message', () => {
+    it('stores clean message, preserves raw body', () => {
+      const xml = `<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <exc:localizedMessage lang="EN">Program ZTEST not found</exc:localizedMessage>
+</exc:exception>`;
+      const err = new AdtApiError(xml, 404, '/sap/bc/adt/programs/programs/ZTEST', xml);
+
+      expect(err.message).toBe(
+        'ADT API error: status 404 at /sap/bc/adt/programs/programs/ZTEST: Program ZTEST not found',
+      );
+      expect(err.responseBody).toContain('exc:exception'); // Raw body preserved for debugging
+      expect(err.message).not.toContain('<'); // No XML in message
+    });
+  });
+
+  describe('classifyGctsError', () => {
+    it('extracts exception and first ERROR log message', () => {
+      const classified = classifyGctsError(
+        '{"exception":"No relation between system and repository","log":[{"severity":"INFO","message":"x"},{"severity":"ERROR","message":"remote failed"}]}',
+      );
+      expect(classified.exception).toBe('No relation between system and repository');
+      expect(classified.logMessage).toBe('remote failed');
+    });
+
+    it('returns empty classification for malformed JSON', () => {
+      expect(classifyGctsError('{not-json')).toEqual({});
+    });
+  });
+
+  describe('classifyAbapgitError', () => {
+    it('extracts namespace, message, and T100 key from XML payload', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">
+  <namespace id="org.abapgit.adt">org.abapgit.adt</namespace>
+  <exc:localizedMessage lang="EN">Repository not found in database. Key: REPO, 000000009999</exc:localizedMessage>
+  <exc:properties>
+    <entry key="T100KEY-MSGID">SADT_HTTP</entry>
+    <entry key="T100KEY-MSGNO">404</entry>
+  </exc:properties>
+</exc:exception>`;
+      const classified = classifyAbapgitError(xml);
+      expect(classified.namespace).toBe('org.abapgit.adt');
+      expect(classified.message).toContain('Repository not found in database');
+      expect(classified.t100Key).toBe('SADT_HTTP/404');
+    });
+
+    it('returns empty object for empty payload', () => {
+      expect(classifyAbapgitError('')).toEqual({});
+    });
+
+    it('returns the message entity-decoded', () => {
+      const xml =
+        '<exc:exception><namespace id="org.abapgit.adt"/>' +
+        '<message>Clone of https://example.com/r.git?a=1&amp;b=2 failed: &lt;unknown&gt;</message></exc:exception>';
+      expect(classifyAbapgitError(xml)).toEqual({
+        namespace: 'org.abapgit.adt',
+        message: 'Clone of https://example.com/r.git?a=1&b=2 failed: <unknown>',
+      });
+    });
+  });
+});
+
+describe('destinationPpHint', () => {
+  it('hints cross-subaccount on the OAuth2UserTokenExchange "unknown signing key" error (issue #434)', () => {
+    const msg =
+      'Retrieval of OAuthToken failed due to: Unable to fetch refresh token from the specified token ' +
+      'service URL. Response was: Token header claim [kid] references unknown signing key : [default-jwt-key-8826357d37]';
+    const hint = destinationPpHint(msg);
+    expect(hint).toBeDefined();
+    expect(hint).toContain('different BTP subaccounts');
+    expect(hint).toContain('OAuth2SAMLBearerAssertion');
+  });
+
+  it('hints cross-subaccount on the "Unable to map issuer / No identity provider found" variant', () => {
+    const hint = destinationPpHint(
+      'Unable to map issuer: No identity provider found for issuer: https://x.authentication…',
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toContain('OAuth2SAMLBearerAssertion');
+  });
+
+  it('returns undefined for an unrelated PP failure', () => {
+    expect(
+      destinationPpHint(
+        'no SAP-Connectivity-Authentication header, Bearer token, or jwt-bearer exchange token returned',
+      ),
+    ).toBeUndefined();
+  });
+
+  it('returns undefined for empty/undefined input', () => {
+    expect(destinationPpHint(undefined)).toBeUndefined();
+    expect(destinationPpHint('')).toBeUndefined();
+  });
+});
+
+describe('extractUnknownColumn / formatUnknownColumnHint (FEAT-64)', () => {
+  // Real data-preview error wire shape, live-captured on a4h 758 + a4h-2025 816 (EN AND DE).
+  // ADT_DATAPREVIEW_MSG/004 is language-stable but is a generic parser bucket, not an
+  // unknown-column discriminator; the verified message form must match too.
+  const dataPreviewErr = (msgNo: string, prose: string) =>
+    new AdtApiError(
+      'boom',
+      400,
+      '/sap/bc/adt/datapreview/freestyle',
+      '<?xml version="1.0" encoding="utf-8"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">' +
+        '<namespace id="http://www.sap.com/adt/wda/dataPreview"/><type id="ExceptionDataPreviewGeneral"/>' +
+        `<message lang="EN">${prose}</message><localizedMessage lang="EN">${prose}</localizedMessage>` +
+        `<properties><entry key="T100KEY-ID">ADT_DATAPREVIEW_MSG</entry><entry key="T100KEY-NO">${msgNo}</entry>` +
+        `<entry key="T100KEY-V1">${prose}</entry></properties></exc:exception>`,
+    );
+  const unknownColErr = (prose: string) => dataPreviewErr('004', prose);
+
+  it('extracts the column from the live EN unknown-column 400 (ADT_DATAPREVIEW_MSG/004)', () => {
+    expect(extractUnknownColumn(unknownColErr('Unknown column name "NOSUCHCOL".'))).toBe('NOSUCHCOL');
+    expect(extractUnknownColumn(unknownColErr('Unknown column name "My_Col/2".'))).toBe('My_Col/2');
+  });
+
+  it('extracts the column from the live DE unknown-column message', () => {
+    expect(extractUnknownColumn(unknownColErr('Unbekannter Spaltenname "NOSUCHCOL".'))).toBe('NOSUCHCOL');
+  });
+
+  it('extracts the column when the quotes arrive entity-encoded', () => {
+    // Not seen on the wire (SAP writes `"` literally in element text); decoding makes it match anyway.
+    expect(extractUnknownColumn(unknownColErr('Unknown column name &quot;NOSUCHCOL&quot;.'))).toBe('NOSUCHCOL');
+  });
+
+  it.each([
+    '"DESC" is not allowed here. "." is expected.',
+    '"DESC" ist hier nicht erlaubt. Es wurde ein "." erwartet.',
+    '"LIMIT" is invalid here (due to grammar).',
+    '"LIMIT" ist grammatikalisch hier nicht erlaubt.',
+    'The column name or association "TABNAME" is ambiguous, which means it occurs in multiple tables.',
+    'Der Spaltenname oder die Assoziation "TABNAME" ist zweideutig, d.h. kommt in mehreren Tabellen vor.',
+    'A Boolean expression was expected in "MANDT".',
+    'The variable "NULL" must be escaped using "@".',
+  ])('does not misclassify another live message-004 parser error: %s', (message) => {
+    expect(extractUnknownColumn(unknownColErr(message))).toBeNull();
+  });
+
+  it('fails closed for an unverified localized unknown-column message', () => {
+    expect(extractUnknownColumn(unknownColErr('Nombre de columna desconocido "NOSUCHCOL".'))).toBeNull();
+  });
+
+  it('does NOT fire on the missing-table error (same class, number 022)', () => {
+    // Live: SELECT * FROM <missing> → ADT_DATAPREVIEW_MSG/022 "Cannot find 'X'".
+    expect(extractUnknownColumn(dataPreviewErr('022', `Cannot find 'NOSUCHTAB'`))).toBeNull();
+  });
+
+  it('returns null for unrelated errors and a ReDoS-sized body (linear, anchored regexes)', () => {
+    expect(extractUnknownColumn(new AdtApiError('Object not found', 404, '/p'))).toBeNull();
+    expect(extractUnknownColumn(new AdtApiError('Syntax error', 400, '/p'))).toBeNull(); // no responseBody
+    expect(extractUnknownColumn(new Error('Unknown column name "X".'))).toBeNull(); // not an AdtApiError
+    expect(extractUnknownColumn(undefined)).toBeNull();
+    // 200 kB body without the data-preview id → early-exit null, no catastrophic backtracking.
+    expect(extractUnknownColumn(new AdtApiError('boom', 400, '/p', `<x>${'A'.repeat(200_000)}</x>`))).toBeNull();
+  });
+
+  it('formats the hint with the table upper-cased and the column list', () => {
+    expect(formatUnknownColumnHint('nosuchcol', 't000', ['MANDT', 'MTEXT'])).toBe(
+      'Unknown column "nosuchcol" on T000. Available columns: MANDT, MTEXT.',
+    );
+  });
+});

@@ -1,0 +1,62 @@
+# Build artifacts
+/build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Credentials — never bake into images
+.env
+.env.local
+.env.*
+!.env.example
+*service-key*.json
+**/*service-key*.json
+cookies.txt
+cookie.txt
+cookies
+cookie
+.mcp.json
+.mcp*.json
+
+# Session data
+*SESSION-SUMMARY*
+sessions/
+
+# Test & coverage
+coverage.out
+coverage.html
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Go workspace
+go.work
+go.work.sum
+
+# Reports (large, not needed in image)
+reports/
+
+# Articles
+articles/
+
+# Git
+.git/
+.gitignore
+
+# Docker itself
+Dockerfile
+.dockerignore
+
+# CI
+.github/
+
+# Claude
+.claude/

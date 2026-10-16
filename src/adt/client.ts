@@ -1,0 +1,1697 @@
+/**
+ * ADT Client — main facade for all SAP ADT operations.
+ *
+ * Entry point for SAP interactions, wiring together:
+ * - AdtHttpClient (HTTP transport, CSRF, cookies)
+ * - SafetyConfig (operation/package/transport gating)
+ * - FeatureConfig (optional feature detection)
+ *
+ * Every public method checks safety before making any HTTP call.
+ * The client is stateless between calls (no cached object state),
+ * except for CSRF token and session cookies managed by AdtHttpClient.
+ *
+ * Architecture: The client exposes high-level operations grouped by domain.
+ * Read operations are directly on the client, while CRUD, DevTools, etc.
+ * are imported from their respective modules by handlers.
+ */
+import { getCurrentContext } from '../server/context.js';
+import { BSP_OBJECTS_PATH, bspContentPath, resolveBspNameAndPath } from './bsp-path.js';
+import type { AdtClientConfig } from './config.js';
+import { defaultAdtClientConfig } from './config.js';
+import { type DataResponseBudget, DataResultScope } from './data-result-context.js';
+import { canonicalDataSourceName } from './data-source-name.js';
+import { CDS_DEPENDENCY_GRAPH_PATH, DataSourceBlocklistGuard, parseTableReplacement } from './data-source-policy.js';
+import { parseTableType, type TableTypeInfo } from './ddic-xml.js';
+import { readEnhancementImplementation } from './enhancements.js';
+import { AdtApiError, AdtSafetyError, isNotFoundError } from './errors.js';
+import { AdtHttpClient, type AdtHttpConfig, type AdtResponse } from './http.js';
+import type { AdtRequestOptions } from './http-deadline.js';
+import { AdtPackageHierarchyResolver, type PackageHierarchyResolver } from './package-hierarchy.js';
+import { canonicalRevisionSourcePath } from './path-safety.js';
+import { clampUrlLimit } from './result-limits.js';
+import { checkOperation, OperationType, type SafetyConfig } from './safety.js';
+import { Semaphore } from './semaphore.js';
+import {
+  buildTableQuerySql,
+  clampPreviewRows,
+  executeDataPreviewStatements,
+  fitFreestyleSqlLines,
+} from './table-query.js';
+import {
+  readTextElementPart,
+  readTextElements,
+  type TextElementObjectType,
+  type TextElementPart,
+  writeTextElementPart,
+} from './text-elements.js';
+import { clampSearchResults, searchSource as executeSourceSearch, toTextSearchObjectType } from './text-search.js';
+import type {
+  AdtObjectLookupResult,
+  AdtSearchResult,
+  ApiReleaseStateInfo,
+  AuthorizationFieldInfo,
+  BspAppInfo,
+  BspFileNode,
+  ClassMetadata,
+  ClassStructure,
+  DataElementInfo,
+  DomainInfo,
+  EnhancementImplementationInfo,
+  FeatureToggleInfo,
+  FunctionGroupStructure,
+  FunctionModuleProperties,
+  InactiveObject,
+  MessageClassInfo,
+  RevisionListResult,
+  SourceSearchResult,
+  StructuredClassResponse,
+  TransactionInfo,
+} from './types.js';
+import {
+  assertApiReleaseStateConfirmed,
+  buildApiReleasePutBody,
+  type DataPreviewMeta,
+  parseApiReleaseState,
+  parseAuthorizationField,
+  parseBspAppList,
+  parseBspFolderListing,
+  parseClassMetadata,
+  parseClassStructure,
+  parseDataElementMetadata,
+  parseDataPreviewResult,
+  parseDomainMetadata,
+  parseFeatureToggleStates,
+  parseFunctionGroup,
+  parseFunctionGroupNodes,
+  parseFunctionModuleProperties,
+  parseInactiveObjects,
+  parseInstalledComponents,
+  parseMessageClass,
+  parseRevisionFeed,
+  parseSearchResults,
+  parseServiceBinding,
+  parseSubpackageNodestructure,
+  parseSystemInfo,
+  parseTableContents,
+  parseTransactionMetadata,
+} from './xml-parser.js';
+
+export { buildTableQuerySql, clampPreviewRows, clampSearchResults, toTextSearchObjectType };
+
+export interface SourceReadResult {
+  source: string;
+  etag?: string;
+  notModified: boolean;
+  statusCode: number;
+}
+
+export type BspPathContent = { kind: 'folder'; nodes: BspFileNode[] } | { kind: 'file'; content: string };
+
+export interface SourceReadOptions extends AdtRequestOptions {
+  ifNoneMatch?: string;
+  version?: 'active' | 'inactive';
+  accept?: string;
+}
+
+function appendQueryParam(path: string, key: string, value: string): string {
+  const [baseAndQuery, fragment] = path.split('#', 2);
+  const [base, query = ''] = (baseAndQuery ?? path).split('?', 2);
+  const params = new URLSearchParams(query);
+  if (!params.has(key)) params.set(key, value);
+  const queryString = params.toString();
+  return `${base}${queryString ? `?${queryString}` : ''}${fragment ? `#${fragment}` : ''}`;
+}
+
+/**
+ * Build a navigation hint URL for a TADIR row.
+ *
+ * Internal mirror of the handler-side `objectBasePath()` table — kept local to
+ * `client.ts` to avoid circular dependencies (the handler modules import `AdtClient`).
+ * Returns `''` for types that cannot be addressed via a single base URL
+ * (FUNC requires a parent group; SEGW legacy types have no ADT handler);
+ * callers must treat the empty string as "no direct navigation".
+ *
+ * Only used by `lookupObjectsViaDb()` for synthesizing the `uri` field on
+ * SQL-sourced TADIR matches so the result is still consumable by SAPRead /
+ * SAPNavigate where applicable. TADIR stores bare types (e.g. `DDLS`, not
+ * `DDLS/DF`); no slash-form normalization is required.
+ */
+function tadirObjectUrl(tadirType: string, name: string): string {
+  const t = tadirType.toUpperCase();
+  switch (t) {
+    case 'PROG':
+      return `/sap/bc/adt/programs/programs/${encodeURIComponent(name)}`;
+    case 'CLAS':
+      return `/sap/bc/adt/oo/classes/${encodeURIComponent(name)}`;
+    case 'INTF':
+      return `/sap/bc/adt/oo/interfaces/${encodeURIComponent(name)}`;
+    case 'INCL':
+      return `/sap/bc/adt/programs/includes/${encodeURIComponent(name)}`;
+    case 'FUGR':
+      return `/sap/bc/adt/functions/groups/${encodeURIComponent(name)}`;
+    case 'DDLS':
+      return `/sap/bc/adt/ddic/ddl/sources/${encodeURIComponent(name)}`;
+    case 'DCLS':
+      return `/sap/bc/adt/acm/dcl/sources/${encodeURIComponent(name)}`;
+    case 'BDEF':
+      return `/sap/bc/adt/bo/behaviordefinitions/${encodeURIComponent(name)}`;
+    case 'SRVD':
+      return `/sap/bc/adt/ddic/srvd/sources/${encodeURIComponent(name)}`;
+    case 'DDLX':
+      return `/sap/bc/adt/ddic/ddlx/sources/${encodeURIComponent(name)}`;
+    case 'SRVB':
+      return `/sap/bc/adt/businessservices/bindings/${encodeURIComponent(name)}`;
+    case 'TABL':
+      // Default to /tables/ — for DDIC structures, callers must reach for
+      // AdtClient.resolveTablObjectUrl(name) which does the 404 fallback.
+      return `/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}`;
+    case 'DOMA':
+      return `/sap/bc/adt/ddic/domains/${encodeURIComponent(name)}`;
+    case 'DTEL':
+      return `/sap/bc/adt/ddic/dataelements/${encodeURIComponent(name)}`;
+    case 'MSAG':
+      return `/sap/bc/adt/messageclass/${encodeURIComponent(name)}`;
+    case 'DEVC':
+      return `/sap/bc/adt/packages/${encodeURIComponent(name)}`;
+    case 'TRAN':
+      return `/sap/bc/adt/vit/wb/object_type/trant/object_name/${encodeURIComponent(name)}`;
+    case 'VIEW':
+      return `/sap/bc/adt/vit/wb/object_type/viewdv/object_name/${encodeURIComponent(name)}`;
+    case 'SKTD':
+      return `/sap/bc/adt/documentation/ktd/documents/${encodeURIComponent(name.toLowerCase())}`;
+    case 'ENQU':
+      return `/sap/bc/adt/ddic/lockobjects/sources/${encodeURIComponent(name)}`;
+    default:
+      // FUNC needs a parent group (not addressable by a single base URL); legacy
+      // SEGW types (IWSV, IWMO, IWPR, IWBEP) have no ADT handler. Return an
+      // empty URI so callers know not to navigate; the row still surfaces.
+      return '';
+  }
+}
+
+/** The five source includes a class keeps its revisions under. */
+export const CLASS_REVISION_INCLUDES = ['main', 'definitions', 'implementations', 'macros', 'testclasses'] as const;
+
+/**
+ * Versions-feed URL per object type — the single source for BOTH the URL and the set of
+ * revision-capable types (`REVISION_TYPES` below derives from these keys). A new type is one
+ * row here; nothing else needs updating, so the two cannot drift apart
+ * (AGENTS.md Playbook §3, "make invariants true by construction").
+ *
+ * The suffix is NOT uniform: DDLS/DCLS hang the feed off the OBJECT while their DDIC sibling
+ * SRVD uses `/source/main`. Live-probed on a4h (758) — verify against a system before adding.
+ */
+const REVISION_URL_BUILDERS: Record<
+  string,
+  (encodedName: string, opts: { include?: string; group?: string }, rawName: string) => string
+> = {
+  PROG: (n) => `/sap/bc/adt/programs/programs/${n}/source/main/versions`,
+  CLAS: (n, opts) => {
+    const include =
+      String(opts.include ?? 'main')
+        .trim()
+        .toLowerCase() || 'main';
+    if (!(CLASS_REVISION_INCLUDES as readonly string[]).includes(include)) {
+      throw new Error(
+        `Invalid include "${opts.include ?? ''}" for CLAS revisions. Valid values: ${CLASS_REVISION_INCLUDES.join(', ')}.`,
+      );
+    }
+    return `/sap/bc/adt/oo/classes/${n}/includes/${include}/versions`;
+  },
+  INTF: (n) => `/sap/bc/adt/oo/interfaces/${n}/source/main/versions`,
+  FUNC: (n, opts, rawName) => {
+    const group = String(opts.group ?? '').trim();
+    if (!group) throw new Error(`Function group is required for FUNC revisions of "${rawName}".`);
+    return `/sap/bc/adt/functions/groups/${encodeURIComponent(group)}/fmodules/${n}/source/main/versions`;
+  },
+  INCL: (n) => `/sap/bc/adt/programs/includes/${n}/source/main/versions`,
+  DDLS: (n) => `/sap/bc/adt/ddic/ddl/sources/${n}/versions`,
+  DCLS: (n) => `/sap/bc/adt/acm/dcl/sources/${n}/versions`,
+  BDEF: (n) => `/sap/bc/adt/bo/behaviordefinitions/${n}/source/main/versions`,
+  SRVD: (n) => `/sap/bc/adt/ddic/srvd/sources/${n}/source/main/versions`,
+};
+
+/** Types with an addressable revisions feed — derived, never hand-maintained. */
+export const REVISION_TYPES: ReadonlySet<string> = new Set(Object.keys(REVISION_URL_BUILDERS));
+
+export {
+  isTextElementObjectType,
+  TEXT_ELEMENT_OBJECT_TYPES,
+  TEXT_ELEMENT_PARTS,
+  type TextElementObjectType,
+  type TextElementPart,
+} from './text-elements.js';
+
+export class AdtClient {
+  readonly http: AdtHttpClient;
+  readonly safety: SafetyConfig;
+  /** The configured SAP username (from --user / SAP_USER) */
+  readonly username: string;
+  /** Bearer-token provider (BTP). Kept so the effective ABAP user can be read from the JWT (G-5). */
+  private readonly bearerTokenProvider?: () => Promise<string>;
+  /** True when this client authenticates via a bearer token (⇒ BTP ABAP Environment). */
+  readonly usesBearerAuth: boolean;
+  /** Memoized JWT-derived user (resolved lazily by getEffectiveUser). */
+  private effectiveUser?: string;
+  /** Memoized internal ABAP user (XUBNAME) — resolved from the createdBy of a cloud object this session
+   *  created (no whoami endpoint); used as adtcore:responsible for BTP package create. Shared via withSafety. */
+  private internalUser?: string;
+  /** The configured SAP client number (from --client / SAP_CLIENT) */
+  readonly sapClient: string;
+  /** Per-call response ceiling shared by every data method in the current MCP request. */
+  private readonly maxDataPreviewResponseBytes: number;
+  /** Shared process-wide data admission guard (private fallback outside server-managed clients). */
+  private readonly dataResultSemaphore: Semaphore;
+  /** Per-client cache of resolved TABL URLs for **reads** (transparent table at
+   *  /tables/, structure at /structures/). Populated by getTabl() via the
+   *  /tables/→/structures/ 404 fallback. */
+  private readonly tablUrlCache = new Map<string, string>();
+  /** Lazily-instantiated DEVCLASS hierarchy resolver — only built when a subtree
+   *  allowedPackages rule is hit. Shared across `withSafety()` clones because the
+   *  hierarchy is a property of the SAP system, not of the current safety scope. */
+  private packageHierarchyResolverHolder: { resolver: PackageHierarchyResolver | null } = { resolver: null };
+
+  constructor(options: Partial<AdtClientConfig> = {}) {
+    const config = { ...defaultAdtClientConfig(), ...options };
+    this.safety = config.safety;
+    this.username = config.username;
+    this.bearerTokenProvider = config.bearerTokenProvider;
+    this.usesBearerAuth = !!config.bearerTokenProvider;
+    this.sapClient = config.client;
+    this.maxDataPreviewResponseBytes = config.maxDataPreviewResponseBytes;
+    this.dataResultSemaphore = config.dataResultSemaphore ?? new Semaphore(config.maxConcurrentDataResults);
+
+    const httpConfig: AdtHttpConfig = {
+      baseUrl: config.baseUrl,
+      username: config.username,
+      password: config.password,
+      client: config.client,
+      language: config.language,
+      userAgent: config.userAgent,
+      insecure: config.insecure,
+      gzipDataPreviewBody: config.gzipDataPreviewBody,
+      cookies: config.cookies,
+      cookieFile: config.cookieFile,
+      cookieString: config.cookieString,
+      btpProxy: config.btpProxy,
+      sapConnectivityAuth: config.sapConnectivityAuth,
+      ppProxyAuth: config.ppProxyAuth,
+      bearerTokenProvider: config.bearerTokenProvider,
+      samlAuthorization: config.samlAuthorization,
+      disableSaml: config.disableSaml,
+      retryUnauthorized: config.retryUnauthorized,
+      onUnauthorized: config.onUnauthorized,
+      // Prefer the shared server-wide semaphore when provided so all per-user PP clients
+      // share one cap. Fall back to a private semaphore for stdio/tests when only maxConcurrent
+      // is set. When neither is set, no concurrency cap applies.
+      semaphore: config.adtSemaphore ?? (config.maxConcurrent ? new Semaphore(config.maxConcurrent) : undefined),
+    };
+
+    this.http = config.http ?? new AdtHttpClient(httpConfig);
+  }
+
+  /** Share identity and caches; only the per-request safety ceiling changes.
+   * Clones skip the constructor to preserve the live connection. All fields must
+   * remain own-enumerable (TypeScript private, never #private); see issue #333. */
+  withSafety(safety: SafetyConfig): AdtClient {
+    return Object.assign(Object.create(AdtClient.prototype) as AdtClient, this, { safety });
+  }
+
+  /** Run existing readers in one isolated SAP session without mutating this client. */
+  withStatefulSession<T>(action: (client: AdtClient) => Promise<T>): Promise<T> {
+    return this.http.withStatefulSession((http) =>
+      action(Object.assign(Object.create(AdtClient.prototype) as AdtClient, this, { http })),
+    );
+  }
+
+  /**
+   * Lazily build (and return) the DEVCLASS hierarchy resolver. The resolver
+   * powers `ZFOO/**` subtree rules in `allowedPackages`; reads/writes that
+   * don't trigger a subtree rule never instantiate it (zero cost).
+   *
+   * Shared across `withSafety()` clones — the hierarchy is per-SAP-system, not
+   * per-safety-scope. Cache invalidation is exposed via `invalidatePackageHierarchy()`.
+   */
+  getPackageHierarchyResolver(): PackageHierarchyResolver {
+    if (!this.packageHierarchyResolverHolder.resolver) {
+      this.packageHierarchyResolverHolder.resolver = new AdtPackageHierarchyResolver((root) =>
+        this.getSubpackages(root),
+      );
+    }
+    return this.packageHierarchyResolverHolder.resolver;
+  }
+
+  /** Invalidate the resolver cache. Called after admin actions that change the
+   *  hierarchy (create_package / change_package / delete_package). */
+  invalidatePackageHierarchy(root?: string): void {
+    this.packageHierarchyResolverHolder.resolver?.invalidate(root);
+  }
+
+  // ─── Source Code Read Operations ──────────────────────────────────
+
+  private async fetchSource(path: string, opts: SourceReadOptions = {}): Promise<SourceReadResult> {
+    const url = opts.version ? appendQueryParam(path, 'version', opts.version) : path;
+    const headers: Record<string, string> = {};
+    if (opts.accept) headers.Accept = opts.accept;
+    if (opts.ifNoneMatch) headers['If-None-Match'] = opts.ifNoneMatch;
+    const resp = await this.http.get(url, Object.keys(headers).length > 0 ? headers : undefined, opts);
+    return {
+      source: resp.body,
+      etag: resp.headers.etag ?? undefined,
+      notModified: resp.statusCode === 304,
+      statusCode: resp.statusCode,
+    };
+  }
+
+  /** Get program source code */
+  async getProgram(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetProgram');
+    return this.fetchSource(`/sap/bc/adt/programs/programs/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Read the `/source/main` body under an object's base ADT URL (version-aware).
+   *  Type-agnostic: the caller supplies the already-resolved object URL. Used by SAPActivate
+   *  to capture the inactive draft so it can be promoted to the active cache slot after a
+   *  successful activation (the active version equals the draft byte-for-byte for source
+   *  objects), sidestepping the backend's read-after-activate consistency lag. */
+  async getSourceAtObjectUrl(objectBaseUrl: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetSource');
+    return this.fetchSource(`${objectBaseUrl}/source/main`, opts);
+  }
+
+  /** Get class source code (main include by default) */
+  async getClass(name: string, include?: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetClass');
+    const encodedName = encodeURIComponent(name);
+
+    if (!include) {
+      // Default: return full combined class source
+      return this.fetchSource(`/sap/bc/adt/oo/classes/${encodedName}/source/main`, opts);
+    }
+
+    const validIncludes = new Set<string>(CLASS_REVISION_INCLUDES);
+    const includes = include
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+
+    const parts: string[] = [];
+    for (const inc of includes) {
+      if (!validIncludes.has(inc)) {
+        parts.push(`=== ${inc} ===\n[Unknown include "${inc}". Valid: ${CLASS_REVISION_INCLUDES.join(', ')}]`);
+        continue;
+      }
+
+      // "main" uses /source/main; others use /includes/{type}
+      const path =
+        inc === 'main'
+          ? `/sap/bc/adt/oo/classes/${encodedName}/source/main`
+          : `/sap/bc/adt/oo/classes/${encodedName}/includes/${inc}`;
+
+      try {
+        const result = await this.fetchSource(path, opts);
+        parts.push(`=== ${inc} ===\n${result.source}`);
+      } catch (err) {
+        if (isNotFoundError(err)) {
+          parts.push(
+            `=== ${inc} ===\n[Include "${inc}" is not available for this class. Try reading without the include parameter to get the full source.]`,
+          );
+        } else {
+          throw err; // Re-throw non-404 errors
+        }
+      }
+    }
+    return { source: parts.join('\n\n'), notModified: false, statusCode: 200 };
+  }
+
+  /**
+   * Get the RAW source of a single class include (no `=== inc ===` wrapper that
+   * `getClass(name, include)` adds), so line numbers stay accurate for grep.
+   */
+  async getClassInclude(name: string, include: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetClassInclude');
+    return this.fetchSource(
+      `/sap/bc/adt/oo/classes/${encodeURIComponent(name)}/includes/${encodeURIComponent(include)}`,
+      opts,
+    );
+  }
+
+  /** Get class metadata (description, language, category, etc.) from the object endpoint */
+  async getClassMetadata(name: string): Promise<ClassMetadata> {
+    checkOperation(this.safety, OperationType.Read, 'GetClassMetadata');
+    const resp = await this.http.get(`/sap/bc/adt/oo/classes/${encodeURIComponent(name)}`);
+    return parseClassMetadata(resp.body);
+  }
+
+  /** Get structured class response with metadata + decomposed includes */
+  async getClassStructured(name: string): Promise<StructuredClassResponse> {
+    checkOperation(this.safety, OperationType.Read, 'GetClassStructured');
+    const encodedName = encodeURIComponent(name);
+
+    const fetchInclude = async (include: string): Promise<string | null> => {
+      try {
+        const resp = await this.http.get(`/sap/bc/adt/oo/classes/${encodedName}/includes/${include}`, undefined, {
+          suppressNotFoundLog: true,
+        });
+        return resp.body;
+      } catch (err) {
+        if (isNotFoundError(err)) return null;
+        throw err;
+      }
+    };
+
+    const [metadata, mainResp, testclasses, definitions, implementations, macros] = await Promise.all([
+      this.getClassMetadata(name),
+      this.http.get(`/sap/bc/adt/oo/classes/${encodedName}/source/main`),
+      fetchInclude('testclasses'),
+      fetchInclude('definitions'),
+      fetchInclude('implementations'),
+      fetchInclude('macros'),
+    ]);
+
+    return {
+      metadata,
+      main: mainResp.body,
+      testclasses,
+      definitions,
+      implementations,
+      macros,
+    };
+  }
+
+  /**
+   * Get the class structure map (line ranges for DEFINITION / IMPLEMENTATION
+   * blocks, per-method/attribute ranges) from `/sap/bc/adt/oo/classes/{name}/objectstructure`.
+   *
+   * The endpoint is read-only — the response carries `#start=L,C;end=L,C`
+   * coordinates that `class-section surgery` actions (`edit_class_definition`,
+   * `add_method`, `edit_method_signature`, `delete_method`) use to splice into
+   * `/source/main` without re-sending the full class. Issue #303.
+   *
+   * Cross-release: works on both NW 7.50 SP02 (split CLAS/OO + CLAS/OM elements
+   * merged by name) and S/4HANA 2023 kernel 7.58+ (single CLAS/OM per method).
+   * MIME negotiation is delegated to the discovery cache in http.ts — v1+xml on
+   * 7.50, v2+xml on 7.58+.
+   */
+  async getClassStructure(name: string, version: 'active' | 'inactive' = 'active'): Promise<ClassStructure> {
+    checkOperation(this.safety, OperationType.Read, 'GetClassStructure');
+    // version=inactive returns the draft's structure (verified live on a4h: a class
+    // with an unactivated draft reports the draft's method set + line ranges under
+    // ?version=inactive, the active set under ?version=active). Threading the same
+    // version here as the /source/main read keeps the spliced line ranges aligned
+    // with the bytes being edited — critical for chained surgery on a draft.
+    const suffix = version === 'inactive' ? '?version=inactive' : '';
+    const resp = await this.http.get(`/sap/bc/adt/oo/classes/${encodeURIComponent(name)}/objectstructure${suffix}`);
+    return parseClassStructure(resp.body, name.toUpperCase());
+  }
+
+  /** Get interface source code */
+  async getInterface(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetInterface');
+    return this.fetchSource(`/sap/bc/adt/oo/interfaces/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get function module source code */
+  async getFunction(group: string, name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetFunction');
+    return this.fetchSource(
+      `/sap/bc/adt/functions/groups/${encodeURIComponent(group)}/fmodules/${encodeURIComponent(name)}/source/main`,
+      opts,
+    );
+  }
+
+  /**
+   * Read a function module's processing attributes (SE37 "Processing Type" + update-task kind).
+   * These live in the fmodule metadata document, NOT in /source/main where the signature lives.
+   *
+   * No explicit Accept: the resource's native version differs per release (7.50 serves
+   * …fmodules.v2+xml, 758 serves v3 — both live-verified), so discovery negotiation is correct
+   * where a hardcoded version would be an assumption.
+   */
+  async getFunctionModuleProperties(group: string, name: string): Promise<FunctionModuleProperties> {
+    checkOperation(this.safety, OperationType.Read, 'GetFunctionModuleProperties');
+    const url = `/sap/bc/adt/functions/groups/${encodeURIComponent(group.toLowerCase())}/fmodules/${encodeURIComponent(name.toLowerCase())}`;
+    return parseFunctionModuleProperties((await this.http.get(url)).body);
+  }
+
+  /** Resolve by URI: some releases decorate search names with "(Function Module)". */
+  async resolveFunctionGroup(fmName: string): Promise<string | null> {
+    const results = await this.searchObject(fmName, 10);
+    for (const r of results) {
+      const match = r.uri.match(/\/functions\/groups\/([^/]+)\/fmodules\/([^/?#]+)(?:[/?#]|$)/i);
+      if (match && decodeURIComponent(match[2]!).toUpperCase() === fmName.toUpperCase()) {
+        return decodeURIComponent(match[1]!).toUpperCase();
+      }
+    }
+    return null;
+  }
+
+  /** Get function group structure (list of function modules + includes) */
+  async getFunctionGroup(name: string): Promise<FunctionGroupStructure> {
+    checkOperation(this.safety, OperationType.Read, 'GetFunctionGroup');
+    // The function-module list lives in the objectstructure resource, NOT the plain
+    // /functions/groups/<name> resource (which returns only metadata + atom links).
+    const accept = 'application/vnd.sap.adt.objectstructure.v2+xml';
+    try {
+      const resp = await this.http.get(`/sap/bc/adt/functions/groups/${encodeURIComponent(name)}/objectstructure`, {
+        Accept: accept,
+      });
+      return parseFunctionGroup(resp.body);
+    } catch (err) {
+      // NW 7.50/7.51 don't ship the per-group objectstructure sub-resource (404 under every
+      // Accept), but the GENERIC repository resource works there and carries the same FF/I
+      // nodes in a flat projectexplorer shape. Note the LOWERCASE query params — objectName/
+      // objectType returns 400. Verified live on npl 7.50; §8.3 of the 2026-07-29 dossier.
+      if (!isNotFoundError(err)) throw err;
+      const fallback = await this.http.get(
+        `/sap/bc/adt/repository/objectstructure?objectname=${encodeURIComponent(name)}&objecttype=${encodeURIComponent('FUGR/F')}`,
+        { Accept: accept },
+      );
+      // The fallback payload does not carry the group name — pass it through.
+      return parseFunctionGroupNodes(fallback.body, name);
+    }
+  }
+
+  /** Get function group source code */
+  async getFunctionGroupSource(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetFunctionGroupSource');
+    return this.fetchSource(`/sap/bc/adt/functions/groups/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get include source code */
+  async getInclude(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetInclude');
+    return this.fetchSource(`/sap/bc/adt/programs/includes/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /**
+   * Expand a function group into its full source tree: the main include plus every
+   * nested INCLUDE, fetched **recursively**.
+   *
+   * The main FUGR source only references the TOP + UXX includes directly; the actual
+   * `FUNCTION … ENDFUNCTION` bodies live in nested `LZ<group>U01/U02…` includes pulled
+   * in from UXX, and PBO/PAI screen modules in `…O…/…I…` includes. A one-level expansion
+   * (the old SAPRead `expand_includes` behaviour) therefore misses the real code — this
+   * BFS follows the include graph to capture it.
+   *
+   * Bounded for safety: a `seen` set (cycle + dedup guard), a depth cap, and a total-block
+   * cap so a pathological include graph can't blow up the response. Comment-only INCLUDE
+   * lines (leading `*`) are skipped. A block that fails to read is a placeholder, `unreadable`.
+   * `truncated` is true if either cap leaves an unseen include unread.
+   *
+   * Note: dynpros (screens) and GUI status (CUA) are NOT included — ADT does not expose
+   * those over REST (they are SAPGUI/SE51/SE41-only; the endpoints return 404). This
+   * captures the function group's ABAP code/flow logic, not its screen flow.
+   */
+  async getFunctionGroupExpanded(
+    name: string,
+    opts?: SourceReadOptions,
+  ): Promise<{ blocks: Array<{ name: string; source: string; unreadable?: true }>; truncated: boolean }> {
+    checkOperation(this.safety, OperationType.Read, 'GetFunctionGroupExpanded');
+    const MAX_BLOCKS = 80;
+    const MAX_DEPTH = 5;
+    const seen = new Set<string>();
+    const blocks: Array<{ name: string; source: string; unreadable?: true }> = [];
+    let truncated = false;
+
+    const { source: mainSource } = await this.getFunctionGroupSource(name, opts);
+    blocks.push({ name: `FUGR ${name} (main)`, source: mainSource });
+
+    // Match INCLUDE statements but skip ABAP comment lines (leading `*` after optional
+    // whitespace). Non-greedy name capture stops at the trailing `.`.
+    const findIncludes = (src: string): string[] => {
+      const re = /^[^*\n]*\bINCLUDE\s+(\S+?)\s*\./gim;
+      const out: string[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(src)) !== null) out.push(m[1]!);
+      return out;
+    };
+
+    let frontier: Array<{ src: string; depth: number }> = [{ src: mainSource, depth: 0 }];
+    while (frontier.length > 0 && !truncated) {
+      const next: Array<{ src: string; depth: number }> = [];
+      for (const { src, depth } of frontier) {
+        for (const incRaw of findIncludes(src)) {
+          const key = incRaw.toLowerCase();
+          if (seen.has(key)) continue;
+          if (depth >= MAX_DEPTH || blocks.length >= MAX_BLOCKS) {
+            truncated = true;
+            break;
+          }
+          seen.add(key);
+          try {
+            const { source: incSource } = await this.getInclude(incRaw, opts);
+            blocks.push({ name: incRaw, source: incSource });
+            next.push({ src: incSource, depth: depth + 1 });
+          } catch {
+            blocks.push({ name: incRaw, source: `[Could not read include "${incRaw}"]`, unreadable: true });
+          }
+        }
+        if (truncated) break;
+      }
+      frontier = next;
+    }
+    return { blocks, truncated };
+  }
+
+  /** Get CDS view source code (DDLS) */
+  async getDdls(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetDDLS');
+    return this.fetchSource(`/sap/bc/adt/ddic/ddl/sources/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get CDS access control source code (DCLS) */
+  async getDcl(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetDCL');
+    return this.fetchSource(`/sap/bc/adt/acm/dcl/sources/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get behavior definition source code (BDEF) */
+  async getBdef(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetBDEF');
+    return this.fetchSource(`/sap/bc/adt/bo/behaviordefinitions/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get service definition source code (SRVD) */
+  async getSrvd(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetSRVD');
+    return this.fetchSource(`/sap/bc/adt/ddic/srvd/sources/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get Knowledge Transfer Document (SKTD) — Markdown documentation attached to an ABAP object. */
+  async getKtd(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetKTD');
+    // Eclipse ADT lowercases the name in the URL path; server-side matching is case-sensitive here.
+    return this.fetchSource(`/sap/bc/adt/documentation/ktd/documents/${encodeURIComponent(name.toLowerCase())}`, {
+      ...opts,
+      accept: opts?.accept ?? 'application/vnd.sap.adt.sktdv2+xml',
+    });
+  }
+
+  /** Get metadata extension source code (DDLX) */
+  async getDdlx(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetDDLX');
+    return this.fetchSource(`/sap/bc/adt/ddic/ddlx/sources/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Get service binding metadata (SRVB) — returns structured XML, not source text */
+  async getSrvb(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetSRVB');
+    const result = await this.fetchSource(`/sap/bc/adt/businessservices/bindings/${encodeURIComponent(name)}`, {
+      ...opts,
+      accept: opts?.accept ?? 'application/vnd.sap.adt.businessservices.servicebinding.v2+xml',
+    });
+    return result.notModified ? result : { ...result, source: parseServiceBinding(result.source) };
+  }
+
+  /** Get table definition source code */
+  async getTable(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetTable');
+    return this.fetchSource(`/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /**
+   * Read DDIC view metadata.
+   *
+   * Classic DDIC views are exposed via ADT's VIT generic-object endpoint, NOT
+   * `/sap/bc/adt/ddic/views/`. Live verification 2026-05-08 against a4h
+   * S/4HANA 2023 + npl NW 7.50: `/ddic/views/V_USR_NAME` returns HTTP 500;
+   * `/ddic/views/V_USR_NAME/source/main` returns HTTP 404. Only the VIT URL
+   * `/sap/bc/adt/vit/wb/object_type/viewdv/object_name/{name}` returns 200.
+   * Note: VIEW does NOT expose a `/source/main` sub-resource — the response
+   * body is the metadata XML (root element `adtcore:mainObject` with view
+   * attributes). Returning that XML as `source` is consistent with the
+   * SourceReadResult contract; structured parsing is out of scope here.
+   *
+   * See docs/research/abap-types/types/view.md and PR #222 follow-up.
+   */
+  async getView(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetView');
+    return this.fetchSource(`/sap/bc/adt/vit/wb/object_type/viewdv/object_name/${encodeURIComponent(name)}`, opts);
+  }
+
+  /** Get structure definition source code (CDS-like format) */
+  async getStructure(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetStructure');
+    return this.fetchSource(`/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}/source/main`, opts);
+  }
+
+  /** Read TABL source — covers both transparent tables and DDIC structures.
+   *  TADIR groups them under R3TR TABL, distinguished only by DD02L-TABCLASS
+   *  (TRANSP/CLUSTER/POOL → /tables/, INTTAB/APPEND → /structures/).
+   *  Tries /tables/ first, falls back to /structures/ on 404. Caches the resolved
+   *  URL for later read-path lookups (where-used, structure hierarchy) — never for mutations. */
+  async getTabl(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetTabl');
+    const upper = name.toUpperCase();
+    try {
+      const result = await this.getTable(name, opts);
+      this.tablUrlCache.set(upper, `/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}`);
+      return result;
+    } catch (err) {
+      if (err instanceof AdtApiError && err.statusCode === 404) {
+        const result = await this.getStructure(name, opts);
+        this.tablUrlCache.set(upper, `/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}`);
+        return result;
+      }
+      throw err;
+    }
+  }
+
+  /** Resolve the canonical ADT URL for a TABL name (transparent table or structure)
+   *  for the **read** path. Probes /tables/ first and falls back to /structures/ on
+   *  404. The source body is identical either way, so the fallback is safe for reads.
+   *  Result is cached per client.
+   *
+   *  Do NOT use this for writes/activates — on NW 7.50 the /tables/ endpoint is
+   *  absent entirely, so transparent tables (TABL/DT) fall through to /structures/
+   *  and a PUT there silently sets DD02L-TABCLASS=INTTAB (corruption). Use
+   *  `resolveTablObjectUrlForWrite()` instead. See issue #285. */
+  async resolveTablObjectUrl(name: string): Promise<string> {
+    const upper = name.toUpperCase();
+    const cached = this.tablUrlCache.get(upper);
+    if (cached) return cached;
+    const tableUrl = `/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}`;
+    const structUrl = `/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}`;
+    try {
+      await this.http.get(tableUrl);
+      this.tablUrlCache.set(upper, tableUrl);
+      return tableUrl;
+    } catch (err) {
+      if (err instanceof AdtApiError && err.statusCode === 404) {
+        await this.http.get(structUrl);
+        this.tablUrlCache.set(upper, structUrl);
+        return structUrl;
+      }
+      throw err;
+    }
+  }
+
+  /** Resolve the canonical ADT URL for a TABL name on the **write/activate/delete**
+   *  path. Unlike `resolveTablObjectUrl()`, it first asks SAP what the object actually is
+   *  (via repository search) and refuses transparent-table writes on systems where /sap/bc/adt/ddic/tables/
+   *  is absent (NW 7.50 ships /ddic/structures/ only; the table editor was added
+   *  in NW 7.52). Returning /structures/ for a TABL/DT object would let a PUT
+   *  silently flip DD02L-TABCLASS to INTTAB on the inactive draft (issue #285).
+   *
+   *  Resolution order:
+   *    1. Search returns `TABL/DT` → require /tables/ availability, return /tables/<n>
+   *       or throw AdtSafetyError with SE11 hint.
+   *    2. Search returns `TABL/DS` → return /structures/<n> (always allowed).
+   *    3. Search fails or finds no TABL → probe fresh via the read-path resolver. A /tables/ hit
+   *       proves a table on any release; a /structures/ hit proves a structure only where
+   *       discovery shows /tables/ exists. Otherwise (7.50/7.51, or discovery not loaded) refuse:
+   *       a /tables/ 404 cannot tell an absent endpoint from a structure.
+   *
+   *  Never cached: SAP can replace a structure with a table between calls of a long-lived
+   *  client, and a remembered /structures/ route would skip the refusal above. */
+  async resolveTablObjectUrlForWrite(
+    name: string,
+    options: { tablesEndpointAvailable?: boolean } = {},
+  ): Promise<string> {
+    const upper = name.toUpperCase();
+    let actualType: string | undefined;
+    try {
+      const results = await this.searchObject(name, 5);
+      // NPL 7.50 appends a localized suffix to adtcore:name ("T000 (Database Table)",
+      // "BAPIRET2 (Structure)"), so strip parenthesized text before matching. A4H
+      // and modern releases return just the bare name; both forms must work.
+      // Only TABL hits count: a same-named program must not hide the table's subtype.
+      const match = results.find((r) => {
+        const bare = String(r.objectName ?? '')
+          .replace(/\s*\(.*$/, '')
+          .toUpperCase();
+        return bare === upper && String(r.objectType ?? '').startsWith('TABL');
+      });
+      actualType = match?.objectType;
+    } catch {
+      // Subtype stays unknown; step 3 decides whether the fresh probe alone is trustworthy.
+    }
+
+    const tableUrl = `/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}`;
+    const structUrl = `/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}`;
+
+    if (actualType === 'TABL/DT') {
+      if (options.tablesEndpointAvailable === false) {
+        throw new AdtSafetyError(
+          `Transparent table writes via ADT REST are not available on this system ` +
+            `(/sap/bc/adt/ddic/tables/ is not exposed — NW 7.50/7.51 ship the DDIC ` +
+            `structures endpoint only; the table editor was added in NW 7.52). ` +
+            `Use SE11 in SAPGUI to modify transparent table "${name}", or connect ` +
+            `ARC-1 to an SAP_BASIS ≥ 7.52 system. Writing to /sap/bc/adt/ddic/structures/ ` +
+            `would silently flip DD02L-TABCLASS to INTTAB and corrupt the table.`,
+        );
+      }
+      return tableUrl;
+    }
+    if (actualType === 'TABL/DS') return structUrl;
+
+    // Subtype unknown: re-probe (a cached read route may be stale; a missing object throws its 404).
+    // Create paths never get here: they gate on tablesEndpointAvailable themselves.
+    this.tablUrlCache.delete(upper);
+    const url = await this.resolveTablObjectUrl(name);
+    if (url === tableUrl || options.tablesEndpointAvailable === true) return url;
+    const system =
+      options.tablesEndpointAvailable === false
+        ? 'This system has no /sap/bc/adt/ddic/tables/ (NW 7.50/7.51)'
+        : 'ADT discovery is not loaded, so ARC-1 cannot rule out a system without /sap/bc/adt/ddic/tables/';
+    throw new AdtSafetyError(
+      `Cannot confirm that TABL "${name}" is a structure: the repository search failed or found no TABL. ${system}, ` +
+        'where writing a transparent table through /sap/bc/adt/ddic/structures/ flips DD02L-TABCLASS to INTTAB. ' +
+        'Restore repository-search access for this user, or use SE11 in SAPGUI.',
+    );
+  }
+
+  /** Get domain metadata (type, length, value table, fixed values) */
+  async getDomain(name: string): Promise<DomainInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetDomain');
+    const resp = await this.http.get(`/sap/bc/adt/ddic/domains/${encodeURIComponent(name)}`);
+    return parseDomainMetadata(resp.body);
+  }
+
+  /** Get table type (TTYP) metadata: row type, access type, key kind. */
+  async getTableType(name: string): Promise<TableTypeInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetTableType');
+    const resp = await this.http.get(`/sap/bc/adt/ddic/tabletypes/${encodeURIComponent(name)}`, {
+      Accept: 'application/vnd.sap.adt.tabletype.v1+xml',
+    });
+    return parseTableType(resp.body);
+  }
+
+  /** Get data element metadata (domain, labels/reserved lengths, search help, input-history flag) */
+  async getDataElement(name: string, version?: 'active' | 'inactive'): Promise<DataElementInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetDataElement');
+    const versionQuery = version ? `?version=${version}` : '';
+    const resp = await this.http.get(`/sap/bc/adt/ddic/dataelements/${encodeURIComponent(name)}${versionQuery}`);
+    return parseDataElementMetadata(resp.body);
+  }
+
+  // ─── Authorization & Switch Framework ───────────────────────────
+
+  /** Get authorization field metadata (role, check table, domain, org-level flags) */
+  async getAuthorizationField(name: string): Promise<AuthorizationFieldInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetAuthorizationField');
+    const resp = await this.http.get(`/sap/bc/adt/aps/iam/auth/${encodeURIComponent(name)}`, {
+      Accept: 'application/vnd.sap.adt.blues.v1+xml',
+    });
+    return parseAuthorizationField(resp.body);
+  }
+
+  // ─── Source Revision / Version History ──────────────────────────
+
+  private revisionsUrlFor(type: string, name: string, opts: { include?: string; group?: string }): string {
+    const build = REVISION_URL_BUILDERS[String(type).trim().toUpperCase()];
+    if (!build) throw new Error(`Unsupported object type "${type}" for revisions.`);
+    return build(encodeURIComponent(name), opts, name);
+  }
+
+  /** List available source revisions for an ABAP object. */
+  async getRevisions(
+    type: string,
+    name: string,
+    opts: { include?: string; group?: string } = {},
+  ): Promise<RevisionListResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetRevisions');
+    const url = this.revisionsUrlFor(type, name, opts);
+    const resp = await this.http.get(url, { Accept: 'application/atom+xml;type=feed' });
+    return parseRevisionFeed(resp.body);
+  }
+
+  /** Read source content for a specific revision URI from the revisions feed. */
+  async getRevisionSource(versionUri: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetRevisionSource');
+    const canonicalUri = canonicalRevisionSourcePath(versionUri);
+    if (!canonicalUri) {
+      throw new Error(
+        'Path must be a canonical host-relative ADT path under /sap/bc/adt/ and a source URI from a VERSIONS response.',
+      );
+    }
+    const resp = await this.http.get(canonicalUri, { Accept: 'text/plain' });
+    return resp.body;
+  }
+
+  /** Get feature toggle states from switch framework */
+  async getFeatureToggle(name: string): Promise<FeatureToggleInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetFeatureToggle');
+    const resp = await this.http.get(`/sap/bc/adt/sfw/featuretoggles/${encodeURIComponent(name)}/states`, {
+      Accept: 'application/vnd.sap.adt.states.v1+asjson',
+    });
+    return parseFeatureToggleStates(resp.body, name);
+  }
+
+  /** Get enhancement metadata and, for source-code plug-ins, hook locations and ABAP source. */
+  async getEnhancementImplementation(name: string): Promise<EnhancementImplementationInfo> {
+    return readEnhancementImplementation(this, name);
+  }
+
+  /** Get transaction code metadata (description, package) */
+  async getTransaction(name: string): Promise<TransactionInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetTransaction');
+    const resp = await this.http.get(`/sap/bc/adt/vit/wb/object_type/trant/object_name/${encodeURIComponent(name)}`);
+    return parseTransactionMetadata(resp.body);
+  }
+
+  /** Get API release state for an object (clean core / ABAP Cloud compliance) */
+  async getApiReleaseState(objectUri: string): Promise<ApiReleaseStateInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetApiReleaseState');
+    const resp = await this.http.get(`/sap/bc/adt/apireleases/${encodeURIComponent(objectUri)}`, {
+      Accept: 'application/vnd.sap.adt.apirelease.v10+xml',
+    });
+    return parseApiReleaseState(resp.body);
+  }
+
+  /**
+   * Set an object's API release contract state (RELEASED / NOT_RELEASED) — the clean-core
+   * governance write. Uses GET→narrow PUT→GET read-back with v10; no lock needed.
+   */
+  async setApiReleaseState(
+    objectUri: string,
+    opts: { state?: string; contract?: string; transport?: string } = {},
+  ): Promise<ApiReleaseStateInfo & { changed: boolean }> {
+    checkOperation(this.safety, OperationType.Update, 'SetApiReleaseState');
+    const state = (opts.state ?? 'RELEASED').toUpperCase();
+    const contract = (opts.contract ?? 'C1').toUpperCase();
+    if (state !== 'RELEASED' && state !== 'NOT_RELEASED') {
+      throw new Error(`apiState must be RELEASED or NOT_RELEASED, got ${opts.state}.`);
+    }
+    const accept = 'application/vnd.sap.adt.apirelease.v10+xml';
+    const encoded = encodeURIComponent(objectUri);
+    const current = await this.http.get(`/sap/bc/adt/apireleases/${encoded}`, { Accept: accept });
+    const body = buildApiReleasePutBody(current.body, contract, state);
+    const path = `/sap/bc/adt/apireleases/${encoded}/${contract.toLowerCase()}`;
+    const expectedVisibility = {
+      useInSAPCloudPlatform: /ars:useInSAPCloudPlatform="true"/.test(body),
+      useInKeyUserApps: /ars:useInKeyUserApps="true"/.test(body),
+    };
+    let changed = true;
+    try {
+      await this.http.put(
+        opts.transport ? `${path}?request=${encodeURIComponent(opts.transport)}` : path,
+        body,
+        accept,
+        { Accept: accept },
+      );
+    } catch (err) {
+      // SAP returns 400 "No changes were made" when the contract is already in the requested state.
+      // Treat that as an idempotent no-op (the desired state already holds — confirmed via read-back
+      // below) rather than surfacing a confusing error for "release something already released".
+      if (
+        err instanceof AdtApiError &&
+        err.statusCode === 400 &&
+        /no changes were made/i.test(`${err.message} ${err.responseBody ?? ''}`)
+      ) {
+        changed = false;
+      } else {
+        throw err;
+      }
+    }
+    const confirmedResp = await this.http.get(`/sap/bc/adt/apireleases/${encoded}`, { Accept: accept });
+    const confirmed = parseApiReleaseState(confirmedResp.body);
+    // On a real write, assert the full target (state + requested visibility). On an idempotent no-op,
+    // assert only that the state already matches — the pre-existing visibility is whatever SAP stored.
+    assertApiReleaseStateConfirmed(confirmed, contract, state, changed ? expectedVisibility : undefined);
+    return { ...confirmed, changed };
+  }
+
+  /** List objects pending activation (inactive objects).
+   *  Endpoint is `/sap/bc/adt/activation/inactiveobjects` on every supported SAP release
+   *  (verified live on S/4HANA 2023 and NW 7.50 SP02).
+   *  The vendor MIME `application/vnd.sap.adt.inactivectsobjects.v1+xml` returns the rich
+   *  `<ioc:object>` shape (with user/deleted/transport/parentTransport metadata); the
+   *  `application/xml;q=0.5` fallback covers any release that ignores the vendor type. */
+  async getInactiveObjects(): Promise<InactiveObject[]> {
+    checkOperation(this.safety, OperationType.Read, 'GetInactiveObjects');
+    const resp = await this.http.get('/sap/bc/adt/activation/inactiveobjects', {
+      Accept: 'application/vnd.sap.adt.inactivectsobjects.v1+xml, application/xml;q=0.5',
+    });
+    return parseInactiveObjects(resp.body);
+  }
+
+  // ─── Search Operations ─────────────────────────────────────────────
+
+  /** Search for ABAP objects by name pattern */
+  async searchObject(query: string, maxResults = 100, objectType?: string): Promise<AdtSearchResult[]> {
+    checkOperation(this.safety, OperationType.Search, 'SearchObject');
+    const limit = clampSearchResults(maxResults, 100);
+    const typeFilter = objectType ? `&objectType=${encodeURIComponent(objectType)}` : '';
+    const resp = await this.http.get(
+      `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=${encodeURIComponent(query)}&maxResults=${limit}${typeFilter}`,
+    );
+    return parseSearchResults(resp.body);
+  }
+
+  /**
+   * Exact object-directory lookup for one or more names.
+   *
+   * Uses ADT repository quick search instead of freestyle SQL against TADIR. This
+   * keeps the lookup available in read/search-only configurations and avoids ADT
+   * SQL parser limits on long IN-lists.
+   */
+  async lookupObjects(
+    names: string[],
+    options: { maxResults?: number; objectTypes?: string[] } = {},
+  ): Promise<AdtObjectLookupResult[]> {
+    checkOperation(this.safety, OperationType.Search, 'LookupObjects');
+
+    const cleanedNames = [
+      ...new Set(
+        names
+          .map((n) => n.trim())
+          .filter(Boolean)
+          .map((n) => n.toUpperCase()),
+      ),
+    ];
+    const objectTypes = [
+      ...new Set(
+        (options.objectTypes ?? [])
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .map((t) => t.toUpperCase()),
+      ),
+    ];
+    const limit = clampUrlLimit(options.maxResults, 100);
+
+    const searchOnce = async (name: string, objectType?: string): Promise<AdtSearchResult[]> => {
+      const params = new URLSearchParams({
+        operation: 'quickSearch',
+        query: name,
+        maxResults: String(limit),
+      });
+      if (objectType) {
+        params.set('objectType', objectType);
+      }
+      const resp = await this.http.get(`/sap/bc/adt/repository/informationsystem/search?${params.toString()}`);
+      return parseSearchResults(resp.body);
+    };
+
+    const results: AdtObjectLookupResult[] = [];
+    for (const name of cleanedNames) {
+      const rawMatches =
+        objectTypes.length > 0
+          ? (await Promise.all(objectTypes.map((objectType) => searchOnce(name, objectType)))).flat()
+          : await searchOnce(name);
+
+      const seen = new Set<string>();
+      const matches = rawMatches
+        .filter((r) => r.objectName.toUpperCase() === name)
+        .filter((r) => {
+          const key = `${r.objectType}\u0000${r.objectName}\u0000${r.packageName}\u0000${r.uri}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
+
+      results.push({ name, found: matches.length > 0, matches });
+    }
+
+    return results;
+  }
+
+  /**
+   * SQL-backed alternative to `lookupObjects` — issues a single `SELECT … FROM tadir`
+   * query so the result can include TADIR rows the ADT info-system endpoint
+   * deliberately filters out (orphan / "ghost" entries from aborted create/delete
+   * cycles whose source row no longer resolves to a workbench resource).
+   *
+   * **When to use** — for `SAPSearch(searchType='tadir_lookup', source='db' | 'both')`
+   * when the caller specifically needs to detect ghosts. The default
+   * `source='adt'` path stays on `lookupObjects` and is the right choice for the
+   * vast majority of viewer-scope workflows.
+   *
+   * **Scope requirement** — this path issues freestyle SQL, so callers must have
+   * `sql` scope and the server must run with `SAP_ALLOW_FREE_SQL=true`. The
+   * underlying `runQuery` enforces both via `checkOperation(safety, FreeSQL)`.
+   *
+   * The returned shape matches `lookupObjects` exactly so handler code can merge
+   * the two result sets. Each match is stamped with `_origin: 'db'` for
+   * split-brain reporting in `source='both'` mode.
+   */
+  async lookupObjectsViaDb(
+    names: string[],
+    options: { maxResults?: number; objectTypes?: string[] } = {},
+  ): Promise<AdtObjectLookupResult[]> {
+    const cleanedNames = [
+      ...new Set(
+        names
+          .map((n) => n.trim())
+          .filter(Boolean)
+          .map((n) => n.toUpperCase()),
+      ),
+    ];
+
+    if (cleanedNames.length === 0) {
+      throw new Error('lookupObjectsViaDb: at least one non-empty name is required.');
+    }
+
+    const objectTypes = [
+      ...new Set(
+        (options.objectTypes ?? [])
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .map((t) => t.toUpperCase()),
+      ),
+    ];
+    const limit = clampUrlLimit(options.maxResults, 1000);
+
+    const quoteSqlLiteral = (v: string): string => `'${v.replace(/'/g, "''")}'`;
+    const namesClause = cleanedNames.map(quoteSqlLiteral).join(', ');
+    let sql = `SELECT pgmid, object, obj_name, devclass FROM tadir WHERE obj_name IN (${namesClause})`;
+    if (objectTypes.length > 0) {
+      const typesClause = objectTypes.map(quoteSqlLiteral).join(', ');
+      sql += ` AND object IN (${typesClause})`;
+    }
+
+    const queryResult = await this.runQuery(sql, limit);
+
+    // Group rows by OBJ_NAME so multiple matches per name collapse into one
+    // lookup entry. SQL returns row-oriented data after `parseTableContents`
+    // pivots — keys are the column names (uppercased by SAP).
+    const byName = new Map<string, AdtSearchResult[]>();
+    for (const row of queryResult.rows) {
+      const objName = String(row.OBJ_NAME ?? '').toUpperCase();
+      if (!objName) continue;
+      const objectType = String(row.OBJECT ?? '');
+      const packageName = String(row.DEVCLASS ?? '');
+      const match: AdtSearchResult = {
+        objectType,
+        objectName: objName,
+        description: '',
+        packageName,
+        uri: tadirObjectUrl(objectType, objName),
+        _origin: 'db',
+      };
+      const existing = byName.get(objName);
+      if (existing) existing.push(match);
+      else byName.set(objName, [match]);
+    }
+
+    // Preserve the caller's input order — the cleaned, deduped, uppercased list.
+    return cleanedNames.map((name) => {
+      const matches = byName.get(name) ?? [];
+      return { name, found: matches.length > 0, matches };
+    });
+  }
+
+  /** Search within ABAP source code through the bounded ADT text-search contract. */
+  async searchSource(
+    pattern: string,
+    maxResults = 50,
+    objectType?: string,
+    packageName?: string,
+  ): Promise<SourceSearchResult[]> {
+    return executeSourceSearch(this.http, this.safety, pattern, maxResults, objectType, packageName);
+  }
+
+  // ─── Package Operations ────────────────────────────────────────────
+
+  /**
+   * Get package contents (objects and subpackages).
+   *
+   * Uses the ADT **search** endpoint
+   * (`/sap/bc/adt/repository/informationsystem/search?packageName=...`)
+   * rather than the older `nodestructure` endpoint, because nodestructure
+   * returns object descriptions that are misaligned with `OBJECT_NAME` on
+   * real systems — a server-side data-quality issue, not a parser bug.
+   * The search endpoint returns `adtcore:objectReferences` with descriptions
+   * correctly attached to each object reference.
+   *
+   * Trade-off: object coverage differs slightly between the two endpoints.
+   * Notably, legacy SEGW `IWSV` (service version) objects appear in
+   * nodestructure but not in search results — search returns `IWMO` (model
+   * version) objects instead. If you specifically need `IWSV` objects, use
+   * `searchObject()` with a name pattern instead. For typical "list what's
+   * in this package" use cases (the dominant consumer), this is acceptable.
+   *
+   * @param packageName — DEVC name to inspect
+   * @param maxResults — soft cap on number of returned entries (default 200,
+   *                     clamped to [1, 1000]). This array API has no completeness
+   *                     metadata; SAPRead supplies it alongside these entries.
+   * @returns array of `{ type, name, description, uri }` (URIs may be empty
+   *          for objects that the workbench does not expose via ADT, e.g.
+   *          some `IWMO`/`IWPR`/`SICF/TYP` entries).
+   */
+  async getPackageContents(
+    packageName: string,
+    maxResults = 200,
+  ): Promise<Array<{ type: string; name: string; description: string; uri: string }>> {
+    checkOperation(this.safety, OperationType.Read, 'GetPackage');
+    const limit = clampUrlLimit(maxResults, 200);
+    const resp = await this.http.get(
+      `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=*&packageName=${encodeURIComponent(packageName)}&maxResults=${limit}`,
+    );
+    return parseSearchResults(resp.body).map((ref) => ({
+      type: ref.objectType,
+      name: ref.objectName,
+      description: ref.description,
+      uri: ref.uri,
+    }));
+  }
+
+  /**
+   * Direct sub-packages of `packageName` — names only, uppercased, deduplicated.
+   *
+   * Uses ADT's `POST /sap/bc/adt/repository/nodestructure` with
+   * `parent_type=DEVC/K`, which is the canonical primitive for "direct
+   * children of package X" — returning exactly the set of DEVCLASS rows
+   * whose `TDEVC.PARENTCL = packageName`. Verified live against S/4HANA
+   * 2023 to match `SELECT devclass FROM tdevc WHERE parentcl = ?` for
+   * a range of roots, including namespace packages (`/AIF/MAIN`) and
+   * deep subtrees (5 levels under `SABP_TOOLS`).
+   *
+   * NOTE: the previous implementation used
+   * `informationsystem/search?packageName=X&objectType=DEVC/K`, which
+   * silently ignores `packageName` and returns ~1000 unrelated packages.
+   * That bug caused `allowedPackages` `X/**` rules to silently over-grant
+   * writes to unrelated packages. See
+   * `docs/research/2026-05-28-package-subtree-endpoints.md` for the comparative analysis.
+   *
+   * Backs the `allowedPackages` subtree-rule (`ZFOO/**`) safety gate, so any
+   * failure (network, 4xx/5xx, parse) is surfaced as an exception, NEVER as
+   * an empty list. An empty list always means "SAP returned no children" —
+   * `nodestructure` responds with HTTP 200 and an empty (or absent) body
+   * for an unknown `parent_name`.
+   *
+   * `maxResults` is preserved for API compatibility and applied as a
+   * defense-in-depth post-filter on the parsed result. `nodestructure`
+   * itself does not honour a maxResults parameter on the SAP side and
+   * returns the full child set in one round-trip.
+   */
+  async getSubpackages(packageName: string, maxResults = 1000): Promise<string[]> {
+    checkOperation(this.safety, OperationType.Read, 'GetSubpackages');
+    const limit = clampUrlLimit(maxResults, 1000);
+    const enc = encodeURIComponent(packageName);
+    const url =
+      `/sap/bc/adt/repository/nodestructure` +
+      `?parent_type=${encodeURIComponent('DEVC/K')}&parent_name=${enc}&parent_tech_name=${enc}` +
+      `&withShortDescriptions=true`;
+    // ADT requires the asx:abap envelope with a TV_NODEKEY even though
+    // `parent_name` carries the actual selector. Missing the body returns HTTP 406.
+    const body =
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+      `<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">` +
+      `<asx:values><DATA><TV_NODEKEY>000000</TV_NODEKEY></DATA></asx:values>` +
+      `</asx:abap>`;
+    const resp = await this.http.post(url, body, 'application/vnd.sap.as+xml; charset=UTF-8; dataname=null', {
+      Accept: 'application/vnd.sap.as+xml',
+    });
+    const names = parseSubpackageNodestructure(resp.body);
+    const upperSelf = packageName.toUpperCase();
+    // parseSubpackageNodestructure already filters to DEVC/K, drops empty names,
+    // uppercases, and dedupes. Here we additionally exclude the queried package
+    // itself (defensive — `nodestructure` does not normally include it under
+    // its own subtree) and apply the maxResults cap.
+    const out: string[] = [];
+    for (const name of names) {
+      if (name === upperSelf) continue;
+      out.push(name);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
+  // ─── Table Data Operations ─────────────────────────────────────────
+
+  /** A fresh guard per logical request; instrumentation never leaks between decisions. */
+  private dataSourceBlocklistGuard(budget: DataResponseBudget, signal?: AbortSignal): DataSourceBlocklistGuard {
+    return new DataSourceBlocklistGuard(this.safety.blockedDataSources, {
+      searchObject: (name, maxResults) => this.searchObject(name, maxResults),
+      // Fixed authorization metadata: public runQuery would recursively invoke this guard.
+      readTableReplacement: async (name) => {
+        const table = canonicalDataSourceName(name);
+        const sql = `SELECT d~TABNAME, d~TABCLASS, d~VIEWREF, d~VIEWREF_ERR, d~SQLTAB, l~DDLNAME
+FROM DD02L AS d LEFT OUTER JOIN DDLDEPENDENCY AS l
+ON l~OBJECTNAME = d~VIEWREF AND l~OBJECTTYPE = 'VIEW' AND l~STATE = 'A'
+WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
+        // Two rows suffice to reject ambiguity; all bytes share the caller's result budget.
+        const { rows } = parseTableContents(await this.postFreestyleQuery(sql, 2, budget, signal));
+        return parseTableReplacement(table, rows);
+      },
+      dependencyGraphAccept: () => this.http.discoveryAcceptFor(CDS_DEPENDENCY_GRAPH_PATH),
+      readDependencyGraph: async (path, accept) => {
+        checkOperation(this.safety, OperationType.Read, 'GetCdsDependencyGraph');
+        return (await this.http.get(path, { Accept: accept })).body;
+      },
+    });
+  }
+
+  /** Create the lazy request-level result scope inherited by nested handler dispatch. */
+  createDataResultScope(): DataResultScope {
+    return new DataResultScope(this.maxDataPreviewResponseBytes, this.dataResultSemaphore);
+  }
+
+  private async withDataResultScope<T>(
+    operation: (budget: DataResponseBudget, signal?: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const context = getCurrentContext();
+    const inheritedScope = context?.dataResultScope;
+    const scope = inheritedScope ?? this.createDataResultScope();
+    await scope.acquire(context?.signal);
+    try {
+      return await operation(scope.responseBudget, context?.signal);
+    } finally {
+      if (!inheritedScope) scope.release();
+    }
+  }
+
+  private async postDataPreview(
+    path: string,
+    body: string | undefined,
+    budget: DataResponseBudget,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const resp = await this.http.post(path, body, 'text/plain', undefined, { responseBudget: budget, signal });
+    return resp.body;
+  }
+
+  /** Get table contents via data preview */
+  async getTableContents(
+    tableName: string,
+    maxRows = 100,
+    sqlFilter?: string,
+  ): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
+    checkOperation(this.safety, OperationType.Query, 'GetTableContents');
+    // Canonicalize BEFORE authorizing and before building the URL so the name the policy checks is
+    // byte-for-byte the name SAP receives. This runs with the blocklist off too: identifier handling
+    // must not depend on policy state.
+    const source = canonicalDataSourceName(tableName, 'TABLE_CONTENTS table name');
+    const rowLimit = clampPreviewRows(maxRows);
+    // Response memory is bounded per logical request (#739); the URL uses the canonical `source`
+    // so the name the policy authorized is byte-for-byte the name SAP receives.
+    return this.withDataResultScope(async (budget, signal) => {
+      await this.dataSourceBlocklistGuard(budget, signal).enforceTableContents(source, sqlFilter);
+      return parseTableContents(
+        await this.postDataPreview(
+          `/sap/bc/adt/datapreview/ddic?rowNumber=${rowLimit}&ddicEntityName=${encodeURIComponent(source)}`,
+          sqlFilter,
+          budget,
+          signal,
+        ),
+      );
+    });
+  }
+
+  /** Execute freestyle SQL query and return just the rows/columns. */
+  async runQuery(sql: string, maxRows = 100): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
+    const { columns, rows } = await this.runQueryBatch([sql], maxRows);
+    return { columns, rows };
+  }
+
+  /**
+   * Like runQuery, but also returns the datapreview metrics ADT already includes in the response
+   * (totalRows, server-side queryExecutionTimeMs, executedQueryString). Kept separate from runQuery so
+   * these — including the internal generated SQL — only surface where asked (SAPQuery), not in every
+   * runQuery consumer that JSON-stringifies the result.
+   */
+  async runQueryWithMetrics(
+    sql: string,
+    maxRows = 100,
+  ): Promise<{ columns: string[]; rows: Record<string, string>[] } & DataPreviewMeta> {
+    return this.runQueryBatch([sql], maxRows);
+  }
+
+  /**
+   * Authorize a set of server-generated statements ONCE, then execute them.
+   *
+   * This is the single freestyle-SQL entry point. IN-list chunking splits one logical caller request
+   * into N statements; authorizing each separately would repeat the whole lineage resolution N times
+   * (a search plus a graph read plus a table-source read per distinct source, per chunk). Instead the
+   * union of every chunk's canonical direct sources is authorized in one decision, and only then are
+   * the already-authorized statements posted.
+   *
+   * Authorization and the POST deliberately live inside the same private operation: there is no
+   * caller-supplied `authorized`/`internal` receipt that could be forged to skip the guard, and the
+   * decision is a local const that cannot outlive this call.
+   *
+   * The whole batch runs inside ONE data-result scope, so the response-memory budget (#739) is
+   * cumulative across chunks rather than reset per chunk — N chunks cannot together exceed the limit
+   * a single response may consume. Metrics are reported only for a single statement, because an
+   * early break on the row cap would make a summed totalRows misleading.
+   */
+  async runQueryBatch(
+    statements: string[],
+    maxRows = 100,
+  ): Promise<{ columns: string[]; rows: Record<string, string>[] } & Partial<DataPreviewMeta>> {
+    checkOperation(this.safety, OperationType.FreeSQL, 'RunQuery');
+    if (statements.length === 0) throw new Error('runQueryBatch requires at least one statement');
+
+    const rowLimit = clampPreviewRows(maxRows);
+    return this.withDataResultScope(async (budget, signal) => {
+      await this.dataSourceBlocklistGuard(budget, signal).enforceSqlBatch(statements);
+      const post = (sql: string, limit: number): Promise<string> => this.postFreestyleQuery(sql, limit, budget, signal);
+
+      if (statements.length === 1) {
+        return parseDataPreviewResult(await post(statements[0]!, rowLimit));
+      }
+      return executeDataPreviewStatements(post, parseTableContents, statements, rowLimit);
+    });
+  }
+
+  private async postFreestyleQuery(
+    sql: string,
+    maxRows: number,
+    budget: DataResponseBudget,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const rowLimit = clampPreviewRows(maxRows);
+    return this.postDataPreview(
+      `/sap/bc/adt/datapreview/freestyle?rowNumber=${rowLimit}`,
+      fitFreestyleSqlLines(sql),
+      budget,
+      signal,
+    );
+  }
+
+  /**
+   * Query a table or CDS view with structured parameters.
+   * Builds the SELECT server-side from structured params. IN/NOT IN values are strictly
+   * parsed as quoted literal lists (no subqueries). Uses the freestyle endpoint so
+   * multi-column WHERE and CDS views work on all SAP releases.
+   * Gated by allowDataPreview (not allowFreeSQL).
+   */
+  async runTableQuery(
+    tableName: string,
+    opts: {
+      columns?: string[];
+      where?: Array<{ field: string; op: string; value?: string }>;
+      maxRows?: number;
+    } = {},
+  ): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
+    checkOperation(this.safety, OperationType.Query, 'RunTableQuery');
+    // One canonical identity: authorize it, then build the statement from the SAME string.
+    const source = canonicalDataSourceName(tableName, 'TABLE_QUERY table name');
+    const sql = buildTableQuerySql(source, opts.columns, opts.where);
+    const maxRows = clampPreviewRows(opts.maxRows);
+    return this.withDataResultScope(async (budget, signal) => {
+      await this.dataSourceBlocklistGuard(budget, signal).enforceSources([source]);
+      return parseTableContents(await this.postFreestyleQuery(sql, maxRows, budget, signal));
+    });
+  }
+
+  // ─── System Information ────────────────────────────────────────────
+
+  /**
+   * The ABAP user for this session. Returns the configured SAP_USER when set; otherwise
+   * (BTP bearer auth, where no SAP_USER exists) derives it from the JWT `user_name`/`email`
+   * claim. Read-only use of an already-trusted token claim — never used for auth or access
+   * control, only for display (SAPRead SYSTEM) and `adtcore:responsible` on create. See G-5.
+   */
+  async getEffectiveUser(): Promise<string> {
+    if (this.username) return this.username;
+    if (this.effectiveUser !== undefined) return this.effectiveUser;
+    if (!this.bearerTokenProvider) return (this.effectiveUser = '');
+    try {
+      const token = await this.bearerTokenProvider();
+      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+      return (this.effectiveUser = String(payload.user_name ?? payload.email ?? ''));
+    } catch {
+      // Transient token/decode failure — do NOT memoize, so a later call can still resolve the user.
+      return '';
+    }
+  }
+
+  /** The session's internal ABAP user (XUBNAME) for BTP package create, or undefined until a cloud
+   *  object create populates it (no whoami endpoint — see noteInternalUser). */
+  getInternalUser(): string | undefined {
+    return this.internalUser;
+  }
+
+  /** Cache the internal ABAP user. Ignores empty / email-shaped values (a valid XUBNAME has no '@'). */
+  noteInternalUser(user: string | undefined): void {
+    const u = (user ?? '').trim();
+    if (u && !u.includes('@')) this.internalUser = u;
+  }
+
+  /** Get system info as structured JSON (user, system details from discovery XML).
+   *  Compact: this string is returned verbatim to the LLM by SAPRead(type="SYSTEM"). Cannot use
+   *  handlers' toolJson() here — adt/ must not depend on handlers/. */
+  async getSystemInfo(): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetSystemInfo');
+    const resp = await this.http.get('/sap/bc/adt/core/discovery');
+    const info = parseSystemInfo(resp.body, await this.getEffectiveUser());
+    return JSON.stringify(info);
+  }
+
+  /** Get installed SAP components */
+  async getInstalledComponents(): Promise<Array<{ name: string; release: string; description: string }>> {
+    checkOperation(this.safety, OperationType.Read, 'GetInstalledComponents');
+    try {
+      const resp = await this.http.get('/sap/bc/adt/system/components', { Accept: 'application/atom+xml;type=feed' });
+      return parseInstalledComponents(resp.body);
+    } catch (err) {
+      if (err instanceof AdtApiError && err.statusCode === 406) return [];
+      throw err;
+    }
+  }
+
+  /** Get message class messages (legacy endpoint — may fail for some classes) */
+  async getMessages(messageClass: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetMessages');
+    const resp = await this.http.get(`/sap/bc/adt/msg/messages/${encodeURIComponent(messageClass)}`);
+    return resp.body;
+  }
+
+  /** Get structured message class info from /sap/bc/adt/messageclass/{name} */
+  async getMessageClassInfo(name: string): Promise<MessageClassInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetMessageClassInfo');
+    const resp = await this.http.get(`/sap/bc/adt/messageclass/${encodeURIComponent(name)}`);
+    return parseMessageClass(resp.body);
+  }
+
+  /** Read an object's text elements (CLAS/PROG/FUGR). Without `part`, every subobject that carries
+   *  text is returned under a `=== part ===` marker. See adt/text-elements.ts. */
+  async getTextElements(name: string, options?: { objectType?: string; part?: TextElementPart }): Promise<string> {
+    return readTextElements(this.http, this.safety, name, options);
+  }
+
+  /** Read one subobject of a textpool (symbols | selections | headings). */
+  async getTextElementPart(objectType: TextElementObjectType, name: string, part: TextElementPart): Promise<string> {
+    return readTextElementPart(this.http, this.safety, objectType, name, part);
+  }
+
+  /** Read a global class's text symbols. */
+  async getClassTextSymbols(name: string): Promise<string> {
+    return readTextElementPart(this.http, this.safety, 'CLAS', name, 'symbols');
+  }
+
+  /** Write one subobject of a textpool. Locks the textelements object, PUTs, unlocks. Immediately
+   *  active — no SAPActivate needed. */
+  async writeTextElementPart(
+    objectType: TextElementObjectType,
+    name: string,
+    part: TextElementPart,
+    source: string,
+    transport?: string,
+  ): Promise<void> {
+    return writeTextElementPart(this.http, this.safety, objectType, name, part, source, transport);
+  }
+
+  /** Write a global class's text symbols. */
+  async writeClassTextSymbols(name: string, source: string, transport?: string): Promise<void> {
+    return writeTextElementPart(this.http, this.safety, 'CLAS', name, 'symbols', source, transport);
+  }
+
+  /** Get program variants */
+  async getVariants(program: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetVariants');
+    const resp = await this.http.get(`/sap/bc/adt/programs/programs/${encodeURIComponent(program)}/variants`);
+    return resp.body;
+  }
+
+  // ─── BSP / UI5 Filestore Read Operations ────────────────────────────
+
+  /** List deployed BSP/UI5 applications */
+  async listBspApps(query?: string, maxResults?: number): Promise<BspAppInfo[]> {
+    checkOperation(this.safety, OperationType.Read, 'ListBSPApps');
+    const params = new URLSearchParams();
+    if (query) params.set('name', query);
+    if (maxResults !== undefined) params.set('maxResults', String(maxResults));
+    const qs = params.toString();
+    const path = `${BSP_OBJECTS_PATH}${qs ? `?${qs}` : ''}`;
+    const resp = await this.http.get(path, { Accept: 'application/atom+xml' });
+    return parseBspAppList(resp.body);
+  }
+
+  /** @deprecated Use getBspPathContent(); throws when SAP identifies the path as a file. */
+  async getBspAppStructure(appName: string, subPath?: string): Promise<BspFileNode[]> {
+    checkOperation(this.safety, OperationType.Read, 'GetBSPApp');
+    const resolved = resolveBspNameAndPath(appName, subPath);
+    const content = await this.getBspPathContent(resolved.appName, resolved.path);
+    if (content.kind !== 'folder') {
+      throw new AdtApiError(
+        'The requested BSP path is a file, not a folder.',
+        400,
+        bspContentPath(resolved.appName, resolved.path),
+      );
+    }
+    return content.nodes;
+  }
+
+  /** @deprecated Use getBspPathContent(); throws when SAP identifies the path as a folder. */
+  async getBspFileContent(appName: string, filePath: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetBSPFile');
+    const resolved = resolveBspNameAndPath(appName, filePath);
+    const content = await this.getBspPathContent(resolved.appName, resolved.path);
+    if (content.kind !== 'file') {
+      throw new AdtApiError(
+        'The requested BSP path is a folder, not a file.',
+        400,
+        bspContentPath(resolved.appName, resolved.path),
+      );
+    }
+    return content.content;
+  }
+
+  /**
+   * Read a BSP path and let SAP's response media type identify files vs folders.
+   * Binary assets remain outside this text-oriented API because AdtResponse exposes a string body.
+   */
+  async getBspPathContent(appName: string, path?: string): Promise<BspPathContent> {
+    checkOperation(this.safety, OperationType.Read, 'GetBSPPathContent');
+    // Explicit */* suppresses discovery MIME negotiation so SAP can select the resource's real media type.
+    const resp = await this.http.get(bspContentPath(appName, path), { Accept: '*/*' });
+    if (resp.headers['content-type']?.toLowerCase().startsWith('application/atom+xml')) {
+      return { kind: 'folder', nodes: parseBspFolderListing(resp.body, appName.toUpperCase()) };
+    }
+    return { kind: 'file', content: resp.body };
+  }
+
+  /**
+   * Raw object-root metadata at an explicit ADT URL (may carry `?version=…`).
+   * Used by post-create metadata writes that must round-trip SAP's own envelope
+   * instead of reconstructing a release-sensitive one.
+   */
+  async getObjectMetadata(objectUrl: string): Promise<AdtResponse> {
+    checkOperation(this.safety, OperationType.Read, 'GetObjectMetadata');
+    return this.http.get(objectUrl);
+  }
+
+  /**
+   * Resolve the ABAP package of an existing object by fetching its metadata.
+   * Returns the package name (e.g., "$TMP", "ZPACKAGE") or empty string if not found.
+   * Used by SAPWrite to enforce allowedPackages on update/delete/edit_method.
+   *
+   * Top-level objects (CLAS, INTF, PROG, TABL, DDLS, ...) expose
+   * `<adtcore:packageRef adtcore:name="…"/>` directly. Contained objects
+   * (notably FUNC, which lives inside a FUGR) instead expose the package via
+   * `<adtcore:containerRef … adtcore:packageName="…"/>` since their own
+   * `packageRef` would just point at the parent — the `containerRef` already
+   * surfaces the package as a denormalised attribute. Both shapes resolve
+   * to the same package; we accept either.
+   */
+  async resolveObjectPackage(objectUrl: string, accept?: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'ResolveObjectPackage');
+    // Server-driven objects (8.16+) only render their <blue:blueSource> metadata (with the
+    // adtcore:packageRef) under the blues.vN+xml Accept — callers pass it so the allowedPackages
+    // ceiling can resolve the real package. Other callers rely on discovery-driven negotiation.
+    // Send the bare media type only: on-prem backends reject an Accept carrying parameters
+    // ("; charset=utf-8" → 406 SADT_RESOURCE 037, live-verified on 758 and 816 against the SRVB
+    // bindings resource), and that 406 body names no accepted type, so the generic negotiation
+    // retry cannot recover. Parameters select nothing on these metadata reads.
+    const bareAccept = accept?.split(';')[0]?.trim();
+    const resp = await this.http.get(objectUrl, bareAccept ? { Accept: bareAccept } : undefined);
+    const packageRefMatch = resp.body.match(/adtcore:packageRef[^>]*adtcore:name="([^"]*)"/);
+    if (packageRefMatch?.[1]) return packageRefMatch[1];
+    const containerRefMatch = resp.body.match(/adtcore:containerRef[^>]*adtcore:packageName="([^"]*)"/);
+    return containerRefMatch?.[1] ?? '';
+  }
+}

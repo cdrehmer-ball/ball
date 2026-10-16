@@ -1,0 +1,360 @@
+# Authentication Test Process
+
+Step-by-step verification for each authentication method. Run these tests after deploying arc1 to confirm the configured methods work as intended.
+
+## Prerequisites
+
+```bash
+# Build arc1
+npm run build
+
+# Run unit tests first (all must pass)
+npm test
+```
+
+---
+
+## API Key Setup
+
+### Unit Tests
+
+```bash
+# Run auth-related unit tests
+npm test
+```
+
+### HTTP Profile Manifest Smoke Test
+
+When a local HTTP authz test server is already running with four API-key profiles, run:
+
+```bash
+npm run test:authz:http
+```
+
+Default assumptions:
+
+- URL: `http://127.0.0.1:19081/mcp` (override with `ARC1_AUTHZ_MCP_URL`)
+- Keys: `viewer-key-local`, `sql-key-local`, `dev-key-local`, `admin-key-local`
+- Server ceiling: writes, data preview, SQL, and transport writes enabled; Git writes disabled
+
+The script checks the live MCP `tools/list` manifest for each key. It verifies that unauthorized tools/actions are hidden before any SAP mutation can be attempted:
+
+- `viewer`: no `SAPWrite`, no `SAPQuery`, no `TABLE_CONTENTS`, transport read actions only
+- `viewer-sql`: `SAPQuery` and `TABLE_CONTENTS` visible, no writes
+- `developer`: writes and transport mutations visible, SQL hidden, Git write actions hidden
+- `admin`: writes, SQL, and transport mutations visible; Git write actions still hidden when `SAP_ALLOW_GIT_WRITES=false`
+
+### Manual Integration Test
+
+**1. Start arc1 with API key:**
+
+```bash
+npx arc-1@latest --url https://your-sap-host \
+  --user DEVELOPER --password secret --client 001 \
+  --transport http-streamable --http-addr 127.0.0.1:8080 \
+  --api-keys 'test-key-12345:admin'
+```
+
+**2. Verify health endpoint (no auth required):**
+
+```bash
+curl -s http://localhost:8080/health
+# Expected: HTTP 200; the response includes "status":"ok"
+```
+
+**3. Verify request without API key is rejected:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/mcp
+# Expected: 401
+```
+
+**4. Verify request with wrong API key is rejected:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer wrong-key" \
+  http://localhost:8080/mcp
+# Expected: 401
+```
+
+**5. Verify request with correct API key succeeds:**
+
+```bash
+curl -s -H "Authorization: Bearer test-key-12345" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  http://localhost:8080/mcp \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+# Expected: 200 with JSON-RPC response containing tool list
+```
+
+**6. Verify case-insensitive Bearer prefix:**
+
+```bash
+curl -s -H "Authorization: bearer test-key-12345" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  http://localhost:8080/mcp \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+# Expected: 200 (same as above)
+```
+
+### Checklist
+
+- [ ] Health endpoint returns 200 without auth
+- [ ] Missing Authorization header → 401
+- [ ] Wrong API key → 401
+- [ ] Correct API key → 200 with tools
+- [ ] Case-insensitive "Bearer" prefix works
+- [ ] MCP client (VS Code/Cursor) connects with Authorization header
+
+---
+
+## OAuth / JWT Setup
+
+### Unit Tests
+
+```bash
+npm test
+```
+
+### Manual Integration Test
+
+**Prerequisites:** You need an OIDC identity provider (Microsoft Entra ID, Keycloak, Cognito).
+
+**1. Start arc1 with OIDC:**
+
+```bash
+npx arc-1@latest --url https://your-sap-host \
+  --user DEVELOPER --password secret --client 001 \
+  --transport http-streamable --http-addr 127.0.0.1:8080 \
+  --oidc-issuer 'https://your-idp.example.com' \
+  --oidc-audience 'your-audience'
+```
+
+**2. Verify Protected Resource Metadata endpoint:**
+
+```bash
+curl -s http://localhost:8080/.well-known/oauth-protected-resource/mcp | jq .
+# Expected: JSON with "resource", "authorization_servers", "bearer_methods_supported"
+# (the root path /.well-known/oauth-protected-resource serves the same document;
+#  both are 404 when SAP_OIDC_DISCOVERY=false)
+```
+
+**3. Verify request without token is rejected, and points at the metadata:**
+
+```bash
+curl -s -o /dev/null -D - http://localhost:8080/mcp | grep -i "^HTTP/\|www-authenticate"
+# Expected: 401 + WWW-Authenticate: Bearer …, resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource/mcp"
+```
+
+**4. Get a real JWT from your IdP:**
+
+```bash
+# Example for Azure CLI:
+TOKEN=$(az account get-access-token --resource your-audience --query accessToken -o tsv)
+
+```
+
+For other providers, use their interactive authorization flow to obtain an access token for the configured audience; see [OAuth / JWT Setup](oauth-jwt-setup.md).
+
+**5. Verify request with valid JWT succeeds:**
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  http://localhost:8080/mcp \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+# Expected: 200 with tool list
+```
+
+**6. Verify expired/invalid token is rejected:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}" \
+  -H "Authorization: Bearer invalid.jwt.token" \
+  http://localhost:8080/mcp
+# Expected: 401
+```
+
+**7. Check identity attribution:**
+
+Make a permitted read request from an MCP client and inspect its audit event for the authenticated user. See [Log Analysis](log-analysis.md). Listing tools alone does not verify the mapped SAP identity.
+
+### Checklist
+
+- [ ] Protected Resource Metadata endpoint returns valid JSON
+- [ ] Missing token → 401
+- [ ] Invalid/expired token → 401
+- [ ] Valid JWT → 200 with tools
+- [ ] Username extracted from JWT claims (check logs)
+- [ ] A signed token from the configured issuer is accepted through JWKS validation
+
+---
+
+## Principal Propagation Setup
+
+### Unit Tests
+
+```bash
+npm test
+```
+
+### Manual Integration Test
+
+**Prerequisites:**
+- OIDC or XSUAA configured and working
+- ARC-1 deployed on BTP CF with Destination + Connectivity services
+- Cloud Connector connected and configured for principal propagation
+- SAP system configured with CERTRULE / VUSREXTID (see [Principal Propagation Setup](principal-propagation-setup.md))
+
+**1. Configure ARC-1 with PP:**
+
+Set these properties on `arc1-mcp-server` in your deployment extension, using the actual destination names, then deploy as described in the [runbook](btp-cloud-foundry-deployment.md):
+
+```yaml
+properties:
+  SAP_BTP_DESTINATION: SAP_TRIAL       # least-privileged Basic startup destination
+  SAP_BTP_PP_DESTINATION: SAP_TRIAL_PP
+  SAP_PP_ENABLED: "true"
+  SAP_PP_STRICT: "true"
+```
+
+The startup destination supports discovery before a user JWT exists. Keep it separate from the
+`PrincipalPropagation` destination used for user calls; see [single-target PP setup](principal-propagation-setup.md#step-4-configure-arc-1).
+
+**2. Verify per-user identity in SAP:**
+
+Check in SAP transaction `SM20` (security audit log) or `SM04` (user sessions) that the request was executed as the mapped SAP user, not a technical account.
+
+**3. Check ARC-1 logs:**
+
+```bash
+cf logs arc1-mcp-server --recent | grep -E "Principal propagation|per-user|BTP destination"
+```
+
+### Checklist
+
+- [ ] BTP Destination with `PrincipalPropagation` authentication type configured
+- [ ] Cloud Connector principal propagation enabled
+- [ ] SAP certificate mapping (CERTRULE / VUSREXTID) configured
+- [ ] JWT-authenticated requests use per-user destination
+- [ ] SAP logs show per-user identity (not technical account)
+- [ ] Identity topology is explicit: recommended strict PP + separate API-key instance, or supported mixed mode with `SAP_PP_STRICT=false`
+
+---
+
+## BTP / Cloud Foundry
+
+### Unit Tests
+
+```bash
+npm test
+```
+
+### Manual Integration Test
+
+**To test on BTP Cloud Foundry:**
+
+**1. Deploy to CF:**
+
+Follow the [BTP Cloud Foundry deployment runbook](btp-cloud-foundry-deployment.md) for the chosen profile and MTA deployment commands.
+
+**2. Verify app is running** (check app logs):
+
+```bash
+cf logs arc1-mcp-server --recent | grep "BTP"
+# Expected: Log messages showing parsed XSUAA and Destination bindings
+```
+
+**3. Verify health:**
+
+```bash
+curl -i https://<your-cf-route>/health
+# Expected: HTTP 200; the response includes "status":"ok"
+```
+
+### Checklist
+
+- [ ] BTP config → OAuth config conversion works
+- [ ] App starts on CF without errors
+- [ ] Health endpoint returns 200
+
+---
+
+## BTP ABAP Environment (service key)
+
+ARC-1 has two tiers of BTP ABAP integration tests. Both are **local-only**: the service-key provider
+authenticates with the browser Authorization Code flow, and free-tier instances are stopped
+automatically. Tests skip when no credentials are configured. Setup: [BTP ABAP Environment](btp-abap-environment.md).
+
+### Smoke tests
+
+Core connectivity and API contracts, no repository mutations: connect + CSRF token, system-info
+shape, read a released class (`CL_ABAP_RANDOM`), search released objects, and confirm classic
+programs (`RSHOWTIM`) are not reachable.
+
+```bash
+TEST_BTP_SERVICE_KEY_FILE=~/.config/arc-1/btp-abap-service-key.json npm run test:integration:btp:smoke
+# or: TEST_BTP_SERVICE_KEY='{"uaa":{…},…}' npm run test:integration:btp:smoke
+```
+
+### Extended tests
+
+Interactive scenarios — browser OAuth login, writes (create/update/delete), code intelligence,
+transports, and restriction behavior. Never run in CI.
+
+```bash
+TEST_BTP_SERVICE_KEY_FILE=~/.config/arc-1/btp-abap-service-key.json npm run test:integration:btp
+```
+
+### Failure taxonomy
+
+| Category | Symptoms | Cause |
+|---|---|---|
+| **Auth** | 401, token exchange failure | Token expired, service key invalid or revoked |
+| **Connectivity** | `ECONNREFUSED`, `ETIMEDOUT`, DNS failure | Instance stopped (free tier), network unreachable |
+| **Backend unavailable** | 503, maintenance page | Platform maintenance or provisioning |
+| **Assertion** | `expect` mismatch | API contract changed — a real regression to investigate |
+
+Classify the failure before changing configuration. Auth and connectivity failures can come from
+instance lifecycle, credentials, the network, or an ARC-1 regression; they are not automatically harmless.
+
+### Tenant assumptions
+
+- Standard released objects exist (`CL_ABAP_RANDOM`, `IF_ABAP_RANDOM`).
+- Check the current [BTP ABAP prerequisites](btp-abap-prerequisites.md) for trial and free-tier limits and instance availability.
+
+### Checklist
+
+- [ ] Smoke suite passes against a running instance
+- [ ] Browser login completes and the token is reused for later calls
+- [ ] `SAPManage probe` reports `systemType: "btp"`
+- [ ] Write tests target a real development package (not `ZLOCAL`/`$TMP`)
+
+---
+
+## Full Regression Suite
+
+Run all tests:
+
+```bash
+# All unit tests
+npm test
+
+# Integration tests (requires SAP credentials)
+npm run test:integration
+```
+
+---
+
+## Quick Smoke Test
+
+For a quick check that nothing is broken after code changes:
+
+```bash
+npm test
+# Expected: All tests pass, no failures
+```

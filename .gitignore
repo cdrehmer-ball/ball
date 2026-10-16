@@ -1,0 +1,123 @@
+cookies.txt
+cookies
+cookie.txt
+cookie
+
+# Sub-repos (root-level clones only, not compare/ subdirs)
+/mcp-abap-adt/
+/abap-adt-api-lib/
+/abap-adt-api/
+
+# Infrastructure credentials (NEVER commit)
+INFRASTRUCTURE.md
+.env.infrastructure
+*service-key*.json
+
+# Session context files
+MEMORY.md
+
+# MCP config (contains credentials)
+.mcp*.json
+./claude/abap-adt-api-lib/
+
+# Binaries
+/build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/mcp-abap-adt-go
+/arc1
+
+# Test binary
+*.test
+
+# Coverage
+coverage/
+!tests/fixtures/coverage/
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.cursor/
+.vscode/
+!.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Certificates and keys (principal propagation)
+certs/
+*.key
+*.csr
+*.srl
+
+# Environment
+.env
+.env.local
+.env.*
+!.env.example
+
+# arc1 config files (contain credentials)
+.arc1*.json
+arc1.tmp.json
+arc1*.tmp.json
+.arc1/
+
+# arc1 runtime cache (SQLite + WAL journal sidecars)
+.arc1-cache.db
+.arc1-cache.db-shm
+.arc1-cache.db-wal
+
+# Session summaries (may contain credentials)
+*SESSION-SUMMARY*
+/abap-adt-api/
+
+# Session logs
+sessions/
+node_modules/
+
+# Local documentation build output.
+/site/
+
+# Claude worktrees
+.claude/worktrees/
+
+# Test result artifacts (root only, not test fixtures)
+/test-results/
+
+# MTA build artifacts
+mta_archives/
+
+# MTA extension descriptors with per-landscape values (destinations, safety
+# flags, etc.). Deployers copy `mta-overrides.mtaext.example` to
+# `mta-overrides.mtaext` (or any `mta-*.mtaext`) and fill in their values;
+# only explicit templates/non-secret extensions are tracked.
+mta-overrides.mtaext
+mta-*.mtaext
+!mta-overrides.mtaext.example
+!mta-ui-approuter.mtaext
+
+# TypeScript / Node.js
+dist/
+node_modules/
+*.tsbuildinfo
+.vitest/
+
+# MCPB bundle build artifacts (produced by the release CI / local `mcpb pack`; never committed)
+*.mcpb
+mcpb-bundle/
+
+# Python bytecode (scripts/assets/generate-icon.py)
+__pycache__/
+*.pyc

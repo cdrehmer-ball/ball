@@ -1,0 +1,560 @@
+/**
+ * SAPContext handler — object context: relatives, hierarchy, method listings, CDS upstream/
+ * downstream dependency analysis.
+ */
+
+import {
+  buildSiblingExtensionFinding,
+  type CdsImpactDownstream,
+  classifyCdsImpact,
+  deriveSiblingStem,
+  isSiblingNameMatch,
+  type SiblingExtensionCandidate,
+} from '../adt/cds-impact.js';
+import { type AdtClient, clampSearchResults, type SourceReadResult } from '../adt/client.js';
+import { findWhereUsed } from '../adt/codeintel.js';
+import { decodeKtdText } from '../adt/ddic-xml.js';
+import { AdtApiError, isNotFoundError } from '../adt/errors.js';
+import { mapSapReleaseToAbaplintVersion } from '../adt/features.js';
+import { buildStructureHierarchy } from '../adt/structure-hierarchy.js';
+import type { CachingLayer } from '../cache/caching-layer.js';
+import { extractCdsDependencies } from '../context/cds-deps.js';
+import { compressCdsContext, compressContext } from '../context/compressor.js';
+import { logger } from '../server/logger.js';
+import { type CacheSecurityContext, contextCacheForDependencyPayloads } from './cache-security.js';
+import { getCachedFeatures } from './feature-cache.js';
+import { normalizeObjectType, objectUrlForType } from './object-types.js';
+import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
+import { lookupLiveUsages, resolveWhereUsedUri } from './where-used.js';
+
+// ─── SAPContext Handler ───────────────────────────────────────────────
+
+const DEFAULT_SIBLING_MAX_CANDIDATES = 4;
+const HARD_MAX_SIBLING_MAX_CANDIDATES = 10;
+
+/** Per-bucket cap for action="impact". Applied per bucket, not across the whole result, so a
+ *  crowded `abapConsumers` cannot hide a single decisive `bdefs` entry. */
+const DEFAULT_IMPACT_BUCKET = 50;
+
+/** Bucket keys of CdsImpactDownstream (everything except `summary`). */
+const IMPACT_BUCKETS = [
+  'projectionViews',
+  'bdefs',
+  'serviceDefinitions',
+  'serviceBindings',
+  'accessControls',
+  'metadataExtensions',
+  'abapConsumers',
+  'tables',
+  'documentation',
+  'other',
+] as const;
+
+/** Slice every downstream bucket to `limit`, reporting which were cut. `summary` is untouched: it
+ *  is computed pre-slice and is what makes a capped answer honest about the real blast radius. */
+function boundImpactBuckets(
+  downstream: CdsImpactDownstream,
+  limit: number,
+): { boundedDownstream: CdsImpactDownstream; truncatedBuckets: string[] } {
+  const truncatedBuckets: string[] = [];
+  const boundedDownstream = { ...downstream };
+  for (const bucket of IMPACT_BUCKETS) {
+    const entries = downstream[bucket];
+    if (entries.length > limit) {
+      truncatedBuckets.push(`${bucket} (${entries.length})`);
+      boundedDownstream[bucket] = entries.slice(0, limit);
+    }
+  }
+  return { boundedDownstream, truncatedBuckets };
+}
+
+function parseSiblingMaxCandidates(value: unknown): number {
+  const parsed = Number(value ?? DEFAULT_SIBLING_MAX_CANDIDATES);
+  if (!Number.isFinite(parsed)) return DEFAULT_SIBLING_MAX_CANDIDATES;
+  const rounded = Math.trunc(parsed);
+  return Math.min(Math.max(rounded, 1), HARD_MAX_SIBLING_MAX_CANDIDATES);
+}
+
+export async function handleSAPContext(
+  client: AdtClient,
+  args: Record<string, unknown>,
+  cachingLayer: CachingLayer | undefined,
+  cacheSecurity: CacheSecurityContext,
+): Promise<ToolResult> {
+  const action = String(args.action ?? '');
+  // action="impact" is DDLS-only on the server side — default the type so LLMs
+  // don't have to supply it redundantly (and don't get a validation retry when
+  // they don't). Any non-DDLS value still fails the guardrail below.
+  const rawType = String(args.type ?? '');
+  const type = normalizeObjectType(rawType || (action === 'impact' ? 'DDLS' : ''));
+  const name = String(args.name ?? '');
+  // Bound dependency fan-out: a huge maxDeps would fan out unbounded SAP fetches per level
+  // (depth is already capped at 3). Clamp to [1, 100]; non-finite/<1 falls back to the default 20.
+  const rawMaxDeps = Number(args.maxDeps ?? 20);
+  const maxDeps = Number.isFinite(rawMaxDeps) && rawMaxDeps >= 1 ? Math.min(Math.floor(rawMaxDeps), 100) : 20;
+  const depth = Math.min(Math.max(Number(args.depth ?? 1), 1), 3);
+
+  // ─── Live reverse dependency lookup ───────────────────────────────
+  if (action === 'usages') {
+    if (!name) return errorResult('"name" is required for usages action.');
+
+    let resolvedUri: string | null;
+    let resolvedObject: { type: string; name: string; uri: string };
+
+    if (type) {
+      resolvedUri = await resolveWhereUsedUri(client, type, name);
+      if (!resolvedUri) {
+        return errorResult(
+          `Cannot resolve function group for "${name}". Provide the function's group or use SAPSearch to resolve the object.`,
+        );
+      }
+      resolvedObject = { type, name: name.toUpperCase(), uri: resolvedUri };
+    } else {
+      const lookup = await client.lookupObjects([name], { maxResults: 20 });
+      const exactMatches = (lookup[0]?.matches ?? []).filter(
+        (match) => match.objectName.toUpperCase() === name.toUpperCase() && match.uri.length > 0,
+      );
+      const matches = [...new Map(exactMatches.map((match) => [match.uri, match])).values()];
+      if (matches.length === 0) {
+        return textResult(`No SAP repository object named "${name.toUpperCase()}" was found.`);
+      }
+      if (matches.length > 1) {
+        return errorResult(
+          toolJson({
+            error: `Object name "${name.toUpperCase()}" is ambiguous. Retry with type.`,
+            candidates: matches.slice(0, 20).map((match) => ({
+              type: normalizeObjectType(match.objectType),
+              name: match.objectName,
+              uri: match.uri,
+            })),
+          }),
+        );
+      }
+      const match = matches[0]!;
+      resolvedUri = match.uri;
+      resolvedObject = { type: normalizeObjectType(match.objectType), name: match.objectName, uri: match.uri };
+    }
+
+    const usageMax = args.maxResults === undefined ? undefined : Number(args.maxResults);
+    const lookup = await lookupLiveUsages(client, resolvedUri, undefined, usageMax);
+    return textResult(
+      toolJson({
+        name: name.toUpperCase(),
+        resolvedObject,
+        // Count matching reference entries before paging, not distinct consumers.
+        usageCount: lookup.total,
+        countMeaning: 'Reference entries, not distinct objects or runtime calls; not a complete inventory.',
+        shown: lookup.results.length,
+        truncated: lookup.truncated,
+        ...(lookup.warning ? { warning: lookup.warning } : {}),
+        ...(lookup.truncated
+          ? { hint: `Showing ${lookup.results.length} of ${lookup.total} usages. Raise maxResults (max 1000).` }
+          : {}),
+        usages: lookup.results,
+        source: 'live',
+        fallbackUsed: lookup.fallbackUsed,
+      }),
+    );
+  }
+
+  if (!type || !name) {
+    return errorResult(
+      'SAPContext requires type and name, even with supplied source. Retry with the root object type; use SAPSearch if unknown.',
+    );
+  }
+
+  // Helper: get source with cache support
+  const cachedGet = async (
+    objType: string,
+    objName: string,
+    fetcher: (ifNoneMatch?: string) => Promise<SourceReadResult>,
+  ): Promise<string> => {
+    if (!cachingLayer) return (await fetcher()).source;
+    const { source } = await cachingLayer.getSource(objType, objName, fetcher);
+    return source;
+  };
+
+  if (action === 'impact') {
+    if (type !== 'DDLS') {
+      return errorResult(
+        'SAPContext(action="impact") supports DDLS only. For non-CDS objects, use SAPNavigate(action="references").',
+      );
+    }
+
+    const ddlSource = await cachedGet('DDLS', name, (ifNoneMatch) => client.getDdls(name, { ifNoneMatch }));
+    const upstream = buildCdsUpstream(extractCdsDependencies(ddlSource));
+    const includeIndirect = args.includeIndirect === true;
+    const siblingCheck = args.siblingCheck !== false;
+    const siblingMaxCandidates = parseSiblingMaxCandidates(args.siblingMaxCandidates);
+    let downstream = classifyCdsImpact([], { includeIndirect });
+    const warnings: string[] = [];
+    const consistencyHints: string[] = [];
+    let siblingExtensionAnalysis:
+      | {
+          enabled: boolean;
+          stem: string;
+          searchQuery: string;
+          includeIndirect: boolean;
+          maxCandidates: number;
+          filters: {
+            samePackage: boolean;
+            siblingStem: string;
+          };
+          target: {
+            name: string;
+            packageName?: string;
+            metadataExtensions: number;
+          };
+          consideredCandidates: number;
+          checkedCandidates: Array<SiblingExtensionCandidate & { downstreamTotal: number }>;
+          skipped: {
+            self: number;
+            nonDdls: number;
+            packageMismatch: number;
+            nameMismatch: number;
+            overLimit: number;
+          };
+        }
+      | undefined;
+
+    try {
+      const whereUsed = await findWhereUsed(client.http, client.safety, objectUrlForType('DDLS', name));
+      downstream = classifyCdsImpact(whereUsed, { includeIndirect });
+    } catch (err) {
+      if (err instanceof AdtApiError && [404, 405, 415, 501].includes(err.statusCode)) {
+        warnings.push('Where-used endpoint not available on this system');
+      } else {
+        throw err;
+      }
+    }
+
+    if (siblingCheck && warnings.length === 0) {
+      try {
+        const targetName = name.toUpperCase();
+        const stem = deriveSiblingStem(targetName);
+        // Guard against over-broad sibling searches for short/degenerate stems
+        // (e.g., target "Z1" -> stem "Z" -> searchQuery "Z*" would scan the full Z namespace).
+        if (stem.length < 3) {
+          warnings.push(
+            `Sibling consistency check skipped: derived stem "${stem}" is too short to identify siblings safely.`,
+          );
+        } else {
+          const targetMatches = await client.searchObject(targetName, 25);
+          const targetMatch = targetMatches.find(
+            (candidate) =>
+              normalizeObjectType(candidate.objectType) === 'DDLS' && candidate.objectName.toUpperCase() === targetName,
+          );
+          const targetPackageName = targetMatch?.packageName;
+
+          if (!targetPackageName) {
+            warnings.push(`Sibling consistency check skipped: could not resolve package for DDLS "${targetName}".`);
+          } else {
+            const searchQuery = `${stem}*`;
+            const searchMaxResults = Math.min(100, Math.max(siblingMaxCandidates * 4, siblingMaxCandidates + 4));
+            const siblingCandidates = await client.searchObject(searchQuery, searchMaxResults);
+            const skipped = {
+              self: 0,
+              nonDdls: 0,
+              packageMismatch: 0,
+              nameMismatch: 0,
+              overLimit: 0,
+            };
+            const filteredCandidates: Array<{ name: string; packageName: string }> = [];
+            const seenNames = new Set<string>();
+
+            for (const candidate of siblingCandidates) {
+              if (normalizeObjectType(candidate.objectType) !== 'DDLS') {
+                skipped.nonDdls += 1;
+                continue;
+              }
+
+              const candidateName = candidate.objectName.toUpperCase();
+              if (candidateName === targetName) {
+                skipped.self += 1;
+                continue;
+              }
+              if (candidate.packageName !== targetPackageName) {
+                skipped.packageMismatch += 1;
+                continue;
+              }
+              if (!isSiblingNameMatch(targetName, candidateName, stem)) {
+                skipped.nameMismatch += 1;
+                continue;
+              }
+              if (seenNames.has(candidateName)) {
+                continue;
+              }
+              seenNames.add(candidateName);
+              filteredCandidates.push({ name: candidateName, packageName: candidate.packageName });
+            }
+
+            const selectedCandidates = filteredCandidates.slice(0, siblingMaxCandidates);
+            skipped.overLimit = Math.max(filteredCandidates.length - selectedCandidates.length, 0);
+
+            const checkedCandidates: Array<SiblingExtensionCandidate & { downstreamTotal: number }> = [];
+            let skippedWhereUsedCandidates = 0;
+
+            for (const candidate of selectedCandidates) {
+              try {
+                const siblingWhereUsed = await findWhereUsed(
+                  client.http,
+                  client.safety,
+                  objectUrlForType('DDLS', candidate.name),
+                );
+                const siblingDownstream = classifyCdsImpact(siblingWhereUsed, { includeIndirect });
+                checkedCandidates.push({
+                  name: candidate.name,
+                  packageName: candidate.packageName,
+                  metadataExtensions: siblingDownstream.metadataExtensions.length,
+                  downstreamTotal: siblingDownstream.summary.total,
+                });
+              } catch (err) {
+                if (err instanceof AdtApiError && [404, 405, 415, 501].includes(err.statusCode)) {
+                  skippedWhereUsedCandidates += 1;
+                  continue;
+                }
+                throw err;
+              }
+            }
+
+            if (skippedWhereUsedCandidates > 0) {
+              warnings.push(
+                `Sibling consistency check skipped ${skippedWhereUsedCandidates} candidate(s) due to where-used endpoint errors.`,
+              );
+            }
+
+            const siblingFinding = buildSiblingExtensionFinding({
+              targetName,
+              targetPackageName,
+              stem,
+              targetMetadataExtensions: downstream.metadataExtensions.length,
+              siblings: checkedCandidates,
+            });
+            if (siblingFinding) {
+              consistencyHints.push(siblingFinding.message);
+            }
+
+            siblingExtensionAnalysis = {
+              enabled: true,
+              stem,
+              searchQuery,
+              includeIndirect,
+              maxCandidates: siblingMaxCandidates,
+              filters: {
+                samePackage: true,
+                siblingStem: stem,
+              },
+              target: {
+                name: targetName,
+                packageName: targetPackageName,
+                metadataExtensions: downstream.metadataExtensions.length,
+              },
+              consideredCandidates: filteredCandidates.length,
+              checkedCandidates,
+              skipped,
+            };
+          }
+        }
+      } catch (err) {
+        logger.debug('Sibling consistency check aborted', {
+          name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        warnings.push('Sibling consistency check skipped due to search or where-used processing errors.');
+      }
+    }
+
+    const upstreamCount =
+      upstream.tables.length + upstream.views.length + upstream.associations.length + upstream.compositions.length;
+
+    // Bound each downstream bucket. A widely-consumed base view has a huge blast radius, and this
+    // path classifies the FULL where-used tree. `downstream.summary` is computed before slicing, so
+    // the reported total/direct/indirect stay honest — a truncated bucket must never shrink the
+    // blast radius a caller sees.
+    const impactLimit = clampSearchResults(args.maxResults as number | undefined, DEFAULT_IMPACT_BUCKET);
+    const { boundedDownstream, truncatedBuckets } = boundImpactBuckets(downstream, impactLimit);
+
+    const response = {
+      name,
+      type: 'DDLS',
+      upstream,
+      downstream: boundedDownstream,
+      summary: {
+        upstreamCount,
+        downstreamTotal: downstream.summary.total,
+        downstreamDirect: downstream.summary.direct,
+      },
+      ...(truncatedBuckets.length > 0
+        ? {
+            truncatedBuckets,
+            hint:
+              `Bucket(s) ${truncatedBuckets.join(', ')} were capped at ${impactLimit} entries each; ` +
+              `summary counts remain complete. Raise maxResults (max 1000) to see more.`,
+          }
+        : {}),
+      ...(consistencyHints.length > 0 ? { consistencyHints } : {}),
+      ...(siblingExtensionAnalysis ? { siblingExtensionAnalysis } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
+
+    return textResult(toolJson(response));
+  }
+
+  if (action === 'structure') {
+    if (type !== 'TABL') {
+      return errorResult('SAPContext(action="structure") supports TABL only.');
+    }
+
+    const result = await buildStructureHierarchy(client, name);
+    return textResult(toolJson(result));
+  }
+
+  // Get source — either provided or fetched from SAP
+  let source: string;
+  const shouldIncludeKtd = args.includeKtd !== false && !args.source && (action === '' || action === 'deps');
+  if (args.source) {
+    source = String(args.source);
+  } else {
+    switch (type) {
+      case 'CLAS':
+        source = await cachedGet('CLAS', name, (ifNoneMatch) => client.getClass(name, undefined, { ifNoneMatch }));
+        break;
+      case 'INTF':
+        source = await cachedGet('INTF', name, (ifNoneMatch) => client.getInterface(name, { ifNoneMatch }));
+        break;
+      case 'PROG':
+        source = await cachedGet('PROG', name, (ifNoneMatch) => client.getProgram(name, { ifNoneMatch }));
+        break;
+      case 'FUNC': {
+        const group = String(args.group ?? '');
+        if (!group) {
+          return errorResult(
+            'The "group" parameter is required for FUNC type. Use SAPSearch to find the function group.',
+          );
+        }
+        source = await cachedGet('FUNC', name, (ifNoneMatch) => client.getFunction(group, name, { ifNoneMatch }));
+        break;
+      }
+      case 'DDLS': {
+        const ddlSource = await cachedGet('DDLS', name, (ifNoneMatch) => client.getDdls(name, { ifNoneMatch }));
+        const cdsResult = await compressCdsContext(
+          client,
+          ddlSource,
+          name,
+          maxDeps,
+          depth,
+          contextCacheForDependencyPayloads(cachingLayer, cacheSecurity),
+        );
+        const ktdMarkdown = shouldIncludeKtd ? await readKtdMarkdown(client, name, cachingLayer) : undefined;
+        return textResult(prependKtd(cdsResult.output, name, ktdMarkdown));
+      }
+      default:
+        return errorResult(
+          type === 'TABL'
+            ? 'SAPContext type TABL requires action="structure".'
+            : `SAPContext supports types: CLAS, INTF, PROG, FUNC, DDLS. Got: ${type}`,
+        );
+    }
+  }
+
+  const ktdMarkdown = shouldIncludeKtd ? await readKtdMarkdown(client, name, cachingLayer) : undefined;
+
+  // A root hash cannot validate changed dependency contracts or depth/maxDeps options.
+  // Rebuild the aggregate, retaining ETag-validated source reads (and PP isolation).
+  const dependencyPayloadCache = contextCacheForDependencyPayloads(cachingLayer, cacheSecurity);
+
+  // Use detected ABAP version from probe if available, otherwise Cloud (superset)
+  const probedAbapRelease = getCachedFeatures()?.abapRelease;
+  const abaplintVersion = probedAbapRelease ? mapSapReleaseToAbaplintVersion(probedAbapRelease) : undefined;
+
+  const result = await compressContext(
+    client,
+    source,
+    name,
+    type,
+    maxDeps,
+    depth,
+    abaplintVersion,
+    dependencyPayloadCache,
+  );
+  return textResult(prependKtd(result.output, name, ktdMarkdown));
+}
+
+async function readKtdMarkdown(
+  client: AdtClient,
+  name: string,
+  cachingLayer: CachingLayer | undefined,
+): Promise<string | undefined> {
+  try {
+    const envelope = cachingLayer
+      ? (
+          await cachingLayer.getSource('SKTD', name, (ifNoneMatch) =>
+            client.getKtd(name, { ifNoneMatch, version: 'active' }),
+          )
+        ).source
+      : (await client.getKtd(name, { version: 'active' })).source;
+    // Context is analysis-only: expose the stored Markdown without write-routing escapes.
+    const markdown = decodeKtdText(envelope, { routeSafe: false }).trim();
+    return markdown.length > 0 ? markdown : undefined;
+  } catch (err) {
+    if (isNotFoundError(err)) return undefined;
+    throw err;
+  }
+}
+
+function prependKtd(output: string, name: string, ktdMarkdown: string | undefined): string {
+  if (!ktdMarkdown) return output;
+  return `* === Knowledge Transfer Document for ${name} ===\n\n${ktdMarkdown}\n\n${output}`;
+}
+
+function buildCdsUpstream(
+  deps: Array<{
+    name: string;
+    kind: 'data_source' | 'association' | 'composition' | 'projection_base';
+  }>,
+): {
+  tables: Array<{ name: string }>;
+  views: Array<{ name: string }>;
+  associations: Array<{ name: string }>;
+  compositions: Array<{ name: string }>;
+} {
+  const tableNames = new Set<string>();
+  const viewNames = new Set<string>();
+  const associationNames = new Set<string>();
+  const compositionNames = new Set<string>();
+
+  for (const dep of deps) {
+    const upperName = dep.name.toUpperCase();
+    if (dep.kind === 'association') {
+      associationNames.add(upperName);
+      continue;
+    }
+    if (dep.kind === 'composition') {
+      compositionNames.add(upperName);
+      continue;
+    }
+    if (dep.kind === 'projection_base') {
+      viewNames.add(upperName);
+      continue;
+    }
+    if (isLikelyCdsViewName(upperName)) {
+      viewNames.add(upperName);
+    } else {
+      tableNames.add(upperName);
+    }
+  }
+
+  return {
+    tables: [...tableNames].sort().map((name) => ({ name })),
+    views: [...viewNames].sort().map((name) => ({ name })),
+    associations: [...associationNames].sort().map((name) => ({ name })),
+    compositions: [...compositionNames].sort().map((name) => ({ name })),
+  };
+}
+
+function isLikelyCdsViewName(name: string): boolean {
+  if (name.startsWith('/')) {
+    return /\/[ICRPAZ][A-Z0-9_]*_/.test(name);
+  }
+  return /^(ZI_|ZC_|ZR_|ZP_|I_|C_|R_|P_)/.test(name);
+}

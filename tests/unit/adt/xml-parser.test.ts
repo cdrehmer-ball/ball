@@ -1,0 +1,2077 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
+import { parseTableType } from '../../../src/adt/ddic-xml.js';
+import { parseSourceSearchResults } from '../../../src/adt/text-search.js';
+import {
+  buildApiReleasePutBody,
+  escapeXmlAttr,
+  findDeepNodes,
+  parseApiReleaseState,
+  parseAtcSystemCheckVariant,
+  parseAuthorizationField,
+  parseBspAppList,
+  parseBspFolderListing,
+  parseClassMetadata,
+  parseDataElementMetadata,
+  parseDataPreviewMeta,
+  parseDataPreviewResult,
+  parseDomainMetadata,
+  parseEnhancementImplementation,
+  parseFeatureToggleStates,
+  parseFunctionGroup,
+  parseFunctionGroupNodes,
+  parseFunctionModuleProperties,
+  parseInactiveObjects,
+  parseInstalledComponents,
+  parseMessageClass,
+  parseNamedItems,
+  parsePackageContents,
+  parseRevisionFeed,
+  parseSearchResults,
+  parseServerDrivenMetadata,
+  parseServiceBinding,
+  parseSubpackageNodestructure,
+  parseSyntaxConfigurations,
+  parseSystemInfo,
+  parseTableContents,
+  parseTransactionMetadata,
+  parseXml,
+} from '../../../src/adt/xml-parser.js';
+
+const fixturesDir = join(import.meta.dirname, '../../fixtures/xml');
+const loadFixture = (name: string) => readFileSync(join(fixturesDir, name), 'utf-8');
+
+describe('XML Parser', () => {
+  // ─── parseXml ──────────────────────────────────────────────────────
+
+  describe('parseXml', () => {
+    it('parses simple XML', () => {
+      const result = parseXml('<root><child attr="val">text</child></root>');
+      expect(result).toBeDefined();
+      expect((result.root as any).child).toBeDefined();
+    });
+
+    it('strips namespace prefixes', () => {
+      const result = parseXml(
+        '<adtcore:root xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:child>val</adtcore:child></adtcore:root>',
+      );
+      expect(result.root).toBeDefined();
+    });
+
+    it('preserves attributes with @_ prefix', () => {
+      const result = parseXml('<item name="test" type="PROG"/>');
+      const item = result.item as Record<string, unknown>;
+      expect(item['@_name']).toBe('test');
+      expect(item['@_type']).toBe('PROG');
+    });
+
+    it('keeps values as strings (does not parse numbers)', () => {
+      const result = parseXml('<item code="001"/>');
+      const item = result.item as Record<string, unknown>;
+      expect(item['@_code']).toBe('001'); // NOT number 1
+    });
+
+    it('forces configured repeatable ADT tags into arrays', () => {
+      const result = parseXml(
+        '<atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:entry><atom:link href="/x"/></atom:entry></atom:feed>',
+      );
+      const feed = result.feed as Record<string, unknown>;
+      const entries = feed.entry as Array<Record<string, unknown>>;
+      expect(Array.isArray(entries)).toBe(true);
+      expect(Array.isArray(entries[0]?.link)).toBe(true);
+    });
+
+    it('keeps non-repeatable tags as objects for single elements', () => {
+      const result = parseXml('<root><single attr="x"/></root>');
+      const root = result.root as Record<string, unknown>;
+      expect(Array.isArray(root.single)).toBe(false);
+      expect(root.single).toEqual({ '@_attr': 'x' });
+    });
+
+    it('handles empty XML', () => {
+      const result = parseXml('<root/>');
+      expect(result.root).toBeDefined();
+    });
+
+    // The custom entity decoder handles raw XML references once; CDATA remains literal.
+    describe('entity decoding', () => {
+      const attrAndText = (wire: string) => {
+        const item = parseXml(`<item attr="${wire}">${wire}</item>`).item as Record<string, unknown>;
+        return [item['@_attr'], item['#text']];
+      };
+
+      it('decodes the five predefined entities in attributes and text', () => {
+        const text = 'a > b & c < d "e" \'f\'';
+        expect(attrAndText('a &gt; b &amp; c &lt; d &quot;e&quot; &apos;f&apos;')).toEqual([text, text]);
+      });
+
+      // CodeQL js/double-escaping (docs/plans/2026-05-08-codeql-alerts-html-hygiene.md): were
+      // &amp; decoded first, &amp;lt; would become < instead of the literal text "&lt;".
+      it('decodes &amp; last, so an escaped entity stays literal text', () => {
+        const text = '&lt; &amp; &quot;x"';
+        expect(attrAndText('&amp;lt; &amp;amp; &amp;quot;x&quot;')).toEqual([text, text]);
+      });
+
+      it('leaves bare ampersands and references it does not know alone', () => {
+        const text = 'a & b &nbsp; &#0; &#xD800; &#1114112; &x';
+        expect(attrAndText(text)).toEqual([text, text]);
+      });
+
+      it('decodes numeric references once, including supplementary Unicode characters', () => {
+        const text = "' &lt; &amp; 😀";
+        expect(attrAndText('&#39; &#38;lt; &amp;amp; &#x1F600;')).toEqual([text, text]);
+      });
+
+      it('preserves literal entities and whitespace inside CDATA alongside encoded text', () => {
+        expect(parseXml('<r><![CDATA[ &amp; &#39; <x> ]]></r>').r).toBe(' &amp; &#39; <x> ');
+        expect(parseXml('<r>a&amp;<![CDATA[&amp;]]>b&lt;</r>').r).toBe('a&&amp;b<');
+      });
+
+      it('never expands an entity the document declares itself', () => {
+        const doc = parseXml('<!DOCTYPE r [<!ENTITY e "EXPANDED">]><r attr="&e;">&e; &amp; rest</r>');
+        expect(doc.r).toEqual({ '@_attr': '&e;', '#text': '&e; & rest' });
+      });
+
+      // fast-xml-parser 5.5.x rejected a document after 1000 references, which is what an ST22
+      // feed carries in a handful of stack traces. The decode here must never be capped.
+      it('has no cap on the number of references', () => {
+        const count = 5000;
+        const xml = `<feed>${'<entry title="a &lt; b">x &amp; y &gt; z</entry>'.repeat(count)}</feed>`;
+        const entries = (parseXml(xml).feed as Record<string, unknown>).entry as Array<Record<string, unknown>>;
+        expect(entries).toHaveLength(count);
+        expect(entries[count - 1]).toEqual({ '@_title': 'a < b', '#text': 'x & y > z' });
+      });
+    });
+  });
+
+  // ─── parseSearchResults ────────────────────────────────────────────
+
+  describe('parseSearchResults', () => {
+    it('parses search results from fixture', () => {
+      const xml = loadFixture('search-results.xml');
+      const results = parseSearchResults(xml);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0]?.objectName).toBeTruthy();
+      expect(results[0]?.objectType).toBeTruthy();
+    });
+
+    it('handles single result (not array)', () => {
+      const xml = `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+        <adtcore:objectReference uri="/sap/bc/adt/programs/programs/ZTEST" type="PROG/P" name="ZTEST" packageName="$TMP" description="Test"/>
+      </adtcore:objectReferences>`;
+      const results = parseSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.objectName).toBe('ZTEST');
+      expect(results[0]?.objectType).toBe('PROG/P');
+      expect(results[0]?.packageName).toBe('$TMP');
+      expect(results[0]?.description).toBe('Test');
+    });
+
+    it('handles empty results', () => {
+      const xml = '<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>';
+      const results = parseSearchResults(xml);
+      expect(results).toEqual([]);
+    });
+
+    it('handles multiple results', () => {
+      const xml = `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+        <adtcore:objectReference uri="/uri1" type="PROG/P" name="PROG1" packageName="$TMP" description="P1"/>
+        <adtcore:objectReference uri="/uri2" type="CLAS/OC" name="ZCL_1" packageName="ZTEST" description="C1"/>
+      </adtcore:objectReferences>`;
+      const results = parseSearchResults(xml);
+      expect(results).toHaveLength(2);
+      expect(results[0]?.objectName).toBe('PROG1');
+      expect(results[1]?.objectName).toBe('ZCL_1');
+    });
+
+    it('handles missing attributes gracefully', () => {
+      const xml = `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+        <adtcore:objectReference uri="/uri"/>
+      </adtcore:objectReferences>`;
+      const results = parseSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.objectName).toBe('');
+      expect(results[0]?.objectType).toBe('');
+    });
+
+    // Regression for the "literal &gt; in description" bug: consumers see the
+    // human-readable form, not the wire-encoded form.
+    describe('decodes standard XML entities in description', () => {
+      function descOf(rawAttr: string): string | undefined {
+        const xml = `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+          <adtcore:objectReference uri="/u" type="PROG/P" name="ZX" packageName="$TMP" description="${rawAttr}"/>
+        </adtcore:objectReferences>`;
+        return parseSearchResults(xml)[0]?.description;
+      }
+
+      it('decodes &gt; (the original repro)', () => {
+        expect(descOf('Seed data for SEGW-&gt;RAP demo')).toBe('Seed data for SEGW->RAP demo');
+      });
+
+      it('decodes &lt;', () => {
+        expect(descOf('Less &lt; than')).toBe('Less < than');
+      });
+
+      it('decodes &amp;', () => {
+        expect(descOf('Cars &amp; coffee')).toBe('Cars & coffee');
+      });
+
+      it('decodes &quot;', () => {
+        expect(descOf('She said &quot;hi&quot;')).toBe('She said "hi"');
+      });
+
+      it('decodes &apos;', () => {
+        expect(descOf('It&apos;s fine')).toBe("It's fine");
+      });
+
+      it('decodes all five mixed in one description', () => {
+        expect(descOf('a &gt; b &amp; c &lt; d &quot;e&quot; &apos;f&apos;')).toBe('a > b & c < d "e" \'f\'');
+      });
+
+      it('decodes &amp; LAST so &amp;lt; resolves to literal &lt; (CodeQL js/double-escaping)', () => {
+        // If &amp; were decoded first, &amp;lt; → &lt; → < (incorrect).
+        // We decode &amp; last, so &amp;lt; → &lt; (literal text).
+        expect(descOf('a &amp;lt; b')).toBe('a &lt; b');
+      });
+
+      it('decodes every other field too — a uri with a query string must be requestable', () => {
+        const xml = `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+          <adtcore:objectReference uri="/u?a=1&amp;b=2" type="X&amp;Y" name="N&amp;M" packageName="P&amp;Q" description="d"/>
+        </adtcore:objectReferences>`;
+        const r = parseSearchResults(xml)[0];
+        expect(r?.uri).toBe('/u?a=1&b=2');
+        expect(r?.objectType).toBe('X&Y');
+        expect(r?.objectName).toBe('N&M');
+        expect(r?.packageName).toBe('P&Q');
+      });
+    });
+  });
+
+  // ─── parseTableContents ────────────────────────────────────────────
+
+  describe('parseTableContents', () => {
+    it('parses table contents from fixture (old asx format)', () => {
+      const xml = loadFixture('table-contents.xml');
+      const result = parseTableContents(xml);
+
+      expect(result.columns.length).toBeGreaterThan(0);
+      expect(result.rows.length).toBeGreaterThan(0);
+      expect(result.columns).toContain('MANDT');
+    });
+
+    it('handles empty table', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+        <asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
+          <asx:values><COLUMNS></COLUMNS></asx:values>
+        </asx:abap>`;
+      const result = parseTableContents(xml);
+      expect(result.columns).toEqual([]);
+      expect(result.rows).toEqual([]);
+    });
+
+    it('parses dataPreview namespace format (newer SAP systems)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview">
+  <dataPreview:totalRows>2</dataPreview:totalRows>
+  <dataPreview:columns>
+    <dataPreview:metadata dataPreview:name="MANDT" dataPreview:type="C"/>
+    <dataPreview:dataSet>
+      <dataPreview:data>001</dataPreview:data>
+      <dataPreview:data>002</dataPreview:data>
+    </dataPreview:dataSet>
+  </dataPreview:columns>
+  <dataPreview:columns>
+    <dataPreview:metadata dataPreview:name="MTEXT" dataPreview:type="C"/>
+    <dataPreview:dataSet>
+      <dataPreview:data>Dev</dataPreview:data>
+      <dataPreview:data>Test</dataPreview:data>
+    </dataPreview:dataSet>
+  </dataPreview:columns>
+</dataPreview:tableData>`;
+      const result = parseTableContents(xml);
+      expect(result.columns).toEqual(['MANDT', 'MTEXT']);
+      expect(result.rows).toHaveLength(2);
+      expect(result.rows[0]).toEqual({ MANDT: '001', MTEXT: 'Dev' });
+      expect(result.rows[1]).toEqual({ MANDT: '002', MTEXT: 'Test' });
+    });
+
+    it('handles single-row dataPreview response', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview">
+  <dataPreview:columns>
+    <dataPreview:metadata dataPreview:name="COL1" dataPreview:type="C"/>
+    <dataPreview:dataSet>
+      <dataPreview:data>val1</dataPreview:data>
+    </dataPreview:dataSet>
+  </dataPreview:columns>
+</dataPreview:tableData>`;
+      const result = parseTableContents(xml);
+      expect(result.columns).toEqual(['COL1']);
+      expect(result.rows).toHaveLength(1);
+      expect(result.rows[0]).toEqual({ COL1: 'val1' });
+    });
+
+    it('handles column with no data rows', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview">
+  <dataPreview:columns>
+    <dataPreview:metadata dataPreview:name="EMPTY_COL" dataPreview:type="C"/>
+    <dataPreview:dataSet/>
+  </dataPreview:columns>
+</dataPreview:tableData>`;
+      const result = parseTableContents(xml);
+      expect(result.columns).toEqual(['EMPTY_COL']);
+      expect(result.rows).toEqual([]);
+    });
+  });
+
+  // ─── parseDataPreviewMeta ──────────────────────────────────────────
+
+  describe('parseDataPreviewMeta', () => {
+    it('extracts totalRows, queryExecutionTimeMs, executedQueryString (real freestyle response)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?><dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"><dataPreview:totalRows>511927</dataPreview:totalRows><dataPreview:isHanaAnalyticalView>false</dataPreview:isHanaAnalyticalView><dataPreview:executedQueryString>SELECT MANDT FROM T000   INTO     TABLE @DATA(LT_RESULT)   UP TO 3  ROWS   .</dataPreview:executedQueryString><dataPreview:queryExecutionTime>0.3150000</dataPreview:queryExecutionTime><dataPreview:columns><dataPreview:metadata dataPreview:name="MANDT"/></dataPreview:columns></dataPreview:tableData>`;
+      const meta = parseDataPreviewMeta(xml);
+      expect(meta.totalRows).toBe(511927);
+      expect(meta.queryExecutionTimeMs).toBeCloseTo(0.315);
+      expect(meta.executedQueryString).toBe('SELECT MANDT FROM T000 INTO TABLE @DATA(LT_RESULT) UP TO 3 ROWS .');
+    });
+
+    it('returns empty object when fields are absent (old asx format)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?><asx:abap xmlns:asx="http://www.sap.com/abapxml"><asx:values><COLUMNS></COLUMNS></asx:values></asx:abap>`;
+      expect(parseDataPreviewMeta(xml)).toEqual({});
+    });
+
+    it('surfaces only the fields present (partial)', () => {
+      const xml = `<dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"><dataPreview:totalRows>42</dataPreview:totalRows></dataPreview:tableData>`;
+      expect(parseDataPreviewMeta(xml)).toEqual({ totalRows: 42 });
+    });
+
+    it('ignores empty and non-numeric metric fields', () => {
+      const xml = `<dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"><dataPreview:totalRows> </dataPreview:totalRows><dataPreview:queryExecutionTime>not-a-number</dataPreview:queryExecutionTime><dataPreview:executedQueryString>  </dataPreview:executedQueryString></dataPreview:tableData>`;
+      expect(parseDataPreviewMeta(xml)).toEqual({});
+    });
+
+    it('returns empty object for empty input', () => {
+      expect(parseDataPreviewMeta('')).toEqual({});
+    });
+
+    it('parses rows and metrics together from one data-preview document', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?><dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"><dataPreview:totalRows>2</dataPreview:totalRows><dataPreview:queryExecutionTime>1.25</dataPreview:queryExecutionTime><dataPreview:columns><dataPreview:metadata dataPreview:name="MANDT"/><dataPreview:dataSet><dataPreview:data>001</dataPreview:data><dataPreview:data>002</dataPreview:data></dataPreview:dataSet></dataPreview:columns></dataPreview:tableData>`;
+      expect(parseDataPreviewResult(xml)).toEqual({
+        totalRows: 2,
+        queryExecutionTimeMs: 1.25,
+        columns: ['MANDT'],
+        rows: [{ MANDT: '001' }, { MANDT: '002' }],
+      });
+      expect(parseDataPreviewResult('')).toEqual({ columns: [], rows: [] });
+    });
+
+    it('decodes entity-encoded cell values and the executed query', () => {
+      // Verbatim freestyle response captured live from a4h (SAP_BASIS 758); SAP escapes & < > in cells.
+      const xml = `<?xml version="1.0" encoding="utf-8"?><dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"><dataPreview:totalRows>2</dataPreview:totalRows><dataPreview:isHanaAnalyticalView>false</dataPreview:isHanaAnalyticalView><dataPreview:executedQueryString>SELECT ROLLNAME, DDTEXT FROM DD04T WHERE DDLANGUAGE = 'E' AND ROLLNAME IN ('CKDETAILNO', 'CHECKOP') AND DDTEXT LIKE '%&lt;%' OR DDLANGUAGE = 'E' AND ROLLNAME = 'CKDETAILNO'   INTO     TABLE @DATA(LT_RESULT)   UP TO 5  ROWS   .</dataPreview:executedQueryString><dataPreview:queryExecutionTime>50.4930000</dataPreview:queryExecutionTime><dataPreview:columns><dataPreview:metadata dataPreview:name="ROLLNAME" dataPreview:type="C" dataPreview:description="ROLLNAME" dataPreview:keyAttribute="false" dataPreview:colType="" dataPreview:isKeyFigure="false"/><dataPreview:dataSet><dataPreview:data>CHECKOP</dataPreview:data><dataPreview:data>CKDETAILNO</dataPreview:data></dataPreview:dataSet></dataPreview:columns><dataPreview:columns><dataPreview:metadata dataPreview:name="DDTEXT" dataPreview:type="C" dataPreview:description="DDTEXT" dataPreview:keyAttribute="false" dataPreview:colType="" dataPreview:isKeyFigure="false"/><dataPreview:dataSet><dataPreview:data>Check operator: '=','!=','&lt;','&gt;','&lt;=','&gt;=' or 'D' -&gt; dynamic</dataPreview:data><dataPreview:data>(Serial) detail number of logical check (LTXHWM: 1 &amp; 2)</dataPreview:data></dataPreview:dataSet></dataPreview:columns></dataPreview:tableData>`;
+      const result = parseDataPreviewResult(xml);
+      expect(result.rows).toEqual([
+        { ROLLNAME: 'CHECKOP', DDTEXT: "Check operator: '=','!=','<','>','<=','>=' or 'D' -> dynamic" },
+        { ROLLNAME: 'CKDETAILNO', DDTEXT: '(Serial) detail number of logical check (LTXHWM: 1 & 2)' },
+      ]);
+      expect(result.executedQueryString).toBe(
+        "SELECT ROLLNAME, DDTEXT FROM DD04T WHERE DDLANGUAGE = 'E' AND ROLLNAME IN ('CKDETAILNO', 'CHECKOP') AND DDTEXT LIKE '%<%' OR DDLANGUAGE = 'E' AND ROLLNAME = 'CKDETAILNO' INTO TABLE @DATA(LT_RESULT) UP TO 5 ROWS .",
+      );
+      expect(parseTableContents(xml).rows).toEqual(result.rows);
+    });
+  });
+
+  // ─── parseInstalledComponents ──────────────────────────────────────
+
+  describe('parseInstalledComponents', () => {
+    it('parses installed components from fixture (Atom feed format)', () => {
+      const xml = loadFixture('installed-components.xml');
+      const components = parseInstalledComponents(xml);
+
+      expect(components).toHaveLength(3);
+      expect(components[0]).toMatchObject({
+        name: 'SAP_BASIS',
+        release: '753',
+        description: 'SAP Basis Component',
+      });
+      expect(components[1]?.name).toBe('SAP_ABA');
+      expect(components[2]?.name).toBe('SAP_GWFND');
+    });
+
+    it('exposes SP name and SP level from the title', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:id>SAP_BASIS</atom:id>
+    <atom:title>758;SAPK-75802INSAPBASIS;0002;SAP Basis Component</atom:title>
+  </atom:entry>
+</atom:feed>`;
+      const components = parseInstalledComponents(xml);
+      expect(components[0]).toEqual({
+        name: 'SAP_BASIS',
+        release: '758',
+        spName: 'SAPK-75802INSAPBASIS',
+        spLevel: '0002',
+        description: 'SAP Basis Component',
+      });
+    });
+
+    it('handles empty feed', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:title>Installed Components</atom:title>
+</atom:feed>`;
+      const components = parseInstalledComponents(xml);
+      expect(components).toEqual([]);
+    });
+
+    it('handles single entry', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:id>S4CORE</atom:id>
+    <atom:title>108;SAPK-10808INS4CORE;0008;SAP S/4HANA Core</atom:title>
+  </atom:entry>
+</atom:feed>`;
+      const components = parseInstalledComponents(xml);
+      expect(components).toHaveLength(1);
+      expect(components[0]).toMatchObject({
+        name: 'S4CORE',
+        release: '108',
+        description: 'SAP S/4HANA Core',
+      });
+    });
+
+    it('handles title with fewer semicolons gracefully', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:id>CUSTOM</atom:id>
+    <atom:title>100;SP01</atom:title>
+  </atom:entry>
+</atom:feed>`;
+      const components = parseInstalledComponents(xml);
+      expect(components[0]?.name).toBe('CUSTOM');
+      expect(components[0]?.release).toBe('100');
+    });
+  });
+
+  // ─── parseSyntaxConfigurations ─────────────────────────────────────
+
+  describe('parseSyntaxConfigurations', () => {
+    // Mirrors a live 7.57 syntax-configurations response.
+    const liveResponse = `<?xml version="1.0" encoding="utf-8"?>
+<abapsource:syntaxConfigurations xmlns:abapsource="http://www.sap.com/adt/abapsource">
+  <abapsource:syntaxConfiguration>
+    <abapsource:language>
+      <abapsource:version>2</abapsource:version>
+      <abapsource:description>ABAP for Key Users</abapsource:description>
+      <atom:link href="/sap/bc/adt/abapsource/parsers/rnd/grammar/2" rel="http://www.sap.com/adt/relations/abapsource/parser" type="text/plain" title="ABAP for Key Users" etag="7572" xmlns:atom="http://www.w3.org/2005/Atom"/>
+    </abapsource:language>
+    <abapsource:objectUsage abapsource:restricted="true"/>
+  </abapsource:syntaxConfiguration>
+  <abapsource:syntaxConfiguration>
+    <abapsource:language>
+      <abapsource:version>5</abapsource:version>
+      <abapsource:description>ABAP for Cloud Development</abapsource:description>
+      <atom:link href="/sap/bc/adt/abapsource/parsers/rnd/grammar/5" rel="http://www.sap.com/adt/relations/abapsource/parser" type="text/plain" title="ABAP for Cloud Development" etag="7575" xmlns:atom="http://www.w3.org/2005/Atom"/>
+    </abapsource:language>
+  </abapsource:syntaxConfiguration>
+  <abapsource:syntaxConfiguration>
+    <abapsource:language>
+      <abapsource:version>X</abapsource:version>
+      <abapsource:description>Standard ABAP</abapsource:description>
+      <atom:link href="/sap/bc/adt/abapsource/parsers/rnd/grammar" rel="http://www.sap.com/adt/relations/abapsource/parser" type="text/plain" title="Standard ABAP" etag="757" xmlns:atom="http://www.w3.org/2005/Atom"/>
+    </abapsource:language>
+  </abapsource:syntaxConfiguration>
+</abapsource:syntaxConfigurations>`;
+
+    it('parses each syntax configuration entry with version, description, etag', () => {
+      const configs = parseSyntaxConfigurations(liveResponse);
+      expect(configs).toHaveLength(3);
+
+      const standard = configs.find((c) => c.version === 'X');
+      expect(standard).toEqual({
+        version: 'X',
+        description: 'Standard ABAP',
+        etag: '757',
+      });
+
+      const keyUsers = configs.find((c) => c.version === '2');
+      expect(keyUsers?.description).toBe('ABAP for Key Users');
+      expect(keyUsers?.etag).toBe('7572');
+
+      const cloud = configs.find((c) => c.version === '5');
+      expect(cloud?.description).toBe('ABAP for Cloud Development');
+      expect(cloud?.etag).toBe('7575');
+    });
+
+    it('returns empty array when the feed has no syntaxConfiguration entries', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<abapsource:syntaxConfigurations xmlns:abapsource="http://www.sap.com/adt/abapsource"/>`;
+      expect(parseSyntaxConfigurations(xml)).toEqual([]);
+    });
+
+    it('tolerates entries with missing description', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<abapsource:syntaxConfigurations xmlns:abapsource="http://www.sap.com/adt/abapsource">
+  <abapsource:syntaxConfiguration>
+    <abapsource:language>
+      <abapsource:version>4</abapsource:version>
+      <atom:link etag="7574" xmlns:atom="http://www.w3.org/2005/Atom"/>
+    </abapsource:language>
+  </abapsource:syntaxConfiguration>
+</abapsource:syntaxConfigurations>`;
+      const configs = parseSyntaxConfigurations(xml);
+      expect(configs).toEqual([{ version: '4', description: '', etag: '7574' }]);
+    });
+  });
+
+  // ─── parseFunctionGroup ────────────────────────────────────────────
+
+  describe('parseFunctionGroup', () => {
+    // The real ADT shape is the objectstructure tree: a root <objectStructureElement>
+    // (type FUGR/F) with child elements typed FUGR/FF (function modules), FUGR/I
+    // (includes), FUGR/PX (main program). See tests/fixtures/xml/function-group.xml
+    // (captured live from a4h: ZABAPGIT_PARALLEL — 2 functions, 2 includes).
+    it('parses function group with modules + includes from the real objectstructure fixture', () => {
+      const xml = loadFixture('function-group.xml');
+      const result = parseFunctionGroup(xml);
+      expect(result.name).toBe('ZABAPGIT_PARALLEL');
+      expect(result.functions).toEqual(['Z_ABAPGIT_SERIALIZE_PACKAGE', 'Z_ABAPGIT_SERIALIZE_PARALLEL']);
+      expect(result.includes).toContain('LZABAPGIT_PARALLELTOP');
+      expect(result.includes).toContain('LZABAPGIT_PARALLELUXX');
+    });
+
+    it('handles a group with no function modules', () => {
+      const xml = '<objectStructureElement name="ZEMPTY" type="FUGR/F"/>';
+      const result = parseFunctionGroup(xml);
+      expect(result.name).toBe('ZEMPTY');
+      expect(result.functions).toEqual([]);
+      expect(result.includes).toEqual([]);
+    });
+
+    it('handles a single function module', () => {
+      const xml = `<objectStructureElement name="ZGROUP" type="FUGR/F">
+        <objectStructureElement name="Z_SINGLE_FUNC" type="FUGR/FF"/>
+      </objectStructureElement>`;
+      const result = parseFunctionGroup(xml);
+      expect(result.name).toBe('ZGROUP');
+      expect(result.functions).toEqual(['Z_SINGLE_FUNC']);
+    });
+
+    it('separates function modules (FUGR/FF) from includes (FUGR/I) and ignores the main program (FUGR/PX)', () => {
+      const xml = `<objectStructureElement name="ZGROUP" type="FUGR/F">
+        <objectStructureElement name="Z_FUNC1" type="FUGR/FF"/>
+        <objectStructureElement name="Z_FUNC2" type="FUGR/FF"/>
+        <objectStructureElement name="LZGROUPTOP" type="FUGR/I"/>
+        <objectStructureElement name="SAPLZGROUP" type="FUGR/PX"/>
+      </objectStructureElement>`;
+      const result = parseFunctionGroup(xml);
+      expect(result.functions).toEqual(['Z_FUNC1', 'Z_FUNC2']);
+      expect(result.includes).toEqual(['LZGROUPTOP']);
+    });
+  });
+
+  // ─── parseFunctionGroupNodes (pre-7.52 fallback shape) ─────────────
+
+  describe('parseFunctionGroupNodes', () => {
+    // Flat <projectexplorer:node> list from /sap/bc/adt/repository/objectstructure.
+    // Fixture captured live from npl 7.50 (ZZFIXFG: 1 FM, 2 includes) — see the header
+    // comment in the fixture for the exact request.
+    it('parses functions and includes from the real 7.50 projectexplorer fixture', () => {
+      const xml = loadFixture('function-group-projectexplorer.xml');
+      const result = parseFunctionGroupNodes(xml, 'ZZFIXFG');
+      expect(result.name).toBe('ZZFIXFG');
+      expect(result.functions).toEqual(['Z_ZZFIXFG_PING']);
+      expect(result.includes).toEqual(expect.arrayContaining(['LZZFIXFGTOP', 'LZZFIXFGUXX']));
+    });
+
+    it('skips folder nodes, which carry an objecttype but no objectname', () => {
+      const xml = loadFixture('function-group-projectexplorer.xml');
+      const result = parseFunctionGroupNodes(xml, 'ZZFIXFG');
+      // The fixture has "Includes" (PROG/I) and "Function Modules" (FUGR/FF) folder nodes.
+      expect(result.functions).not.toContain('');
+      expect(result.includes).not.toContain('');
+      expect(result.functions).toHaveLength(1);
+    });
+
+    it('ignores dynpro/module/text node types that real SAP groups emit', () => {
+      // Shape observed live on SRFC/SUNI (npl 7.50): FUGR/PD dynpros, FUGR/PM PBO modules,
+      // FUGR/PT text elements and PROG/* nodes sit alongside the FF/I nodes.
+      const xml = `<projectexplorer:objectstructure xmlns:projectexplorer="http://www.sap.com/adt/projectexplorer">
+        <projectexplorer:node nodeid="1" isfolder="false" objecttype="FUGR/FF" objectname="Z_KEEP"/>
+        <projectexplorer:node nodeid="2" isfolder="false" objecttype="FUGR/I" objectname="LZKEEPTOP"/>
+        <projectexplorer:node nodeid="3" isfolder="false" objecttype="FUGR/PD" objectname="0100"/>
+        <projectexplorer:node nodeid="4" isfolder="false" objecttype="FUGR/PM" objectname="STATUS_0100"/>
+        <projectexplorer:node nodeid="5" isfolder="false" objecttype="PROG/I" objectname="SOMEPROG"/>
+      </projectexplorer:objectstructure>`;
+      const result = parseFunctionGroupNodes(xml, 'ZKEEP');
+      expect(result.functions).toEqual(['Z_KEEP']);
+      expect(result.includes).toEqual(['LZKEEPTOP']);
+    });
+
+    it('returns empty arrays for a group with no nodes', () => {
+      const xml = '<projectexplorer:objectstructure xmlns:projectexplorer="http://www.sap.com/adt/projectexplorer"/>';
+      expect(parseFunctionGroupNodes(xml, 'ZEMPTY')).toEqual({ name: 'ZEMPTY', functions: [], includes: [] });
+    });
+  });
+
+  // ─── function module properties (processingType / updateTaskKind) ──
+
+  describe('parseFunctionModuleProperties', () => {
+    // Fixture captured live from a4h 758: RFC_PING, an RFC-enabled module.
+    it('parses processingType and releaseState from the real fixture', () => {
+      const props = parseFunctionModuleProperties(loadFixture('function-module-properties.xml'));
+      expect(props.processingType).toBe('rfc');
+      expect(props.releaseState).toBe('notReleased');
+      expect(props.updateTaskKind).toBeUndefined();
+    });
+
+    it('reads updateTaskKind when SAP reports one', () => {
+      const xml =
+        '<fmodule:abapFunctionModule xmlns:fmodule="http://www.sap.com/adt/functions/fmodules" fmodule:processingType="update" fmodule:updateTaskKind="collectiveRun"/>';
+      expect(parseFunctionModuleProperties(xml)).toEqual({
+        processingType: 'update',
+        updateTaskKind: 'collectiveRun',
+      });
+    });
+
+    it('accepts single-quoted attributes and mixed-case element names', () => {
+      const xml =
+        "<FMODULE:abapFunctionModule xmlns:fmodule='http://www.sap.com/adt/functions/fmodules' fmodule:processingType='rfc'/>";
+      expect(parseFunctionModuleProperties(xml).processingType).toBe('rfc');
+    });
+
+    it('ignores an fmodule attribute that appears outside the root element', () => {
+      const xml =
+        '<fmodule:abapFunctionModule xmlns:fmodule="http://www.sap.com/adt/functions/fmodules">' +
+        "<atom:link href='x' title='fmodule:processingType=\"rfc\"'/></fmodule:abapFunctionModule>";
+      expect(parseFunctionModuleProperties(xml).processingType).toBeUndefined();
+    });
+
+    it('returns an empty object when the document carries none of the attributes', () => {
+      const xml =
+        '<fmodule:abapFunctionModule xmlns:fmodule="http://www.sap.com/adt/functions/fmodules" adtcore:name="Z_X"/>';
+      expect(parseFunctionModuleProperties(xml)).toEqual({});
+    });
+  });
+
+  // ─── parsePackageContents ──────────────────────────────────────────
+
+  describe('parsePackageContents', () => {
+    it('parses package contents from fixture', () => {
+      const xml = loadFixture('package-contents.xml');
+      const contents = parsePackageContents(xml);
+      expect(contents.length).toBeGreaterThan(0);
+    });
+
+    it('handles empty package', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
+  <asx:values><DATA><TREE_CONTENT/></DATA></asx:values>
+</asx:abap>`;
+      const contents = parsePackageContents(xml);
+      expect(contents).toEqual([]);
+    });
+  });
+
+  // ─── parseSubpackageNodestructure ─────────────────────────────────
+  //
+  // Parses the response of `POST /sap/bc/adt/repository/nodestructure`
+  // for `parent_type=DEVC/K` and returns only the direct DEVC/K children
+  // (DEVC/KI package interfaces and placeholder rows excluded). Backs
+  // the `allowedPackages` subtree-rule (`ZFOO/**`) safety gate, so the
+  // contract is strict: only DEVC/K with non-empty OBJECT_NAME, dedup,
+  // uppercase, empty body returns [].
+  describe('parseSubpackageNodestructure', () => {
+    it('parses the live SABP_UNIT fixture into the exact 5 known children', () => {
+      // Live fixture captured from S/4HANA 2023 (a4h.marianzeis.de)
+      const xml = loadFixture('nodestructure-sabp_unit-devc.xml');
+      const names = parseSubpackageNodestructure(xml);
+      expect([...names].sort()).toEqual([
+        'SABP_UNIT_CORE',
+        'SABP_UNIT_EXECUTION_API',
+        'SABP_UNIT_GUI',
+        'SABP_UNIT_SCRATCH',
+        'SABP_UNIT_SHARED',
+      ]);
+    });
+
+    it('returns [] for an empty body (HTTP 200 with no payload — SAP response for unknown parents)', () => {
+      expect(parseSubpackageNodestructure('')).toEqual([]);
+      expect(parseSubpackageNodestructure('   \n  ')).toEqual([]);
+    });
+
+    it('returns [] when TREE_CONTENT is empty', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
+  <asx:values><DATA><TREE_CONTENT/></DATA></asx:values>
+</asx:abap>`;
+      expect(parseSubpackageNodestructure(xml)).toEqual([]);
+    });
+
+    it('filters out DEVC/KI (package interface) rows', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/KI</OBJECT_TYPE><OBJECT_NAME>ZFOO_IF</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>CLAS/OC</OBJECT_TYPE><OBJECT_NAME>ZCL_LEAK</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      expect(parseSubpackageNodestructure(xml)).toEqual(['ZFOO_A']);
+    });
+
+    it('filters out rows with empty OBJECT_NAME (SAP placeholders / category rows)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME/></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>   </OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      expect(parseSubpackageNodestructure(xml)).toEqual(['ZFOO_A']);
+    });
+
+    it('uppercases names and deduplicates', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>zfoo_a</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_B</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      expect(parseSubpackageNodestructure(xml)).toEqual(['ZFOO_A', 'ZFOO_B']);
+    });
+  });
+
+  // ─── parseSearchResults — package contents alignment regression ───
+  //
+  // Background: getPackageContents() used to call the `nodestructure` ADT
+  // endpoint, which returns object descriptions misaligned with their names
+  // on real systems (SAP-side data-quality issue). The fix routes
+  // getPackageContents through the `informationsystem/search` endpoint
+  // instead — which uses the parseSearchResults parser. The fixture
+  // `package-contents-search.xml` is the **real captured response** from
+  // a live S/4HANA 2023 system for the package ZDEMO_MIG (5 demo objects
+  // plus SEGW-generated artifacts). If parseSearchResults ever regresses to
+  // misaligning descriptions, this test fails on the four anchor rows below.
+  describe('parseSearchResults — package contents alignment', () => {
+    it('attaches each description to its OWN object name (regression for #devc-listing-bug)', () => {
+      const xml = loadFixture('package-contents-search.xml');
+      const refs = parseSearchResults(xml);
+
+      // The four anchor rows. If any shifts, the bug is back.
+      const sub = refs.find((r) => r.objectName === 'ZDEMO_MIG_RAP');
+      const dpc = refs.find((r) => r.objectName === 'ZCL_ZDEMO_MIG_PROJECTS_DPC');
+      const proj = refs.find((r) => r.objectName === 'ZDM_PROJECT');
+      const seed = refs.find((r) => r.objectName === 'ZDM_SEED_DATA');
+
+      expect(sub?.description).toBe('Demo: RAP migration outputs from migrate-segw-to-rap skill');
+      expect(dpc?.description).toBe('Data Provider Base Class');
+      expect(proj?.description).toBe('Demo: Project (legacy SEGW era)');
+      expect(seed?.description).toBe('Seed data for SEGW->RAP demo');
+
+      // And types/uris track too — fields are not shuffled at the parser level.
+      expect(sub?.objectType).toBe('DEVC/K');
+      expect(sub?.uri).toBe('/sap/bc/adt/packages/zdemo_mig_rap');
+      expect(proj?.objectType).toBe('TABL/DT');
+    });
+
+    it('returns an empty array when the response has no objectReference children', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>`;
+      expect(parseSearchResults(xml)).toEqual([]);
+    });
+
+    it('handles a single objectReference (fast-xml-parser non-array shape)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zonly" adtcore:type="PROG/P" adtcore:name="ZONLY" adtcore:packageName="ZTEST" adtcore:description="The lonely report"/>
+</adtcore:objectReferences>`;
+      const refs = parseSearchResults(xml);
+      expect(refs).toHaveLength(1);
+      expect(refs[0]?.objectName).toBe('ZONLY');
+      expect(refs[0]?.description).toBe('The lonely report');
+    });
+
+    it('returns an empty string (not undefined) when description attribute is missing', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/x" adtcore:type="X/Y" adtcore:name="ZNOMORE" adtcore:packageName="P"/>
+</adtcore:objectReferences>`;
+      const refs = parseSearchResults(xml);
+      expect(refs).toHaveLength(1);
+      expect(refs[0]?.description).toBe('');
+      expect(typeof refs[0]?.description).toBe('string');
+    });
+  });
+
+  // ─── parseSystemInfo ──────────────────────────────────────────────
+
+  describe('parseSystemInfo', () => {
+    it('parses discovery XML with workspaces and collections', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<app:service xmlns:app="http://www.w3.org/2007/app" xmlns:atom="http://www.w3.org/2005/Atom">
+  <app:workspace>
+    <atom:title>Object Discovery</atom:title>
+    <app:collection href="/sap/bc/adt/repository/nodestructure">
+      <atom:title>Object Types</atom:title>
+    </app:collection>
+    <app:collection href="/sap/bc/adt/repository/informationsystem/search">
+      <atom:title>Search</atom:title>
+    </app:collection>
+  </app:workspace>
+  <app:workspace>
+    <atom:title>Source Code Library</atom:title>
+    <app:collection href="/sap/bc/adt/programs/programs">
+      <atom:title>Programs</atom:title>
+    </app:collection>
+  </app:workspace>
+</app:service>`;
+      const result = parseSystemInfo(xml, 'DEVELOPER');
+      expect(result.user).toBe('DEVELOPER');
+      expect(result.collections.length).toBeGreaterThan(0);
+      const search = result.collections.find((c) => c.title === 'Search');
+      expect(search).toBeDefined();
+      expect(search?.href).toBe('/sap/bc/adt/repository/informationsystem/search');
+      const programs = result.collections.find((c) => c.title === 'Programs');
+      expect(programs).toBeDefined();
+      expect(programs?.href).toBe('/sap/bc/adt/programs/programs');
+    });
+
+    it('returns username even with empty discovery XML', () => {
+      const xml = '<service/>';
+      const result = parseSystemInfo(xml, 'ADMIN');
+      expect(result.user).toBe('ADMIN');
+      expect(result.collections).toEqual([]);
+    });
+
+    it('handles single workspace with single collection', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<app:service xmlns:app="http://www.w3.org/2007/app" xmlns:atom="http://www.w3.org/2005/Atom">
+  <app:workspace>
+    <atom:title>Single</atom:title>
+    <app:collection href="/sap/bc/adt/core">
+      <atom:title>Core</atom:title>
+    </app:collection>
+  </app:workspace>
+</app:service>`;
+      const result = parseSystemInfo(xml, 'TEST_USER');
+      expect(result.user).toBe('TEST_USER');
+      expect(result.collections).toHaveLength(1);
+      expect(result.collections[0]).toEqual({ title: 'Core', href: '/sap/bc/adt/core' });
+    });
+  });
+
+  // ─── parseDomainMetadata ───────────────────────────────────────────
+
+  describe('parseDomainMetadata', () => {
+    it('parses domain metadata from fixture', () => {
+      const xml = loadFixture('domain-metadata.xml');
+      const domain = parseDomainMetadata(xml);
+      expect(domain.name).toBe('BUKRS');
+      expect(domain.description).toBe('Company code');
+      expect(domain.dataType).toBe('CHAR');
+      expect(domain.length).toBe('000004');
+      expect(domain.decimals).toBe('000000');
+      expect(domain.outputLength).toBe('000004');
+      expect(domain.signExists).toBe(false);
+      expect(domain.lowercase).toBe(false);
+      expect(domain.valueTable).toBe('T001');
+      expect(domain.fixedValues).toEqual([]);
+      expect(domain.package).toBe('BF');
+    });
+
+    it('parses domain with fixed values', () => {
+      const xml = loadFixture('domain-with-fixvalues.xml');
+      const domain = parseDomainMetadata(xml);
+      expect(domain.name).toBe('BAPI_MTYPE');
+      expect(domain.description).toBe('Message type: S, E, W, I, A');
+      expect(domain.dataType).toBe('CHAR');
+      expect(domain.length).toBe('000001');
+      expect(domain.fixedValues.length).toBe(5);
+      expect(domain.fixedValues[0]).toEqual({ low: 'S', high: '', description: 'Success' });
+      expect(domain.fixedValues[4]).toEqual({ low: 'A', high: '', description: 'Abort' });
+    });
+
+    it('handles minimal domain XML', () => {
+      const xml =
+        '<doma:domain adtcore:name="ZTEST" adtcore:description="Test" xmlns:doma="http://www.sap.com/dictionary/domain" xmlns:adtcore="http://www.sap.com/adt/core"/>';
+      const domain = parseDomainMetadata(xml);
+      expect(domain.name).toBe('ZTEST');
+      expect(domain.description).toBe('Test');
+      expect(domain.dataType).toBe('');
+      expect(domain.fixedValues).toEqual([]);
+    });
+  });
+
+  // ─── parseDataElementMetadata ─────────────────────────────────────
+
+  describe('parseDataElementMetadata', () => {
+    it('parses data element metadata from fixture', () => {
+      const xml = loadFixture('dataelement-metadata.xml');
+      const dtel = parseDataElementMetadata(xml);
+      expect(dtel.name).toBe('BUKRS');
+      expect(dtel.description).toBe('Company code');
+      expect(dtel.typeKind).toBe('domain');
+      expect(dtel.typeName).toBe('BUKRS');
+      expect(dtel.dataType).toBe('CHAR');
+      expect(dtel.length).toBe('000004');
+      expect(dtel.decimals).toBe('000000');
+      expect(dtel.shortLabel).toBe('CoCd');
+      expect(dtel.shortLength).toBe('06');
+      expect(dtel.mediumLabel).toBe('Company Code');
+      expect(dtel.mediumLength).toBe('15');
+      expect(dtel.longLabel).toBe('Company Code');
+      expect(dtel.longLength).toBe('15');
+      expect(dtel.headingLabel).toBe('CoCd');
+      expect(dtel.headingLength).toBe('04');
+      expect(dtel.searchHelp).toBe('C_T001');
+      expect(dtel.searchHelpParameter).toBe('BUKRS');
+      expect(dtel.setGetParameter).toBe('BUK');
+      expect(dtel.defaultComponentName).toBe('COMP_CODE');
+      expect(dtel.deactivateInputHistory).toBe(false);
+      expect(dtel.changeDocument).toBe(true);
+      expect(dtel.leftToRightDirection).toBe(false);
+      expect(dtel.deactivateBIDIFiltering).toBe(false);
+      expect(dtel.package).toBe('BF');
+    });
+
+    it('handles minimal data element XML', () => {
+      const xml =
+        '<blue:wbobj adtcore:name="ZTEST" adtcore:description="Test Element" xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel" xmlns:adtcore="http://www.sap.com/adt/core"/>';
+      const dtel = parseDataElementMetadata(xml);
+      expect(dtel.name).toBe('ZTEST');
+      expect(dtel.description).toBe('Test Element');
+      expect(dtel.typeKind).toBe('');
+      expect(dtel.typeName).toBe('');
+      expect(dtel.shortLength).toBe('');
+      expect(dtel.deactivateInputHistory).toBe(false);
+    });
+
+    it('parses a true deactivateInputHistory value', () => {
+      const xml =
+        '<blue:wbobj xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel"><dtel:dataElement xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements"><dtel:deactivateInputHistory>true</dtel:deactivateInputHistory></dtel:dataElement></blue:wbobj>';
+      expect(parseDataElementMetadata(xml).deactivateInputHistory).toBe(true);
+    });
+  });
+
+  // ─── parseAuthorizationField ─────────────────────────────────────
+
+  describe('parseAuthorizationField', () => {
+    it('parses authorization field metadata from real SAP fixture (fields under <auth:content>)', () => {
+      const xml = loadFixture('authorization-field.xml');
+      const auth = parseAuthorizationField(xml);
+      expect(auth.name).toBe('BUKRS');
+      expect(auth.description).toBe('Company Code');
+      expect(auth.roleName).toBe('BUKRS');
+      expect(auth.checkTable).toBe('T001');
+      expect(auth.domainName).toBe('BUKRS');
+      expect(auth.outputLength).toBe('000004');
+      expect(auth.package).toBe('BF');
+      expect(auth.orgLevelInfo).toEqual(['Field is not defined as Organizational level.']);
+      expect(auth.masterLanguage).toBe('DE');
+    });
+
+    it('handles minimal authorization field XML', () => {
+      const xml =
+        '<auth:auth xmlns:auth="http://www.sap.com/iam/auth" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:description="Test auth"/>';
+      const auth = parseAuthorizationField(xml);
+      expect(auth.name).toBe('');
+      expect(auth.description).toBe('Test auth');
+      expect(auth.roleName).toBe('');
+      expect(auth.orgLevelInfo).toEqual([]);
+      expect(auth.package).toBe('');
+    });
+  });
+
+  // ─── parseFeatureToggleStates ────────────────────────────────────
+
+  describe('parseFeatureToggleStates', () => {
+    it('parses feature toggle states from real SAP fixture (uppercase STATES wrapper)', () => {
+      const json = loadFixture('feature-toggle-states.json');
+      const toggle = parseFeatureToggleStates(json, 'SFW_SWITCH_TOGGLE');
+      expect(toggle.name).toBe('SFW_SWITCH_TOGGLE');
+      expect(toggle.clientState).toBe('off');
+      expect(toggle.userState).toBe('undefined');
+      expect(toggle.states).toHaveLength(2);
+      expect(toggle.states[0]).toEqual({ client: '000', state: 'off', description: 'SAP SE' });
+      expect(toggle.states[1]).toEqual({ client: '001', state: 'off', description: 'SAP SE' });
+      expect(toggle.userStates).toEqual([]);
+    });
+
+    it('normalizes unknown state values', () => {
+      const toggle = parseFeatureToggleStates(
+        '{"STATES":{"NAME":"Z","CLIENT_STATE":"","USER_STATE":"","CLIENT_STATES":[{"CLIENT":"100","STATE":"maybe"}],"USER_STATES":[]}}',
+        'Z',
+      );
+      expect(toggle.states[0]?.state).toBe('unknown');
+    });
+  });
+
+  // ─── parseEnhancementImplementation ──────────────────────────────
+
+  describe('parseEnhancementImplementation', () => {
+    it('parses enhancement implementation metadata from real SAP fixture', () => {
+      const xml = loadFixture('enhancement-implementation.xml');
+      const enho = parseEnhancementImplementation(xml);
+      expect(enho.name).toBe('SFW_BCF_TCD');
+      expect(enho.description).toBe('TCD Lookup, Assignment...');
+      expect(enho.package).toBe('SFWTOOLS');
+      expect(enho.technology).toBe('BADI_IMPL');
+      expect(enho.switchSupported).toBe(true);
+      expect(enho.badiImplementations).toHaveLength(2);
+      expect(enho.badiImplementations[0]).toEqual({
+        name: 'SFW_TCD',
+        shortText: 'Implementierung: BCF: BADI für TCD Remote Service',
+        implementingClass: 'CL_SFW_TCD',
+        badiDefinition: 'BCF_TCD_REMOTE_BADI',
+        enhancementSpot: 'BCF_REMOTE_TCD',
+        active: true,
+        default: false,
+      });
+      expect(enho.badiImplementations[1]?.default).toBe(true);
+      expect(enho.badiImplementations[1]?.active).toBe(false);
+    });
+
+    it('handles minimal enhancement implementation XML', () => {
+      const xml =
+        '<enho:objectData xmlns:enho="http://www.sap.com/adt/enhancements/enho" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZENHO" adtcore:description="Test"/>';
+      const enho = parseEnhancementImplementation(xml);
+      expect(enho.name).toBe('ZENHO');
+      expect(enho.description).toBe('Test');
+      expect(enho.package).toBe('');
+      expect(enho.technology).toBe('');
+      expect(enho.badiImplementations).toEqual([]);
+    });
+  });
+
+  // ─── parseTransactionMetadata ─────────────────────────────────────
+
+  describe('parseTransactionMetadata', () => {
+    it('parses transaction metadata from fixture', () => {
+      const xml = loadFixture('transaction-metadata.xml');
+      const tran = parseTransactionMetadata(xml);
+      expect(tran.code).toBe('SE38');
+      expect(tran.description).toBe('ABAP Editor');
+      expect(tran.program).toBe(''); // Program not in this endpoint
+      expect(tran.package).toBe('SEDT');
+    });
+
+    it('handles minimal transaction XML', () => {
+      const xml =
+        '<adtcore:mainObject adtcore:name="ZT01" adtcore:description="Custom Transaction" xmlns:adtcore="http://www.sap.com/adt/core"/>';
+      const tran = parseTransactionMetadata(xml);
+      expect(tran.code).toBe('ZT01');
+      expect(tran.description).toBe('Custom Transaction');
+      expect(tran.package).toBe('');
+    });
+  });
+
+  // ─── parseApiReleaseState ──────────────────────────────────────────
+
+  describe('parseApiReleaseState', () => {
+    it('parses released object from fixture', () => {
+      const xml = loadFixture('api-release-state.xml');
+      const state = parseApiReleaseState(xml);
+      expect(state.objectUri).toBe('/sap/bc/adt/oo/classes/cl_salv_table');
+      expect(state.objectType).toBe('CLAS/OC');
+      expect(state.objectName).toBe('CL_SALV_TABLE');
+      expect(state.isAnyContractReleased).toBe(true);
+      expect(state.isAnyAssignmentPossible).toBe(true);
+      expect(state.contracts).toHaveLength(1);
+      expect(state.contracts[0]!.contract).toBe('C1');
+      expect(state.contracts[0]!.state).toBe('RELEASED');
+      expect(state.contracts[0]!.stateDescription).toBe('Released');
+      expect(state.contracts[0]!.useInKeyUserApps).toBe(true);
+      expect(state.contracts[0]!.useInSAPCloudPlatform).toBe(true);
+    });
+
+    it('parses deprecated object with successor', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_gui_alv_grid" adtcore:type="CLAS/OC" adtcore:name="CL_GUI_ALV_GRID"/>
+  <apirelease:c1Release apirelease:contract="C1" apirelease:useInKeyUserApps="false" apirelease:useInSAPCloudPlatform="false">
+    <apirelease:status apirelease:state="DEPRECATED" apirelease:stateDescription="Deprecated — use successor"/>
+    <apirelease:successors>
+      <apirelease:successor adtcore:uri="/sap/bc/adt/oo/classes/cl_salv_table" adtcore:type="CLAS/OC" adtcore:name="CL_SALV_TABLE"/>
+    </apirelease:successors>
+  </apirelease:c1Release>
+  <apirelease:apiCatalogData apirelease:isAnyAssignmentPossible="false" apirelease:isAnyContractReleased="false"/>
+</apirelease:apiReleaseInfos>`;
+      const state = parseApiReleaseState(xml);
+      expect(state.objectName).toBe('CL_GUI_ALV_GRID');
+      expect(state.contracts[0]!.state).toBe('DEPRECATED');
+      expect(state.contracts[0]!.successors).toHaveLength(1);
+      expect(state.contracts[0]!.successors[0]!.name).toBe('CL_SALV_TABLE');
+      expect(state.isAnyContractReleased).toBe(false);
+    });
+
+    it('parses not-released object', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_internal_helper" adtcore:type="CLAS/OC" adtcore:name="CL_INTERNAL_HELPER"/>
+  <apirelease:apiCatalogData apirelease:isAnyAssignmentPossible="false" apirelease:isAnyContractReleased="false"/>
+</apirelease:apiReleaseInfos>`;
+      const state = parseApiReleaseState(xml);
+      expect(state.objectName).toBe('CL_INTERNAL_HELPER');
+      expect(state.contracts).toHaveLength(0);
+      expect(state.isAnyContractReleased).toBe(false);
+    });
+
+    it('parses object with multiple contracts', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_multi" adtcore:type="CLAS/OC" adtcore:name="CL_MULTI"/>
+  <apirelease:c0Release apirelease:contract="C0">
+    <apirelease:status apirelease:state="NOT_RELEASED" apirelease:stateDescription="Not Released"/>
+  </apirelease:c0Release>
+  <apirelease:c1Release apirelease:contract="C1" apirelease:useInKeyUserApps="true" apirelease:useInSAPCloudPlatform="true">
+    <apirelease:status apirelease:state="RELEASED" apirelease:stateDescription="Released"/>
+  </apirelease:c1Release>
+  <apirelease:c2Release apirelease:contract="C2" apirelease:useInKeyUserApps="false" apirelease:useInSAPCloudPlatform="true">
+    <apirelease:status apirelease:state="RELEASED" apirelease:stateDescription="Released"/>
+  </apirelease:c2Release>
+  <apirelease:apiCatalogData apirelease:isAnyAssignmentPossible="true" apirelease:isAnyContractReleased="true"/>
+</apirelease:apiReleaseInfos>`;
+      const state = parseApiReleaseState(xml);
+      expect(state.contracts).toHaveLength(3);
+      expect(state.contracts[0]!.contract).toBe('C0');
+      expect(state.contracts[0]!.state).toBe('NOT_RELEASED');
+      expect(state.contracts[1]!.contract).toBe('C1');
+      expect(state.contracts[1]!.state).toBe('RELEASED');
+      expect(state.contracts[2]!.contract).toBe('C2');
+      expect(state.contracts[2]!.state).toBe('RELEASED');
+      expect(state.contracts[2]!.useInSAPCloudPlatform).toBe(true);
+    });
+
+    it('handles minimal response with no contracts or catalog', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_minimal" adtcore:type="CLAS/OC" adtcore:name="CL_MINIMAL"/>
+</apirelease:apiReleaseInfos>`;
+      const state = parseApiReleaseState(xml);
+      expect(state.objectName).toBe('CL_MINIMAL');
+      expect(state.contracts).toHaveLength(0);
+      expect(state.isAnyContractReleased).toBe(false);
+      expect(state.isAnyAssignmentPossible).toBe(false);
+    });
+
+    it('parses deprecated with multiple successors', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_old" adtcore:type="CLAS/OC" adtcore:name="CL_OLD"/>
+  <apirelease:c1Release apirelease:contract="C1">
+    <apirelease:status apirelease:state="DEPRECATED" apirelease:stateDescription="Deprecated"/>
+    <apirelease:successors>
+      <apirelease:successor adtcore:uri="/sap/bc/adt/oo/classes/cl_new_a" adtcore:type="CLAS/OC" adtcore:name="CL_NEW_A"/>
+      <apirelease:successor adtcore:uri="/sap/bc/adt/oo/classes/cl_new_b" adtcore:type="CLAS/OC" adtcore:name="CL_NEW_B"/>
+    </apirelease:successors>
+  </apirelease:c1Release>
+  <apirelease:apiCatalogData apirelease:isAnyAssignmentPossible="false" apirelease:isAnyContractReleased="false"/>
+</apirelease:apiReleaseInfos>`;
+      const state = parseApiReleaseState(xml);
+      expect(state.contracts[0]!.successors).toHaveLength(2);
+      expect(state.contracts[0]!.successors[0]!.name).toBe('CL_NEW_A');
+      expect(state.contracts[0]!.successors[1]!.name).toBe('CL_NEW_B');
+    });
+  });
+
+  // ─── buildApiReleasePutBody (FEAT-02 write) ────────────────────────
+  // The PUT schema is far narrower than the GET response — the builder must KEEP the contract +
+  // status + successor scaffold + apiCatalogData/ApiCatalogs and DROP the response-only nodes
+  // (atom:link, stateTransitions, transportObject, authValueObject), or SAP 400s. Live-verified
+  // against this real unreleased-class fixture on a4h 758 + 816.
+  describe('buildApiReleasePutBody', () => {
+    const getXml = loadFixture('api-release-unreleased.xml');
+
+    it('builds a RELEASED C1 PUT body with visibility from the behaviour default', () => {
+      const body = buildApiReleasePutBody(getXml, 'C1', 'RELEASED');
+      expect(body).toContain('<ars:status ars:state="RELEASED"/>');
+      // The fixture's c1 behaviour default is SAP Cloud Platform → visibility must be set true.
+      expect(body).toContain('ars:useInSAPCloudPlatform="true"');
+      expect(body).toContain(
+        '<ars:apiCatalogData ars:isAnyAssignmentPossible="true" ars:isAnyContractReleased="true"><ars:ApiCatalogs/></ars:apiCatalogData>',
+      );
+      // Response-only nodes must NOT survive into the request (they 400 the PUT).
+      expect(body).not.toContain('atom:link');
+      expect(body).not.toContain('stateTransitions');
+      expect(body).not.toContain('transportObject');
+      expect(body).not.toContain('authValueObject');
+      // Exactly one contract block, correctly closed.
+      expect(body.match(/<ars:c1Release\b/g)).toHaveLength(1);
+      expect(body).toContain('</ars:c1Release>');
+    });
+
+    it('never invents visibility — with no default, both flags stay false and SAP decides', () => {
+      // Defensive: ARC-1 must not fabricate broader exposure, and must not pre-judge whether the
+      // contract even requires visibility (it varies — C0/C1 demand it, C4 has other rules). So with
+      // both defaults false it sends both false; SAP returns the contract-accurate error if needed.
+      const noDefaultVisibility = getXml.replace(
+        'ars:useInSAPCloudPlatformDefault="true"',
+        'ars:useInSAPCloudPlatformDefault="false"',
+      );
+      const body = buildApiReleasePutBody(noDefaultVisibility, 'C1', 'RELEASED');
+      expect(body).toContain('ars:useInSAPCloudPlatform="false"');
+      expect(body).toContain('ars:useInKeyUserApps="false"');
+      expect(body).not.toContain('ars:useInSAPCloudPlatform="true"');
+      expect(body).toContain('<ars:status ars:state="RELEASED"/>');
+    });
+
+    it('builds a NOT_RELEASED body (revoke) without forcing visibility', () => {
+      const body = buildApiReleasePutBody(getXml, 'C1', 'NOT_RELEASED');
+      expect(body).toContain('<ars:status ars:state="NOT_RELEASED"/>');
+      expect(body).not.toContain('stateTransitions');
+    });
+
+    it('targets a non-C1 contract the object supports (C4)', () => {
+      // The captured class fixture supports C1 + C4. The transform must build the c4Release block.
+      // Use NOT_RELEASED so the assertion is about contract routing, not per-contract visibility.
+      const body = buildApiReleasePutBody(getXml, 'C4', 'NOT_RELEASED');
+      expect(body).toContain('<ars:c4Release');
+      expect(body).toContain('<ars:status ars:state="NOT_RELEASED"/>');
+      expect(body).toContain('</ars:c4Release>');
+    });
+
+    it('lists the supported contracts when the requested one is unavailable (e.g. C0 on a class)', () => {
+      // The class fixture supports C1 + C4 only — C0 is not settable, so the error must name C1, C4.
+      expect(() => buildApiReleasePutBody(getXml, 'C0', 'RELEASED')).toThrow(
+        /contract C0 is not available.*supports: C1, C4/is,
+      );
+    });
+
+    it('throws when the requested contract is not settable on the object', () => {
+      // The fixture supports C1; C3 has no standalone settable block.
+      expect(() => buildApiReleasePutBody(getXml, 'C3', 'RELEASED')).toThrow(/contract C3 is not available/i);
+    });
+  });
+
+  // ─── findDeepNodes ─────────────────────────────────────────────────
+
+  describe('findDeepNodes', () => {
+    it('finds nested elements at any depth', () => {
+      const obj = { a: { b: { target: [{ val: 1 }, { val: 2 }] } } };
+      const result = findDeepNodes(obj, 'target');
+      expect(result).toHaveLength(2);
+    });
+
+    it('returns empty array for non-existent key', () => {
+      const result = findDeepNodes({ a: 1 }, 'missing');
+      expect(result).toEqual([]);
+    });
+
+    it('returns empty for null input', () => {
+      expect(findDeepNodes(null, 'key')).toEqual([]);
+    });
+
+    it('wraps single object in array', () => {
+      const obj = { wrapper: { target: { name: 'single' } } };
+      const result = findDeepNodes(obj, 'target');
+      expect(result).toHaveLength(1);
+      expect((result[0] as any).name).toBe('single');
+    });
+  });
+
+  // ─── parseServiceBinding ──────────────────────────────────────────
+
+  describe('parseServiceBinding', () => {
+    it('parses service binding XML from fixture', () => {
+      const xml = loadFixture('service-binding.xml');
+      const result = JSON.parse(parseServiceBinding(xml));
+      expect(result.name).toBe('/DMO/UI_TRAVEL_D_D_O4');
+      expect(result.description).toBe('Service Binding Travel Draft Scenario');
+      expect(result.type).toBe('SRVB/SVB');
+      expect(result.odataVersion).toBe('V4');
+      expect(result.bindingType).toBe('ODATA');
+      expect(result.bindingCategory).toBe('UI'); // category "0" = UI
+      expect(result.published).toBe(true);
+      expect(result.bindingCreated).toBe(true);
+      expect(result.contract).toBe('C1');
+      expect(result.serviceDefinition).toBe('/DMO/UI_TRAVEL_D_D');
+      expect(result.serviceName).toBe('/DMO/UI_TRAVEL_D_D');
+      expect(result.serviceVersion).toBe('0001');
+      expect(result.releaseState).toBe('NOT_RELEASED');
+      expect(result.package).toBe('/DMO/FLIGHT_DRAFT');
+      expect(result.implementation).toBe('/DMO/UI_TRAVEL_D_D_O4');
+    });
+
+    it('parses V2 service binding with Web API category', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<srvb:serviceBinding srvb:contract="C1" srvb:published="false" srvb:bindingCreated="true"
+    adtcore:name="ZAPI_TRAVEL" adtcore:type="SRVB/SVB" adtcore:description="Travel API"
+    adtcore:language="EN" xmlns:srvb="http://www.sap.com/adt/ddic/ServiceBindings"
+    xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="ZTRAVEL"/>
+  <srvb:services srvb:name="ZAPI_TRAVEL">
+    <srvb:content srvb:version="0001" srvb:releaseState="RELEASED">
+      <srvb:serviceDefinition adtcore:name="ZSD_TRAVEL"/>
+    </srvb:content>
+  </srvb:services>
+  <srvb:binding srvb:type="ODATA" srvb:version="V2" srvb:category="1">
+    <srvb:implementation adtcore:name="ZAPI_TRAVEL"/>
+  </srvb:binding>
+</srvb:serviceBinding>`;
+
+      const result = JSON.parse(parseServiceBinding(xml));
+      expect(result.name).toBe('ZAPI_TRAVEL');
+      expect(result.odataVersion).toBe('V2');
+      expect(result.bindingCategory).toBe('Web API'); // category "1" = Web API
+      expect(result.published).toBe(false);
+      expect(result.releaseState).toBe('RELEASED');
+    });
+
+    it('handles minimal service binding XML gracefully', () => {
+      const xml = `<?xml version="1.0"?><srvb:serviceBinding
+        xmlns:srvb="http://www.sap.com/adt/ddic/ServiceBindings"
+        xmlns:adtcore="http://www.sap.com/adt/core">
+        <srvb:binding/>
+      </srvb:serviceBinding>`;
+      const result = JSON.parse(parseServiceBinding(xml));
+      expect(result.name).toBe('');
+      expect(result.odataVersion).toBe('');
+    });
+  });
+
+  // ─── parseClassMetadata ─────────────────────────────────────────────
+
+  describe('parseClassMetadata', () => {
+    it('parses class metadata from fixture', () => {
+      const xml = loadFixture('class-metadata.xml');
+      const result = parseClassMetadata(xml);
+
+      expect(result.name).toBe('ZCL_EXAMPLE');
+      expect(result.description).toBe('Example test class');
+      expect(result.language).toBe('EN');
+      expect(result.abapLanguageVersion).toBe('standard');
+      expect(result.category).toBe('generalObjectType');
+      expect(result.fixPointArithmetic).toBe(true);
+      expect(result.package).toBe('$TMP');
+    });
+
+    it('handles missing optional fields', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<class:abapClass adtcore:name="ZCL_MINIMAL" adtcore:description="Minimal" adtcore:language="EN"
+    class:fixPointArithmetic="false"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="ZTEST"/>
+</class:abapClass>`;
+      const result = parseClassMetadata(xml);
+
+      expect(result.name).toBe('ZCL_MINIMAL');
+      expect(result.abapLanguageVersion).toBeUndefined();
+      expect(result.category).toBe('');
+      expect(result.fixPointArithmetic).toBe(false);
+    });
+
+    it('extracts package from nested packageRef', () => {
+      const xml = `<?xml version="1.0"?>
+<class:abapClass adtcore:name="ZCL_PKG" adtcore:description="Pkg test" adtcore:language="EN"
+    class:fixPointArithmetic="true"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="ZFLIGHT" adtcore:description="Flight demo"/>
+</class:abapClass>`;
+      const result = parseClassMetadata(xml);
+      expect(result.package).toBe('ZFLIGHT');
+    });
+
+    it('maps category codes to human-readable strings', () => {
+      const makeXml = (cat: string) => `<?xml version="1.0"?>
+<class:abapClass adtcore:name="ZCL_CAT" adtcore:description="Cat" adtcore:language="EN"
+    class:category="${cat}" class:fixPointArithmetic="true"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+</class:abapClass>`;
+
+      expect(parseClassMetadata(makeXml('00')).category).toBe('generalObjectType');
+      expect(parseClassMetadata(makeXml('01')).category).toBe('exceptionClass');
+      expect(parseClassMetadata(makeXml('40')).category).toBe('exitClass');
+      expect(parseClassMetadata(makeXml('41')).category).toBe('testclassAbapUnit');
+    });
+
+    it('passes through unknown category codes as-is', () => {
+      const xml = `<?xml version="1.0"?>
+<class:abapClass adtcore:name="ZCL_UNK" adtcore:description="Unknown" adtcore:language="EN"
+    class:category="99" class:fixPointArithmetic="true"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+</class:abapClass>`;
+      expect(parseClassMetadata(xml).category).toBe('99');
+    });
+
+    it('parses rootEntityRef from a behavior pool class fixture (live A4H capture)', () => {
+      // Captured from a4h.marianzeis.de via:
+      //   curl -H 'Accept: application/vnd.sap.adt.oo.classes.v4+xml' \
+      //        /sap/bc/adt/oo/classes/zbp_dm_project
+      // ZBP_DM_PROJECT is a RAP behavior pool for the BDEF ZR_DM_PROJECT.
+      const xml = loadFixture('class-metadata-behaviorpool.xml');
+      const result = parseClassMetadata(xml);
+
+      expect(result.name).toBe('ZBP_DM_PROJECT');
+      expect(result.category).toBe('behaviorPool');
+      expect(result.rootEntityRef).toBeDefined();
+      expect(result.rootEntityRef?.name).toBe('ZR_DM_PROJECT');
+      expect(result.rootEntityRef?.type).toBe('STOB/DO');
+      expect(result.rootEntityRef?.uri).toContain('/sap/bc/adt/ddic/ddl/sources/zr_dm_project');
+    });
+
+    it('omits rootEntityRef when XML lacks the element (regular class)', () => {
+      const xml = `<?xml version="1.0"?>
+<class:abapClass adtcore:name="ZCL_REGULAR" adtcore:description="Plain class" adtcore:language="EN"
+    class:fixPointArithmetic="true"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+</class:abapClass>`;
+      const result = parseClassMetadata(xml);
+      expect(result.rootEntityRef).toBeUndefined();
+    });
+
+    it('parses inline rootEntityRef when @_name is present (synthetic minimal)', () => {
+      const xml = `<?xml version="1.0"?>
+<class:abapClass adtcore:name="ZBP_MIN" adtcore:description="Min BP" adtcore:language="EN"
+    class:category="behaviorPool" class:fixPointArithmetic="true"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <class:rootEntityRef adtcore:uri="/sap/bc/adt/ddic/ddl/sources/zr_min/source/main#name=zr_min"
+                       adtcore:type="STOB/DO" adtcore:name="ZR_MIN"/>
+</class:abapClass>`;
+      const result = parseClassMetadata(xml);
+      expect(result.category).toBe('behaviorPool');
+      expect(result.rootEntityRef).toEqual({
+        name: 'ZR_MIN',
+        type: 'STOB/DO',
+        uri: '/sap/bc/adt/ddic/ddl/sources/zr_min/source/main#name=zr_min',
+      });
+    });
+
+    it('handles empty/minimal XML gracefully', () => {
+      const xml = `<?xml version="1.0"?>
+<class:abapClass xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core"/>`;
+      const result = parseClassMetadata(xml);
+      expect(result.name).toBe('');
+      expect(result.description).toBe('');
+      expect(result.language).toBe('');
+      expect(result.fixPointArithmetic).toBe(false);
+      expect(result.package).toBe('');
+    });
+  });
+
+  // ─── parseBspAppList ─────────────────────────────────────────────────
+
+  describe('parseBspAppList', () => {
+    it('parses app list from fixture', () => {
+      const xml = loadFixture('bsp-app-list.xml');
+      const apps = parseBspAppList(xml);
+      expect(apps).toHaveLength(3);
+      expect(apps[0]).toEqual({ name: 'ZAPP_BOOKING', description: 'Manage Bookings' });
+      expect(apps[1]).toEqual({ name: 'ZAPP_TRAVEL', description: 'Travel Management' });
+      expect(apps[2]).toEqual({ name: 'ZAPP_MONITOR', description: 'System Monitor' });
+    });
+
+    it('returns empty array for empty feed', () => {
+      const xml = `<?xml version="1.0"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:id>empty</atom:id>
+</atom:feed>`;
+      const apps = parseBspAppList(xml);
+      expect(apps).toEqual([]);
+    });
+
+    it('handles single entry (no array)', () => {
+      const xml = `<?xml version="1.0"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:title>ZSINGLE_APP</atom:title>
+    <atom:summary>Single app</atom:summary>
+  </atom:entry>
+</atom:feed>`;
+      const apps = parseBspAppList(xml);
+      expect(apps).toHaveLength(1);
+      expect(apps[0]).toEqual({ name: 'ZSINGLE_APP', description: 'Single app' });
+    });
+  });
+
+  // ─── parseBspFolderListing ───────────────────────────────────────────
+
+  describe('parseBspFolderListing', () => {
+    it('parses folder listing from fixture', () => {
+      const xml = loadFixture('bsp-folder-listing.xml');
+      const nodes = parseBspFolderListing(xml, 'ZAPP_BOOKING');
+      expect(nodes).toHaveLength(4);
+    });
+
+    it('detects files and folders', () => {
+      const xml = loadFixture('bsp-folder-listing.xml');
+      const nodes = parseBspFolderListing(xml, 'ZAPP_BOOKING');
+      const files = nodes.filter((n) => n.type === 'file');
+      const folders = nodes.filter((n) => n.type === 'folder');
+      expect(files).toHaveLength(2);
+      expect(folders).toHaveLength(2);
+    });
+
+    it('extracts etag for file entries', () => {
+      const xml = loadFixture('bsp-folder-listing.xml');
+      const nodes = parseBspFolderListing(xml, 'ZAPP_BOOKING');
+      const componentJs = nodes.find((n) => n.name === 'Component.js');
+      expect(componentJs).toBeDefined();
+      expect(componentJs!.etag).toBe('20230112203908');
+    });
+
+    it('omits etag for folder entries', () => {
+      const xml = loadFixture('bsp-folder-listing.xml');
+      const nodes = parseBspFolderListing(xml, 'ZAPP_BOOKING');
+      const i18n = nodes.find((n) => n.name === 'i18n');
+      expect(i18n).toBeDefined();
+      expect(i18n!.etag).toBeUndefined();
+    });
+
+    it('extracts relative path from title', () => {
+      const xml = loadFixture('bsp-folder-listing.xml');
+      const nodes = parseBspFolderListing(xml, 'ZAPP_BOOKING');
+      const componentJs = nodes.find((n) => n.name === 'Component.js');
+      expect(componentJs!.path).toBe('/Component.js');
+      const i18n = nodes.find((n) => n.name === 'i18n');
+      expect(i18n!.path).toBe('/i18n');
+    });
+
+    it('returns empty array for empty folder', () => {
+      const xml = `<?xml version="1.0"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:id>ZAPP_EMPTY</atom:id>
+</atom:feed>`;
+      const nodes = parseBspFolderListing(xml, 'ZAPP_EMPTY');
+      expect(nodes).toEqual([]);
+    });
+  });
+
+  // ─── parseSourceSearchResults ─────────────────────────────────────────
+
+  describe('parseSourceSearchResults', () => {
+    // Shape captured from a live on-premise system (SAP_BASIS 816). Object names
+    // and the highlighted term are anonymised; the structure is verbatim.
+    const liveTextSearchXml = `<?xml version="1.0" encoding="utf-8"?>
+<textsearch:textSearchResult numberOfResults="2" totalNumberOfResults="-1" queryTimeMillis="0" xmlns:textsearch="http://www.sap.com/adt/ris/textsearch">
+<textsearch:textSearchObjects>
+<textsearch:textSearchObject uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aCLASI%2cobjectName%3aZCL_DEMO%3d%3d%3d%3d%3d%3d%3d%3d%3dCCAU" parentUri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aCLASOC%2cobjectName%3aZCL_DEMO" isResult="false">
+<textsearch:adtMainObject adtcore:name="Test Classes" adtcore:type="CLAS/I" adtcore:description="Include" xmlns:adtcore="http://www.sap.com/adt/core"/>
+<textsearch:textLines>
+<textsearch:textLine uri="/sap/bc/adt/repository/proxyurimappings?id=sedi.include&amp;content=ZCL_DEMO%3d%3d%3d%3d%3d%3d%3d%3d%3dCCAU%23start%3d51%2c0%3bend%3d51%2c0">
+<textsearch:content>... &lt;b&gt;lv_flag&lt;/b&gt; = lv_ok ). &amp;amp;
+...</textsearch:content>
+</textsearch:textLine>
+<textsearch:textLine uri="/sap/bc/adt/repository/proxyurimappings?id=sedi.include&amp;content=ZCL_DEMO%3d%3d%3d%3d%3d%3d%3d%3d%3dCCAU%23start%3d150%2c0%3bend%3d150%2c0">
+<textsearch:content>... &lt;b&gt;lv_flag&lt;/b&gt; = abap_true....</textsearch:content>
+</textsearch:textLine>
+</textsearch:textLines>
+</textsearch:textSearchObject>
+<textsearch:textSearchObject uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aPROGP%2cobjectName%3aZDEMO_REPORT" parentUri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aDEVCK%2cobjectName%3a%24TMP" isResult="true">
+<textsearch:adtMainObject adtcore:name="ZDEMO_REPORT" adtcore:type="PROG/P" adtcore:description="Demo report" xmlns:adtcore="http://www.sap.com/adt/core"/>
+<textsearch:textLines>
+<textsearch:textLine uri="/sap/bc/adt/repository/proxyurimappings?id=sedi.program&amp;content=ZDEMO_REPORT%23start%3d7%2c0%3bend%3d7%2c0">
+<textsearch:content>... DATA(&lt;b&gt;lv_flag&lt;/b&gt;) = abap_false....</textsearch:content>
+</textsearch:textLine>
+</textsearch:textLines>
+</textsearch:textSearchObject>
+<textsearch:textSearchObject uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aCLASOC%2cobjectName%3aZCL_DEMO" parentUri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aDEVCK%2cobjectName%3a%24TMP" isResult="false">
+<textsearch:adtMainObject adtcore:name="ZCL_DEMO" adtcore:type="CLAS/OC" adtcore:description="Demo class" xmlns:adtcore="http://www.sap.com/adt/core"/>
+</textsearch:textSearchObject>
+<textsearch:textSearchObject uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aDEVCK%2cobjectName%3a%24TMP" isResult="false">
+<textsearch:adtMainObject adtcore:name="$TMP" adtcore:type="DEVC/K" adtcore:description="Local objects" xmlns:adtcore="http://www.sap.com/adt/core"/>
+</textsearch:textSearchObject>
+</textsearch:textSearchObjects>
+</textsearch:textSearchResult>`;
+
+    it('parses the live textsearch format, decoding object names and line numbers', () => {
+      const results = parseSourceSearchResults(liveTextSearchXml);
+
+      // The owning class and the $TMP package come back as textLine-less tree
+      // nodes and are dropped; only the two objects with hits survive.
+      expect(results).toHaveLength(2);
+
+      // The '=' padding of the class include is stripped, and the type comes
+      // from adtMainObject so the caller can still tell it is an include.
+      expect(results[0]?.objectName).toBe('ZCL_DEMO');
+      expect(results[0]?.objectType).toBe('CLAS/I');
+      expect(results[0]?.matches).toHaveLength(2);
+      expect(results[0]?.matches[0]).toEqual({ line: 51, snippet: '... lv_flag = lv_ok ). &amp; ...' });
+      expect(results[0]?.matches[1]?.line).toBe(150);
+
+      expect(results[1]?.objectName).toBe('ZDEMO_REPORT');
+      expect(results[1]?.objectType).toBe('PROG/P');
+      expect(results[1]?.matches[0]).toEqual({ line: 7, snippet: '... DATA(lv_flag) = abap_false....' });
+    });
+
+    it('names top-level hits after the object, not the package in parentUri', () => {
+      // Regression: preferring parentUri reported every top-level object as the
+      // name of its package, because parentUri is the tree parent — the owning
+      // class for an include, but the package for a top-level object.
+      const results = parseSourceSearchResults(liveTextSearchXml);
+      expect(results.map((r) => r.objectName)).not.toContain('$TMP');
+    });
+
+    it('decodes XML entities in the result uri', () => {
+      const results = parseSourceSearchResults(liveTextSearchXml);
+      expect(results[0]?.uri).toContain('&content=');
+      expect(results[0]?.uri).not.toContain('&amp;');
+    });
+
+    it('does not decode a literal entity into a proxy-URI parameter', () => {
+      const xml = liveTextSearchXml.replaceAll('&amp;content=', '&amp;amp;content=');
+      const result = parseSourceSearchResults(xml)[0];
+      expect(result?.uri).toContain('&amp;content=');
+      expect(result?.objectName).toBe('Test Classes'); // No actual content parameter: use adtMainObject.
+    });
+
+    it('reads the line number from the position: form used by non-source editors', () => {
+      // XSLT hits carry ",position:25" instead of a "#start=25,0" fragment.
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<textsearch:textSearchResult numberOfResults="1" totalNumberOfResults="-1" queryTimeMillis="0" xmlns:textsearch="http://www.sap.com/adt/ris/textsearch">
+<textsearch:textSearchObjects>
+<textsearch:textSearchObject uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aXSLTVT%2cobjectName%3aZDEMO_XSLT" isResult="true">
+<textsearch:adtMainObject adtcore:name="ZDEMO_XSLT" adtcore:type="XSLT/VT" xmlns:adtcore="http://www.sap.com/adt/core"/>
+<textsearch:textLines>
+<textsearch:textLine uri="/sap/bc/adt/repository/proxyurimappings?id=sris.objectType&amp;content=objectType%3aXSLTVT%2cobjectName%3aZDEMO_XSLT%2cposition%3a25">
+<textsearch:content>... &lt;tt:value ref="&lt;b&gt;LV_FLAG&lt;/b&gt;"/&gt; ...</textsearch:content>
+</textsearch:textLine>
+</textsearch:textLines>
+</textsearch:textSearchObject>
+</textsearch:textSearchObjects>
+</textsearch:textSearchResult>`;
+      const results = parseSourceSearchResults(xml);
+      expect(results[0]?.objectName).toBe('ZDEMO_XSLT');
+      expect(results[0]?.matches[0]?.line).toBe(25);
+    });
+
+    it('returns an empty array for an empty live textsearch result', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<textsearch:textSearchResult numberOfResults="0" totalNumberOfResults="0" queryTimeMillis="0" xmlns:textsearch="http://www.sap.com/adt/ris/textsearch">
+<textsearch:textSearchObjects/>
+</textsearch:textSearchResult>`;
+      expect(parseSourceSearchResults(xml)).toEqual([]);
+    });
+
+    it('extracts textSearchResult matches with line and snippet', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core" xmlns:txt="http://www.sap.com/adt/textsearch">
+  <adtcore:objectReference uri="/sap/bc/adt/programs/programs/ZTEST" type="PROG/P" name="ZTEST">
+    <txt:textSearchResult line="10" snippet="DATA lv_test TYPE string."/>
+    <txt:textSearchResult line="25" snippet="lv_test = 'hello'."/>
+  </adtcore:objectReference>
+</adtcore:objectReferences>`;
+      const results = parseSourceSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.objectName).toBe('ZTEST');
+      expect(results[0]?.matches).toHaveLength(2);
+      expect(results[0]?.matches[0]).toEqual({ line: 10, snippet: 'DATA lv_test TYPE string.' });
+      expect(results[0]?.matches[1]).toEqual({ line: 25, snippet: "lv_test = 'hello'." });
+    });
+
+    it('handles single textSearchResult child (still returns array)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core" xmlns:txt="http://www.sap.com/adt/textsearch">
+  <adtcore:objectReference uri="/sap/bc/adt/oo/classes/ZCL_TEST" type="CLAS/OC" name="ZCL_TEST">
+    <txt:textSearchResult line="42" snippet="METHOD do_something."/>
+  </adtcore:objectReference>
+</adtcore:objectReferences>`;
+      const results = parseSourceSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.matches).toHaveLength(1);
+      expect(results[0]?.matches[0]).toEqual({ line: 42, snippet: 'METHOD do_something.' });
+    });
+
+    it('returns empty matches for objectReference with no textSearchResult children', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference uri="/sap/bc/adt/programs/programs/ZTEST" type="PROG/P" name="ZTEST"/>
+</adtcore:objectReferences>`;
+      const results = parseSourceSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.objectName).toBe('ZTEST');
+      expect(results[0]?.matches).toEqual([]);
+    });
+
+    it('falls back to Atom feed format', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:id>/sap/bc/adt/programs/programs/ZTEST</atom:id>
+    <atom:title>ZTEST</atom:title>
+  </atom:entry>
+</atom:feed>`;
+      const results = parseSourceSearchResults(xml);
+      expect(results).toHaveLength(1);
+      expect(results[0]?.objectName).toBe('ZTEST');
+      expect(results[0]?.uri).toBe('/sap/bc/adt/programs/programs/ZTEST');
+      expect(results[0]?.matches).toEqual([]);
+    });
+  });
+
+  // ─── escapeXmlAttr ──────────────────────────────────────────────────
+
+  describe('parseInactiveObjects', () => {
+    it('parses inactive objects with description', () => {
+      const xml = loadFixture('inactive-objects.xml');
+      const objects = parseInactiveObjects(xml);
+      expect(objects).toHaveLength(3);
+      expect(objects[0]).toEqual({
+        name: 'ZCL_TEST',
+        type: 'CLAS/OC',
+        uri: '/sap/bc/adt/oo/classes/zcl_test',
+        description: 'Test class',
+      });
+      expect(objects[1]).toEqual({
+        name: 'ZTEST_DOMAIN',
+        type: 'DOMA/DD',
+        uri: '/sap/bc/adt/ddic/domains/ztest_domain',
+        description: 'Test domain',
+      });
+      // Third object has no description
+      expect(objects[2]).toEqual({
+        name: 'ZTEST_PROG',
+        type: 'PROG/P',
+        uri: '/sap/bc/adt/programs/programs/ztest_prog',
+      });
+      expect(objects[2]).not.toHaveProperty('description');
+    });
+
+    it('returns empty array for empty XML', () => {
+      expect(parseInactiveObjects('')).toEqual([]);
+      expect(parseInactiveObjects('  ')).toEqual([]);
+    });
+
+    it('parses rich ioc shape with user/deleted/transport metadata', () => {
+      const objects = parseInactiveObjects(loadFixture('inactive-objects-ioc.xml'));
+      expect(objects).toHaveLength(2);
+      expect(objects[0]).toEqual({
+        name: 'ZC_FbClubTP',
+        type: 'BDEF/BDO',
+        uri: '/sap/bc/adt/bo/behaviordefinitions/zc_fbclubtp',
+        user: 'MARIAN',
+        deleted: false,
+        transport: 'A4HK901087',
+        parentTransport: '/sap/bc/adt/cts/transportrequests/A4HK901086',
+      });
+      expect(objects[0]).not.toHaveProperty('description');
+      expect(objects[1]).toEqual({
+        name: 'ZARC1_TEST',
+        type: 'DDLS/DF',
+        uri: '/sap/bc/adt/ddic/ddl/sources/zarc1_test',
+        description: 'Test CDS',
+        user: 'MARIAN',
+        deleted: false,
+      });
+      expect(objects[1]).not.toHaveProperty('transport');
+      expect(objects[1]).not.toHaveProperty('parentTransport');
+    });
+
+    it('returns empty array when no objectReference nodes', () => {
+      const xml = '<?xml version="1.0"?><root><empty/></root>';
+      expect(parseInactiveObjects(xml)).toEqual([]);
+    });
+
+    it('parses real NW 7.50 flat <adtcore:objectReferences> shape (no <entry> wrapper)', () => {
+      // Captured live from npl.marianzeis.de — GET /activation/inactiveobjects on NW 7.50
+      // returns a flat list, NOT the feed-wrapped <ioc:entry><ioc:object> shape.
+      const objects = parseInactiveObjects(loadFixture('inactive-objects-nw750-flat.xml'));
+      expect(objects.length).toBeGreaterThanOrEqual(4);
+      expect(objects[0]).toEqual({
+        name: 'ZARC1_DTCV1_8BGO62',
+        type: 'DTEL/DE',
+        uri: '/sap/bc/adt/ddic/dataelements/zarc1_dtcv1_8bgo62',
+      });
+      // Verify a non-DTEL type to confirm the parser doesn't filter
+      const cls = objects.find((o) => o.type === 'CLAS/OC');
+      expect(cls?.name).toBe('ZCL_ARC1_TEST');
+    });
+
+    it('parses single flat objectReference (covers isArray=true)', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zonly" adtcore:type="PROG/P" adtcore:name="ZONLY"/></adtcore:objectReferences>`;
+      const objects = parseInactiveObjects(xml);
+      expect(objects).toHaveLength(1);
+      expect(objects[0]).toEqual({ name: 'ZONLY', type: 'PROG/P', uri: '/sap/bc/adt/programs/programs/zonly' });
+    });
+  });
+
+  describe('parseRevisionFeed', () => {
+    it('parses PROG revision feed with two entries', () => {
+      const result = parseRevisionFeed(loadFixture('revision-feed-prog.xml'));
+      expect(result.object).toEqual({ name: 'ZARC1_TEST_REPORT', type: 'REPS' });
+      expect(result.revisions).toHaveLength(2);
+      expect(result.revisions[0]?.id).toBe('00000');
+      expect(result.revisions[0]?.author).toBe('DEVELOPER');
+      expect(result.revisions[0]?.uri).toContain('/versions/20260410185851/00000/content');
+    });
+
+    it('maps optional transport from the legacy transports relation link', () => {
+      // Hand-written fixture using rel=".../relations/transports" with no adtcore:name — the
+      // shape ARC-1 originally assumed. Kept as the back-compat case; the live shape is below.
+      const result = parseRevisionFeed(loadFixture('revision-feed-prog.xml'));
+      expect(result.revisions[0]?.transport).toBe('A4HK900123');
+      expect(result.revisions[1]?.transport).toBeUndefined();
+    });
+
+    // Captured live from a4h (S/4HANA 2023, SAP_BASIS 758) on 2026-08-03. The real feed uses
+    // rel=".../relations/transport/request" and carries the id in adtcore:name — atom:title is
+    // the transport DESCRIPTION. Parsing the legacy rel alone yielded no transport at all.
+    it('maps the transport from the live transport/request link via adtcore:name', () => {
+      const result = parseRevisionFeed(loadFixture('versions-clas-a4h-758.xml'));
+      expect(result.object).toEqual({ name: 'ZCL_ARC1_DEMO_CALC', type: 'CLAS' });
+      expect(result.revisions.map((r) => [r.id, r.transport])).toEqual([
+        ['00002', 'A4HK906291'],
+        ['00000', undefined],
+        ['00001', 'A4HK906289'],
+      ]);
+    });
+
+    it('does not mistake the transport description for the transport id', () => {
+      const result = parseRevisionFeed(loadFixture('versions-clas-a4h-758.xml'));
+      expect(result.revisions[0]?.versionTitle).toBe('test review');
+      expect(result.revisions[0]?.transport).toBe('A4HK906291');
+    });
+
+    it('parses a live PROG feed', () => {
+      const result = parseRevisionFeed(loadFixture('versions-prog-a4h-758.xml'));
+      expect(result.object).toEqual({ name: 'ZARC1_DEMO_REPORT', type: 'REPS' });
+      expect(result.revisions[0]?.transport).toBe('A4HK906289');
+    });
+
+    it('parses an object whose only revision is the active work state', () => {
+      const result = parseRevisionFeed(loadFixture('versions-active-only-a4h-758.xml'));
+      expect(result.revisions).toHaveLength(1);
+      expect(result.revisions[0]?.id).toBe('00000');
+      expect(result.revisions[0]?.transport).toBeUndefined();
+    });
+
+    it('rejects an href tail that is not a CTS id (ADT emits .../transportrequests/reference?...)', () => {
+      const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transport/request" href="/sap/bc/adt/cts/transportrequests/reference?obj_name=Z"/></atom:entry></atom:feed>`;
+      // Returning 'reference' here would make every revision look like the same transport.
+      expect(parseRevisionFeed(xml).revisions[0]?.transport).toBeUndefined();
+    });
+
+    it('falls back to the link title when it carries a CTS id', () => {
+      const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transports" href="/sap/bc/adt/cts/ui" title="A4HK909999"/></atom:entry></atom:feed>`;
+      expect(parseRevisionFeed(xml).revisions[0]?.transport).toBe('A4HK909999');
+    });
+
+    it('survives a malformed percent escape instead of discarding the whole feed', () => {
+      const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transport/request" href="/sap/bc/adt/cts/transportrequests/A4H%K1"/></atom:entry></atom:feed>`;
+      const result = parseRevisionFeed(xml);
+      expect(result.revisions).toHaveLength(1);
+      expect(result.revisions[0]?.id).toBe('00001');
+    });
+
+    it('recovers the transport id from the href when adtcore:name is absent', () => {
+      const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transport/request" href="/sap/bc/adt/cts/transportrequests/A4HK909999"/></atom:entry></atom:feed>`;
+      expect(parseRevisionFeed(xml).revisions[0]?.transport).toBe('A4HK909999');
+    });
+
+    it('parses CLAS main include feed and keeps opaque version URI', () => {
+      const result = parseRevisionFeed(loadFixture('revision-feed-clas-main.xml'));
+      expect(result.object.name).toBe('ZCL_X');
+      expect(result.object.type).toBe('CINC');
+      expect(result.revisions).toHaveLength(1);
+      expect(result.revisions[0]?.uri).toContain('/oo/classes/ZCL_X/includes/main/versions/');
+    });
+
+    it('returns empty revisions for empty feed while keeping title metadata', () => {
+      const result = parseRevisionFeed(loadFixture('revision-feed-empty.xml'));
+      expect(result.object).toEqual({ name: 'FOO', type: 'REPS' });
+      expect(result.revisions).toEqual([]);
+    });
+
+    it('returns empty result for malformed XML', () => {
+      expect(parseRevisionFeed('<atom:feed><atom:title>broken')).toEqual({
+        object: { name: '', type: '' },
+        revisions: [],
+      });
+    });
+  });
+
+  describe('parseMessageClass', () => {
+    it('parses message class with messages', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<mc:messageClass xmlns:mc="http://www.sap.com/adt/MessageClass"
+                 xmlns:adtcore="http://www.sap.com/adt/core"
+                 adtcore:name="ZCM_TRAVEL" adtcore:type="MSAG/N"
+                 adtcore:description="Travel messages">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <mc:messages mc:msgno="001" mc:msgtext="Booking &amp;1 created" mc:selfexplainatory="true" mc:documented="false"/>
+  <mc:messages mc:msgno="002" mc:msgtext="Flight not found" mc:selfexplainatory="true" mc:documented="false"/>
+  <mc:messages mc:msgno="003" mc:msgtext="Error &amp;1 &amp;2" mc:selfexplainatory="true" mc:documented="false"/>
+</mc:messageClass>`;
+
+      const result = parseMessageClass(xml);
+      expect(result.name).toBe('ZCM_TRAVEL');
+      expect(result.description).toBe('Travel messages');
+      expect(result.package).toBe('$TMP');
+      expect(result.messages).toHaveLength(3);
+      expect(result.messages[0]).toEqual({ number: '001', shortText: 'Booking &1 created' });
+      expect(result.messages[1]).toEqual({ number: '002', shortText: 'Flight not found' });
+      expect(result.messages[2]).toEqual({ number: '003', shortText: 'Error &1 &2' });
+    });
+
+    it('parses empty message class', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<mc:messageClass xmlns:mc="http://www.sap.com/adt/MessageClass"
+                 xmlns:adtcore="http://www.sap.com/adt/core"
+                 adtcore:name="ZCM_EMPTY" adtcore:type="MSAG/N"
+                 adtcore:description="Empty MC">
+  <adtcore:packageRef adtcore:name="ZDEV"/>
+</mc:messageClass>`;
+
+      const result = parseMessageClass(xml);
+      expect(result.name).toBe('ZCM_EMPTY');
+      expect(result.description).toBe('Empty MC');
+      expect(result.package).toBe('ZDEV');
+      expect(result.messages).toEqual([]);
+    });
+
+    it('handles XML with special characters in message text', () => {
+      const xml = `<?xml version="1.0" encoding="utf-8"?>
+<mc:messageClass xmlns:mc="http://www.sap.com/adt/MessageClass"
+                 xmlns:adtcore="http://www.sap.com/adt/core"
+                 adtcore:name="ZTEST" adtcore:type="MSAG/N"
+                 adtcore:description="Test">
+  <adtcore:packageRef adtcore:name="$TMP"/>
+  <mc:messages mc:msgno="001" mc:msgtext="Value &amp;1 &lt; &amp;2" mc:selfexplainatory="true" mc:documented="false"/>
+</mc:messageClass>`;
+
+      const result = parseMessageClass(xml);
+      expect(result.messages[0]!.shortText).toBe('Value &1 < &2');
+    });
+  });
+
+  // ─── Entity-encoded free text ──────────────────────────────────────
+  //
+  // SAP escapes & < > " on the wire. These parsers used to return that wire text verbatim, so
+  // SAPRead showed "R&amp;D" — and a partial metadata update escaped it a second time.
+  describe('free text arrives decoded', () => {
+    const WIRE = 'R&amp;D &lt;Orders&gt; &quot;x&quot;';
+    const TEXT = 'R&D <Orders> "x"';
+    const ADTCORE = 'xmlns:adtcore="http://www.sap.com/adt/core"';
+    /** A recorded response with its root description swapped for entity-bearing wire text. */
+    const recorded = (name: string) =>
+      loadFixture(name).replace(/adtcore:description="[^"]*"/, `adtcore:description="${WIRE}"`);
+    const ref = `adtcore:uri="/u" adtcore:type="PROG/P" adtcore:name="Z" adtcore:description="${WIRE}"`;
+
+    it.each<[string, () => unknown]>([
+      ['domain', () => parseDomainMetadata(recorded('domain-metadata.xml')).description],
+      ['data element', () => parseDataElementMetadata(recorded('dataelement-metadata.xml')).description],
+      ['table type', () => parseTableType(recorded('tabletype-stringtab.xml')).description],
+      ['authorization field', () => parseAuthorizationField(recorded('authorization-field.xml')).description],
+      ['enhancement', () => parseEnhancementImplementation(recorded('enhancement-implementation.xml')).description],
+      ['transaction', () => parseTransactionMetadata(recorded('transaction-metadata.xml')).description],
+      ['service binding', () => JSON.parse(parseServiceBinding(recorded('service-binding.xml'))).description],
+      ['class', () => parseClassMetadata(recorded('class-metadata.xml')).description],
+      [
+        'message class',
+        () =>
+          parseMessageClass(
+            `<mc:messageClass xmlns:mc="http://www.sap.com/adt/MessageClass" ${ADTCORE} adtcore:description="${WIRE}"/>`,
+          ).description,
+      ],
+      [
+        'server-driven object',
+        () =>
+          parseServerDrivenMetadata(
+            `<blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue" ${ADTCORE} adtcore:description="${WIRE}"/>`,
+            'blueSource',
+          ).description,
+      ],
+      [
+        'inactive object (rich)',
+        () =>
+          parseInactiveObjects(
+            `<ioc:inactiveObjects xmlns:ioc="http://www.sap.com/abapxml/inactiveCtsObjects" ${ADTCORE}><ioc:entry><ioc:object><ioc:ref ${ref}/></ioc:object></ioc:entry></ioc:inactiveObjects>`,
+          )[0]?.description,
+      ],
+      [
+        'inactive object (flat)',
+        () =>
+          parseInactiveObjects(
+            `<adtcore:objectReferences ${ADTCORE}><adtcore:objectReference ${ref}/></adtcore:objectReferences>`,
+          )[0]?.description,
+      ],
+    ])('%s description', (_parser, description) => {
+      expect(description()).toBe(TEXT);
+    });
+
+    it('domain fixed values: low, high and text', () => {
+      const xml = loadFixture('domain-with-fixvalues.xml')
+        .replace('<doma:low>S</doma:low>', '<doma:low>&lt;</doma:low>')
+        .replace('<doma:high/>', '<doma:high>&gt;=</doma:high>')
+        .replace('<doma:text>Success</doma:text>', `<doma:text>${WIRE}</doma:text>`);
+      expect(parseDomainMetadata(xml).fixedValues[0]).toEqual({ low: '<', high: '>=', description: TEXT });
+    });
+
+    it('data element field labels', () => {
+      const xml = loadFixture('dataelement-metadata.xml').replace(
+        /(<dtel:(?:short|medium|long|heading)FieldLabel>)[^<]*/g,
+        '$1R&amp;D',
+      );
+      const dtel = parseDataElementMetadata(xml);
+      expect([dtel.shortLabel, dtel.mediumLabel, dtel.longLabel, dtel.headingLabel]).toEqual(Array(4).fill('R&D'));
+    });
+  });
+
+  describe('escapeXmlAttr', () => {
+    it('escapes & < > " and single quote', () => {
+      expect(escapeXmlAttr('a&b<c>d"e\'f')).toBe('a&amp;b&lt;c&gt;d&quot;e&apos;f');
+    });
+
+    it('does not re-process replacement text from the same escape pass', () => {
+      expect(escapeXmlAttr('&lt;already&gt; & raw')).toBe('&amp;lt;already&amp;gt; &amp; raw');
+    });
+
+    it('passes through normal strings unchanged', () => {
+      expect(escapeXmlAttr('/sap/bc/adt/oo/classes/ZCL_TEST')).toBe('/sap/bc/adt/oo/classes/ZCL_TEST');
+    });
+
+    it('handles empty string', () => {
+      expect(escapeXmlAttr('')).toBe('');
+    });
+  });
+});
+
+describe('parseNamedItems + parseAtcSystemCheckVariant (relocated / FEAT-68)', () => {
+  const VARIANTS = `<?xml version="1.0" encoding="utf-8"?><nameditem:namedItemList xmlns:nameditem="http://www.sap.com/adt/nameditem"><nameditem:totalItemCount>2</nameditem:totalItemCount><nameditem:namedItem><nameditem:name>ABAP_CLOUD_DEVELOPMENT_DEFAULT</nameditem:name><nameditem:description>Cloud &amp;amp; default</nameditem:description><nameditem:data/></nameditem:namedItem><nameditem:namedItem><nameditem:name>ZABAP_CLOUD_DEVELOPMENT</nameditem:name><nameditem:description/><nameditem:data/></nameditem:namedItem></nameditem:namedItemList>`;
+
+  it('parses a nameditem list into {name, description}', () => {
+    const items = parseNamedItems(VARIANTS);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ name: 'ABAP_CLOUD_DEVELOPMENT_DEFAULT', description: 'Cloud &amp; default' });
+    expect(items[1].name).toBe('ZABAP_CLOUD_DEVELOPMENT');
+    expect(items[1].description).toBe('');
+  });
+
+  it('returns [] for an empty nameditem list', () => {
+    expect(
+      parseNamedItems(
+        '<nameditem:namedItemList xmlns:nameditem="http://www.sap.com/adt/nameditem"><nameditem:totalItemCount>0</nameditem:totalItemCount></nameditem:namedItemList>',
+      ),
+    ).toEqual([]);
+  });
+
+  it('reads systemCheckVariant from <atc:customizing>', () => {
+    const xml =
+      '<atc:customizing xmlns:atc="http://www.sap.com/adt/atc"><properties><property name="ciCheckFlavour" value="true"/><property name="systemCheckVariant" value="ZABAP_CLOUD_DEVELOPMENT"/></properties></atc:customizing>';
+    expect(parseAtcSystemCheckVariant(xml)).toBe('ZABAP_CLOUD_DEVELOPMENT');
+  });
+
+  it('returns undefined when systemCheckVariant is absent', () => {
+    expect(
+      parseAtcSystemCheckVariant(
+        '<atc:customizing xmlns:atc="http://www.sap.com/adt/atc"><properties/></atc:customizing>',
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe('parseRevisionFeed — legacy attribute fallbacks', () => {
+  it('recovers a CTS id carried in the legacy @_version attribute', () => {
+    const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transports" href="/sap/bc/adt/cts/ui" version="A4HK909991"/></atom:entry></atom:feed>`;
+    expect(parseRevisionFeed(xml).revisions[0]?.transport).toBe('A4HK909991');
+  });
+
+  it('does not accept a description in @_version as a transport id', () => {
+    const xml = `<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"><atom:title>Version List of Z (REPS)</atom:title><atom:entry><atom:id>00001</atom:id><atom:content src="/sap/bc/adt/x/versions/1/00001/content"/><atom:link rel="http://www.sap.com/adt/relations/transports" href="/sap/bc/adt/cts/ui" version="some description"/></atom:entry></atom:feed>`;
+    expect(parseRevisionFeed(xml).revisions[0]?.transport).toBeUndefined();
+  });
+});

@@ -1,0 +1,61 @@
+---
+# Cloud Foundry deployment manifest for ARC-1 connecting to BTP ABAP Environment.
+#
+# This is for BTP ABAP connectivity through a per-user BTP Destination
+# with Authentication=OAuth2UserTokenExchange. No Cloud Connector or
+# Connectivity service is needed.
+#
+# Prerequisites:
+#   1. BTP ABAP Environment instance provisioned
+#   2. Service key created only to populate the destination OAuth settings
+#   3. Destination service instance: cf create-service destination lite arc1-destination
+#   4. XSUAA service instance: create it with the route-specific
+#      xs-security.landscape.json from docs_page/xsuaa-setup.md (not the raw template)
+#
+# Create a destination named ABAP_PP with:
+#   Type=HTTP, ProxyType=Internet, Authentication=OAuth2UserTokenExchange,
+#   URL=<service-key url>, tokenServiceURL=<service-key uaa.url>/oauth/token,
+#   clientId=<service-key uaa.clientid>, clientSecret=<service-key uaa.clientsecret>
+#
+# See docs_page/btp-abap-environment.md for full setup guide.
+# See docs_page/deployment-best-practices.md for architecture guidance.
+
+applications:
+  - name: arc1-btp-abap
+    docker:
+      image: ghcr.io/arc-mcp/arc-1:latest
+    instances: 1
+    memory: 256M
+    disk_quota: 512M
+    health-check-type: http
+    health-check-http-endpoint: /health
+    env:
+      # System type: BTP ABAP Environment
+      SAP_SYSTEM_TYPE: "btp"
+      # MCP transport
+      SAP_TRANSPORT: "http-streamable"
+      # XSUAA auth for MCP-native clients
+      SAP_XSUAA_AUTH: "true"
+      # Per-user BTP Destination for BTP ABAP Environment
+      SAP_BTP_DESTINATION: "ABAP_PP"
+      SAP_PP_ENABLED: "true"
+      SAP_PP_STRICT: "true"
+      # Authorization / safety defaults (adjust per use case)
+      SAP_ALLOW_WRITES: "true"
+      SAP_ALLOW_DATA_PREVIEW: "false"
+      SAP_ALLOW_FREE_SQL: "true"
+      SAP_BLOCKED_DATA_SOURCES: ""
+      SAP_ALLOW_TRANSPORT_WRITES: "true"
+      SAP_ALLOW_GIT_WRITES: "false"
+      # Experimental read-only UI. Keep disabled unless explicitly testing it.
+      ARC1_UI: "off"
+      # CORS — only set if a browser UI calls /mcp directly. Native MCP clients
+      # (Claude Desktop, Cursor, VS Code Copilot, Copilot Studio) don't need this.
+      # Comma-separated, exact match, no wildcards.
+      # ARC1_ALLOWED_ORIGINS: "https://your-ui.example.com"
+      # Logging
+      SAP_VERBOSE: "true"
+    services:
+      - arc1-xsuaa
+      - arc1-destination
+      # - arc1-auditlog    # Uncomment for BTP Audit Log

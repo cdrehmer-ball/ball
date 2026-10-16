@@ -1,0 +1,3000 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { DataSourcePolicyError } from '../../../src/adt/data-source-policy.js';
+import { AdtApiError, AdtSafetyError } from '../../../src/adt/errors.js';
+import { unrestrictedSafetyConfig } from '../../../src/adt/safety.js';
+import { mockResponse } from '../../helpers/mock-fetch.js';
+
+// Mock undici's fetch (used by AdtHttpClient.doFetch)
+const mockFetch = vi.fn();
+vi.mock('undici', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('undici')>();
+  return { ...actual, fetch: mockFetch };
+});
+
+const { AdtClient, clampSearchResults, toTextSearchObjectType } = await import('../../../src/adt/client.js');
+
+const fixturesDir = join(import.meta.dirname, '../../fixtures/xml');
+const loadFixture = (name: string) => readFileSync(join(fixturesDir, name), 'utf-8');
+
+/** Default mock: returns ABAP source code for any request */
+function setupDefaultMock() {
+  mockFetch.mockResolvedValue(mockResponse(200, "REPORT zhello.\nWRITE: / 'Hello'."));
+}
+
+function createClient(overrides: Record<string, unknown> = {}): InstanceType<typeof AdtClient> {
+  return new AdtClient({
+    baseUrl: 'http://sap:8000',
+    username: 'admin',
+    password: 'secret',
+    safety: unrestrictedSafetyConfig(),
+    ...overrides,
+  });
+}
+
+/** Get headers from a specific fetch call */
+function fetchHeaders(callIndex = 0): Record<string, string> {
+  return ((mockFetch.mock.calls[callIndex]?.[1] as RequestInit)?.headers as Record<string, string>) ?? {};
+}
+
+function objectSearchResponse(uri: string, type: string, name: string): Response {
+  return mockResponse(
+    200,
+    `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="${uri}" adtcore:type="${type}" adtcore:name="${name}" adtcore:packageName="SABAPDEMOS" adtcore:description="fixture"/>
+</adtcore:objectReferences>`,
+  );
+}
+
+function objectSearchResponses(entries: Array<{ uri: string; type: string; name: string }>): Response {
+  return mockResponse(
+    200,
+    `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  ${entries
+    .map(
+      ({ uri, type, name }) =>
+        `<adtcore:objectReference adtcore:uri="${uri}" adtcore:type="${type}" adtcore:name="${name}" adtcore:packageName="SABAPDEMOS" adtcore:description="fixture"/>`,
+    )
+    .join('\n  ')}
+</adtcore:objectReferences>`,
+  );
+}
+
+describe('AdtClient', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    setupDefaultMock();
+  });
+
+  describe('source code read operations', () => {
+    it('getProgram returns source code', async () => {
+      const client = createClient();
+      const result = await client.getProgram('ZHELLO');
+      expect(result.source).toContain('REPORT zhello');
+      expect(result.notModified).toBe(false);
+      expect(result.statusCode).toBe(200);
+    });
+
+    it('getProgram captures etag from response header', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'REPORT zhello.', { etag: '20231201001' }));
+      const client = createClient();
+      const result = await client.getProgram('ZHELLO');
+      expect(result.etag).toBe('20231201001');
+    });
+
+    it('getProgram returns notModified=true on 304', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(304, '', { etag: '20231201001' }));
+      const client = createClient();
+      const result = await client.getProgram('ZHELLO');
+      expect(result.notModified).toBe(true);
+      expect(result.source).toBe('');
+      expect(result.statusCode).toBe(304);
+    });
+
+    it('getProgram sends If-None-Match when opts.ifNoneMatch is set', async () => {
+      const client = createClient();
+      await client.getProgram('ZHELLO', { ifNoneMatch: 'abc123' });
+      expect(fetchHeaders(0)['If-None-Match']).toBe('abc123');
+    });
+
+    it('getProgram appends version query when opts.version is set', async () => {
+      const client = createClient();
+      await client.getProgram('ZHELLO', { version: 'inactive' });
+      const url = mockFetch.mock.calls[0]?.[0] as string;
+      expect(url).toContain('/sap/bc/adt/programs/programs/ZHELLO/source/main?version=inactive');
+    });
+
+    it('getClass returns source code', async () => {
+      const client = createClient();
+      const result = await client.getClass('ZCL_TEST');
+      expect(typeof result.source).toBe('string');
+      expect(result.notModified).toBe(false);
+      expect(result.statusCode).toBe(200);
+    });
+
+    it('getClass with include returns include source', async () => {
+      const client = createClient();
+      const result = await client.getClass('ZCL_TEST', 'testclasses');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getClass with include uses correct URL path (no /source/main suffix)', async () => {
+      const client = createClient();
+      await client.getClass('ZCL_TEST', 'definitions');
+      // Find the call that includes ZCL_TEST in the URL
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZCL_TEST'));
+      expect(urlUsed).toContain('/includes/definitions');
+      expect(urlUsed).not.toContain('/source/main');
+    });
+
+    it('getClass with include=main uses /source/main path', async () => {
+      const client = createClient();
+      await client.getClass('ZCL_TEST', 'main');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZCL_TEST'));
+      expect(urlUsed).toContain('/source/main');
+    });
+
+    it('getClass with non-main include forwards version option', async () => {
+      const client = createClient();
+      await client.getClass('ZCL_TEST', 'definitions', { version: 'inactive' });
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZCL_TEST'));
+      expect(urlUsed).toContain('/includes/definitions?version=inactive');
+    });
+
+    it('getClassInclude GETs the raw /includes/<inc> source with no === wrapper', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'CLASS ltcl_test IMPLEMENTATION.\nENDCLASS.'));
+      const client = createClient();
+      const result = await client.getClassInclude('ZCL_TEST', 'testclasses');
+      expect(result.source).toBe('CLASS ltcl_test IMPLEMENTATION.\nENDCLASS.');
+      expect(result.source).not.toContain('==='); // raw, unlike getClass(name, include)
+      const url = mockFetch.mock.calls[0]?.[0] as string;
+      expect(url).toContain('/sap/bc/adt/oo/classes/ZCL_TEST/includes/testclasses');
+    });
+
+    it('getClass with multiple comma-separated includes', async () => {
+      const client = createClient();
+      const result = await client.getClass('ZCL_TEST', 'definitions,implementations');
+      // Should make two HTTP calls for includes
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const classUrls = urls.filter((u) => u.includes('ZCL_TEST'));
+      expect(classUrls).toHaveLength(2);
+      expect(classUrls[0]).toContain('/includes/definitions');
+      expect(classUrls[1]).toContain('/includes/implementations');
+      // Result should contain both section headers
+      expect(result.source).toContain('=== definitions ===');
+      expect(result.source).toContain('=== implementations ===');
+    });
+
+    it('getClass gracefully handles 404 for non-existent includes', async () => {
+      // Override default mock for the first call to reject with 404
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(new AdtApiError('Not found', 404, '/includes/testclasses'));
+      const client = createClient();
+      const result = await client.getClass('ZCL_TEST', 'testclasses');
+      // Should not throw; should contain a helpful message
+      expect(result.source).toContain('testclasses');
+      expect(result.source).toContain('not available');
+    });
+
+    it('getClass validates include values', async () => {
+      const client = createClient();
+      const result = await client.getClass('ZCL_TEST', 'foobar');
+      expect(result.source).toContain('Unknown include');
+      expect(result.source).toContain('foobar');
+    });
+
+    it('getClass normalizes include to lowercase', async () => {
+      const client = createClient();
+      await client.getClass('ZCL_TEST', 'DEFINITIONS');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZCL_TEST'));
+      // Should use lowercase 'definitions' in the URL path
+      expect(urlUsed).toContain('/includes/definitions');
+    });
+
+    it('getInterface returns source code', async () => {
+      const client = createClient();
+      const result = await client.getInterface('ZIF_TEST');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getFunction returns source code', async () => {
+      const client = createClient();
+      const result = await client.getFunction('ZGROUP', 'ZFUNC');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getInclude returns source code', async () => {
+      const client = createClient();
+      const result = await client.getInclude('ZINCLUDE');
+      expect(typeof result.source).toBe('string');
+    });
+
+    describe('getFunctionGroupExpanded (recursive include walk)', () => {
+      // Mock the FUGR include graph: main → UXX → U01 (FUNCTION body lives in U01).
+      // A one-level walk would stop at UXX and miss the function module source.
+      const sourceFor = (url: string): string => {
+        if (url.includes('/functions/groups/') && url.includes('/source/main')) {
+          return 'FUNCTION-POOL zdemo.\nINCLUDE lzdemotop.\nINCLUDE lzdemouxx.\n* INCLUDE lzdemof00.  " commented — must be skipped';
+        }
+        if (url.includes('/includes/lzdemotop/')) return '* global data';
+        if (url.includes('/includes/lzdemouxx/')) return 'INCLUDE lzdemou01.';
+        if (url.includes('/includes/lzdemou01/')) return 'FUNCTION zdemo_fm.\n  WRITE / 1.\nENDFUNCTION.';
+        return '';
+      };
+
+      it('recurses into nested includes and captures the FUNCTION body', async () => {
+        mockFetch.mockImplementation((url: string) => Promise.resolve(mockResponse(200, sourceFor(url))));
+        const client = createClient();
+        const { blocks, truncated } = await client.getFunctionGroupExpanded('ZDEMO');
+
+        const names = blocks.map((b) => b.name);
+        expect(names[0]).toBe('FUGR ZDEMO (main)');
+        // UXX is referenced by main; U01 is referenced only by UXX → only reachable via recursion.
+        expect(names).toContain('lzdemouxx');
+        expect(names).toContain('lzdemou01');
+        const u01 = blocks.find((b) => b.name === 'lzdemou01');
+        expect(u01?.source).toContain('FUNCTION zdemo_fm');
+        // Commented INCLUDE line must be skipped.
+        expect(names).not.toContain('lzdemof00');
+        expect(truncated).toBe(false);
+      });
+
+      it('dedups repeated includes (cycle guard) — no duplicate blocks, no infinite loop', async () => {
+        // U01 INCLUDEs UXX back (cycle); UXX already seen → must not loop or duplicate.
+        mockFetch.mockImplementation((url: string) => {
+          let body = sourceFor(url);
+          if (url.includes('/includes/lzdemou01/')) body = 'FUNCTION zdemo_fm.\nENDFUNCTION.\nINCLUDE lzdemouxx.';
+          return Promise.resolve(mockResponse(200, body));
+        });
+        const client = createClient();
+        const { blocks } = await client.getFunctionGroupExpanded('ZDEMO');
+        const uxxCount = blocks.filter((b) => b.name === 'lzdemouxx').length;
+        expect(uxxCount).toBe(1);
+      });
+
+      it('inserts a placeholder when an include fails to read', async () => {
+        mockFetch.mockImplementation((url: string) => {
+          if (url.includes('/includes/lzdemou01/')) {
+            return Promise.reject(new AdtApiError('Not found', 404, '/includes/lzdemou01'));
+          }
+          return Promise.resolve(mockResponse(200, sourceFor(url)));
+        });
+        const client = createClient();
+        const { blocks } = await client.getFunctionGroupExpanded('ZDEMO');
+        const u01 = blocks.find((b) => b.name === 'lzdemou01');
+        expect(u01?.source).toContain('[Could not read include "lzdemou01"]');
+        expect(u01?.unreadable).toBe(true);
+      });
+
+      it('caps blocks and sets truncated=true on a huge include graph', async () => {
+        // Main source lists 100 distinct includes; each include is empty. The walk must
+        // stop at the MAX_BLOCKS cap (80) rather than fetch all 100, and flag truncated.
+        const manyIncludes = Array.from({ length: 100 }, (_, i) => `INCLUDE linc${String(i).padStart(3, '0')}.`).join(
+          '\n',
+        );
+        mockFetch.mockImplementation((url: string) => {
+          if (url.includes('/functions/groups/') && url.includes('/source/main')) {
+            return Promise.resolve(mockResponse(200, manyIncludes));
+          }
+          return Promise.resolve(mockResponse(200, ''));
+        });
+        const client = createClient();
+        const { blocks, truncated } = await client.getFunctionGroupExpanded('ZBIG');
+        expect(truncated).toBe(true);
+        expect(blocks.length).toBe(80); // main + 79 includes = MAX_BLOCKS
+      });
+    });
+
+    it('getDdls returns CDS source code', async () => {
+      const client = createClient();
+      const result = await client.getDdls('ZTRAVEL');
+      expect(typeof result.source).toBe('string');
+      expect(result.notModified).toBe(false);
+      expect(result.statusCode).toBe(200);
+    });
+
+    it('getDcl returns source code', async () => {
+      const client = createClient();
+      const result = await client.getDcl('ZI_TRAVEL_DCL');
+      expect(typeof result.source).toBe('string');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZI_TRAVEL_DCL'));
+      expect(urlUsed).toContain('/sap/bc/adt/acm/dcl/sources/ZI_TRAVEL_DCL/source/main');
+    });
+
+    it('getBdef returns behavior definition source', async () => {
+      const client = createClient();
+      const result = await client.getBdef('ZTRAVEL');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getSrvd returns service definition source', async () => {
+      const client = createClient();
+      const result = await client.getSrvd('ZTRAVEL');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getDdlx returns metadata extension source', async () => {
+      const client = createClient();
+      const result = await client.getDdlx('ZC_TRAVEL');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getDdlx uses correct ADT URL', async () => {
+      const client = createClient();
+      await client.getDdlx('ZC_TRAVEL');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ddlx'));
+      expect(urlUsed).toContain('/sap/bc/adt/ddic/ddlx/sources/ZC_TRAVEL/source/main');
+    });
+
+    it('getKtd returns the raw <sktd:docu> XML envelope (decoding to Markdown happens at the handler layer)', async () => {
+      const client = createClient();
+      const result = await client.getKtd('ZTR_C_PAYMENT_VALUE_DATE');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getKtd uses correct ADT URL with lowercase name and vendor Accept header', async () => {
+      const client = createClient();
+      await client.getKtd('ZTR_C_PAYMENT_VALUE_DATE');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('/documentation/ktd/'));
+      expect(urlUsed).toContain('/sap/bc/adt/documentation/ktd/documents/ztr_c_payment_value_date');
+      expect(urlUsed).not.toContain('version=workingArea');
+    });
+
+    it('getSrvb returns parsed service binding metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0" encoding="utf-8"?><srvb:serviceBinding srvb:contract="C1" srvb:published="true" srvb:bindingCreated="true" adtcore:name="ZUI_TRAVEL_O4" adtcore:type="SRVB/SVB" adtcore:description="Travel Service Binding" adtcore:language="EN" xmlns:srvb="http://www.sap.com/adt/ddic/ServiceBindings" xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:packageRef adtcore:name="ZTRAVEL"/><srvb:services srvb:name="ZUI_TRAVEL"><srvb:content srvb:version="0001" srvb:releaseState="NOT_RELEASED"><srvb:serviceDefinition adtcore:name="ZSD_TRAVEL"/></srvb:content></srvb:services><srvb:binding srvb:type="ODATA" srvb:version="V4" srvb:category="0"><srvb:implementation adtcore:name="ZUI_TRAVEL_O4"/></srvb:binding></srvb:serviceBinding>`,
+        ),
+      );
+      const client = createClient();
+      const result = await client.getSrvb('ZUI_TRAVEL_O4');
+      const parsed = JSON.parse(result.source);
+      expect(parsed.name).toBe('ZUI_TRAVEL_O4');
+      expect(parsed.odataVersion).toBe('V4');
+      expect(parsed.bindingCategory).toBe('UI');
+      expect(parsed.published).toBe(true);
+      expect(parsed.serviceDefinition).toBe('ZSD_TRAVEL');
+    });
+
+    it('getSrvb uses correct Accept header', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0"?><srvb:serviceBinding xmlns:srvb="http://www.sap.com/adt/ddic/ServiceBindings" xmlns:adtcore="http://www.sap.com/adt/core"><srvb:binding/></srvb:serviceBinding>`,
+        ),
+      );
+      const client = createClient();
+      await client.getSrvb('ZUI_TRAVEL_O4');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const callIdx = mockFetch.mock.calls.findIndex((_: any, i: number) => urls[i]?.includes('businessservices'));
+      expect(urls[callIdx]).toContain('/sap/bc/adt/businessservices/bindings/ZUI_TRAVEL_O4');
+      expect(fetchHeaders(callIdx).Accept).toContain('application/vnd.sap.adt.businessservices.servicebinding.v2+xml');
+    });
+
+    it('getTable returns table definition source', async () => {
+      const client = createClient();
+      const result = await client.getTable('MARA');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getView returns view definition source', async () => {
+      const client = createClient();
+      const result = await client.getView('ZVIEW');
+      expect(typeof result.source).toBe('string');
+    });
+  });
+
+  describe('getClassStructure (issue #303)', () => {
+    it('parses a4h (kernel 7.58) objectstructure response into ranges', async () => {
+      const xml = loadFixture('objectstructure-clas-a4h-758.xml');
+      mockFetch.mockResolvedValueOnce(mockResponse(200, xml));
+      const client = createClient();
+      const s = await client.getClassStructure('ZCL_ARC1_PROBE303');
+      expect(s.className).toBe('ZCL_ARC1_PROBE303');
+      expect(s.classDefinitionBlock).toEqual({ sr: 1, sc: 0, er: 10, ec: 8 });
+      expect(s.classImplementationBlock).toEqual({ sr: 12, sc: 0, er: 22, ec: 8 });
+      expect(s.methods.map((m) => m.name).sort()).toEqual(['GOODBYE', 'HELLO']);
+    });
+
+    it('merges the 7.50 split CLAS/OO + CLAS/OM shape by name', async () => {
+      const xml = loadFixture('objectstructure-clas-npl-750.xml');
+      mockFetch.mockResolvedValueOnce(mockResponse(200, xml));
+      const client = createClient();
+      const s = await client.getClassStructure('CL_ABAP_TYPEDESCR');
+      expect(s.methods.length).toBeGreaterThan(10);
+      const abs = s.methods.find((m) => m.abstract);
+      expect(abs?.implementation).toBeUndefined();
+    });
+
+    it('GETs /sap/bc/adt/oo/classes/{name}/objectstructure', async () => {
+      const xml = loadFixture('objectstructure-clas-a4h-758.xml');
+      mockFetch.mockResolvedValueOnce(mockResponse(200, xml));
+      const client = createClient();
+      await client.getClassStructure('ZCL_ARC1_PROBE303');
+      const url = mockFetch.mock.calls[0]?.[0] as string;
+      expect(url).toContain('/sap/bc/adt/oo/classes/ZCL_ARC1_PROBE303/objectstructure');
+    });
+
+    it('propagates AdtApiError when SAP returns 404', async () => {
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(
+          404,
+          '<?xml version="1.0"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><namespace id="com.sap.adt"/><type id="ExceptionResourceNotFound"/><message lang="EN">CLASS ZCL_MISSING does not exist</message></exc:exception>',
+        ),
+      );
+      const client = createClient();
+      await expect(client.getClassStructure('ZCL_MISSING')).rejects.toThrow(AdtApiError);
+    });
+  });
+
+  describe('getTabl (unified TABL — transparent tables and structures)', () => {
+    it('returns table source from /tables/ on first try (transparent table)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '@AbapCatalog.tableCategory : #TRANSPARENT\ndefine table t000 { ... }'),
+      );
+      const client = createClient();
+      const result = await client.getTabl('T000');
+      expect(result.source).toContain('TRANSPARENT');
+      expect(mockFetch.mock.calls).toHaveLength(1);
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/ddic/tables/T000/source/main');
+    });
+
+    it('falls back to /structures/ on 404 (DDIC structure)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>'));
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '@EndUserText.label : "Return Parameter"\ndefine type bapiret2 { type: char; ... }'),
+      );
+      const client = createClient();
+      const result = await client.getTabl('BAPIRET2');
+      expect(result.source).toContain('bapiret2');
+      expect(mockFetch.mock.calls).toHaveLength(2);
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/ddic/tables/BAPIRET2/source/main');
+      expect(mockFetch.mock.calls[1]?.[0]).toContain('/sap/bc/adt/ddic/structures/BAPIRET2/source/main');
+    });
+
+    it('throws AdtApiError when both URLs return 404', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>'));
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>'));
+      const client = createClient();
+      await expect(client.getTabl('NONEXISTENT')).rejects.toBeInstanceOf(AdtApiError);
+      expect(mockFetch.mock.calls).toHaveLength(2);
+    });
+
+    it('does not fall back on non-404 errors from /tables/', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(500, '<?xml version="1.0"?><error/>'));
+      const client = createClient();
+      await expect(client.getTabl('T000')).rejects.toBeInstanceOf(AdtApiError);
+      expect(mockFetch.mock.calls).toHaveLength(1);
+    });
+  });
+
+  describe('resolveTablObjectUrl', () => {
+    it('returns /tables/ URL after a 200 GET (transparent table)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><tabl/>'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrl('T000');
+      expect(url).toBe('/sap/bc/adt/ddic/tables/T000');
+      expect(mockFetch.mock.calls).toHaveLength(1);
+    });
+
+    it('returns /structures/ URL after /tables/ 404 (DDIC structure)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><stru/>'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrl('BAPIRET2');
+      expect(url).toBe('/sap/bc/adt/ddic/structures/BAPIRET2');
+      expect(mockFetch.mock.calls).toHaveLength(2);
+    });
+
+    it('caches resolution — second call hits no HTTP', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><tabl/>'));
+      const client = createClient();
+      const url1 = await client.resolveTablObjectUrl('T000');
+      const url2 = await client.resolveTablObjectUrl('T000');
+      expect(url1).toBe(url2);
+      expect(mockFetch.mock.calls).toHaveLength(1);
+    });
+
+    it('getTabl populates the resolveTablObjectUrl cache', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '... structure source ...'));
+      const client = createClient();
+      await client.getTabl('BAPIRET2');
+      expect(mockFetch.mock.calls).toHaveLength(2);
+      // Subsequent resolveTablObjectUrl call should be a cache hit (no extra HTTP).
+      const url = await client.resolveTablObjectUrl('BAPIRET2');
+      expect(url).toBe('/sap/bc/adt/ddic/structures/BAPIRET2');
+      expect(mockFetch.mock.calls).toHaveLength(2);
+    });
+  });
+
+  describe('resolveTablObjectUrlForWrite (issue #285)', () => {
+    const searchResponse = (uri: string, type: string, name: string) =>
+      mockResponse(
+        200,
+        `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="${uri}" adtcore:type="${type}" adtcore:name="${name}"/>
+</adtcore:objectReferences>`,
+      );
+
+    it('returns /tables/ URL when search reports TABL/DT and tables endpoint is available', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(searchResponse('/sap/bc/adt/ddic/tables/T000', 'TABL/DT', 'T000'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrlForWrite('T000', { tablesEndpointAvailable: true });
+      expect(url).toBe('/sap/bc/adt/ddic/tables/T000');
+    });
+
+    it('refuses TABL/DT writes when /sap/bc/adt/ddic/tables/ is unavailable (NW 7.50)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(
+        searchResponse('/sap/bc/adt/vit/wb/object_type/tabldt/object_name/T000', 'TABL/DT', 'T000'),
+      );
+      const client = createClient();
+      await expect(client.resolveTablObjectUrlForWrite('T000', { tablesEndpointAvailable: false })).rejects.toThrow(
+        /Transparent table writes via ADT REST are not available/,
+      );
+    });
+
+    it('returns /structures/ URL when search reports TABL/DS regardless of tables availability', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(searchResponse('/sap/bc/adt/ddic/structures/BAPIRET2', 'TABL/DS', 'BAPIRET2'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrlForWrite('BAPIRET2', { tablesEndpointAvailable: false });
+      expect(url).toBe('/sap/bc/adt/ddic/structures/BAPIRET2');
+    });
+
+    it('SE11 hint mentions NW 7.50/7.51 + the table editor landing in 7.52', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(
+        searchResponse('/sap/bc/adt/vit/wb/object_type/tabldt/object_name/SCARR', 'TABL/DT', 'SCARR'),
+      );
+      const client = createClient();
+      try {
+        await client.resolveTablObjectUrlForWrite('SCARR', { tablesEndpointAvailable: false });
+        throw new Error('expected refusal');
+      } catch (err) {
+        expect(err).toBeInstanceOf(Error);
+        const message = (err as Error).message;
+        expect(message).toContain('NW 7.50/7.51');
+        expect(message).toContain('NW 7.52');
+        expect(message).toContain('SE11');
+        expect(message).toContain('SCARR');
+        expect(message).toContain('TABCLASS');
+      }
+    });
+
+    it('falls through to the read-path resolver when search returns no match', async () => {
+      mockFetch.mockReset();
+      // search returns empty
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(
+          200,
+          '<?xml version="1.0" encoding="utf-8"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>',
+        ),
+      );
+      // read-path resolver probe (succeeds with /tables/)
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><tabl/>'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrlForWrite('ZNEW_TABLE', { tablesEndpointAvailable: true });
+      expect(url).toBe('/sap/bc/adt/ddic/tables/ZNEW_TABLE');
+    });
+
+    it('treats search failure as fall-through where /tables/ exists (search auth must not block writes there)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(new Error('network'));
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><tabl/>'));
+      const client = createClient();
+      const url = await client.resolveTablObjectUrlForWrite('ZNEW_TABLE', { tablesEndpointAvailable: true });
+      expect(url).toBe('/sap/bc/adt/ddic/tables/ZNEW_TABLE');
+    });
+
+    it('re-probes instead of trusting a cached read route when the search finds nothing', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '<?xml version="1.0"?><error/>')); // read: /tables/ source
+      mockFetch.mockResolvedValueOnce(mockResponse(200, 'define structure zswap {}')); // read: /structures/ source
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>'),
+      ); // write: search finds nothing
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<?xml version="1.0"?><tabl/>')); // write: fresh /tables/ probe
+      const client = createClient();
+      await client.getTabl('ZSWAP'); // caches /structures/ZSWAP for reads; SAP then recreates it as a table
+      const url = await client.resolveTablObjectUrlForWrite('ZSWAP', { tablesEndpointAvailable: true });
+      expect(url).toBe('/sap/bc/adt/ddic/tables/ZSWAP');
+    });
+
+    it('reads the subtype from the TABL hit, not from a same-named program listed first', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(
+          200,
+          `<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zswap" adtcore:type="PROG/P" adtcore:name="ZSWAP"/>
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/structures/zswap" adtcore:type="TABL/DS" adtcore:name="ZSWAP"/>
+</adtcore:objectReferences>`,
+        ),
+      );
+      const url = await createClient().resolveTablObjectUrlForWrite('ZSWAP', { tablesEndpointAvailable: false });
+      expect(url).toBe('/sap/bc/adt/ddic/structures/ZSWAP');
+    });
+
+    it('keeps the /structures/ fallback where discovery shows /tables/ (a 404 there means structure)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(new Error('network')); // search fails
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '')); // /tables/ probe
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '<tabl/>')); // /structures/ probe
+      const url = await createClient().resolveTablObjectUrlForWrite('ZSWAP', { tablesEndpointAvailable: true });
+      expect(url).toBe('/sap/bc/adt/ddic/structures/ZSWAP');
+    });
+
+    it('reports a missing object on 7.50 as 404, not as an unknown subtype', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(
+        mockResponse(200, '<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>'),
+      );
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '')); // /tables/ (endpoint absent)
+      mockFetch.mockResolvedValueOnce(mockResponse(404, '')); // /structures/
+      await expect(
+        createClient().resolveTablObjectUrlForWrite('ZGONE', { tablesEndpointAvailable: false }),
+      ).rejects.toMatchObject({ statusCode: 404 });
+    });
+  });
+
+  describe('getRevisions', () => {
+    it('returns parsed revision list for a program', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('revision-feed-prog.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const result = await client.getRevisions('PROG', 'ZARC1_TEST_REPORT');
+      expect(result.object.name).toBe('ZARC1_TEST_REPORT');
+      expect(result.revisions).toHaveLength(2);
+      expect(result.revisions[0]?.uri.startsWith('/sap/bc/adt/')).toBe(true);
+    });
+
+    it('uses CLAS include endpoint for explicit include', async () => {
+      const client = createClient();
+      await client.getRevisions('CLAS', 'ZCL_TEST', { include: 'definitions' });
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/oo/classes/ZCL_TEST/includes/definitions/versions'))).toBe(true);
+    });
+
+    it('defaults CLAS include to main when omitted', async () => {
+      const client = createClient();
+      await client.getRevisions('CLAS', 'ZCL_TEST');
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/oo/classes/ZCL_TEST/includes/main/versions'))).toBe(true);
+    });
+
+    it('uses source/main revisions endpoint for INTF', async () => {
+      const client = createClient();
+      await client.getRevisions('INTF', 'ZIF_TEST');
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/oo/interfaces/ZIF_TEST/source/main/versions'))).toBe(true);
+    });
+
+    // DDLS/DCLS hang the feed off the object, not off /source/main — live-probed on a4h (758),
+    // where the /source/main/versions form 404s for both. Their DDIC sibling SRVD does NOT.
+    it('uses the object-level revisions endpoint for DDLS', async () => {
+      const client = createClient();
+      await client.getRevisions('DDLS', 'Z_VIEW');
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/ddic/ddl/sources/Z_VIEW/versions?'))).toBe(true);
+    });
+
+    it('uses the object-level revisions endpoint for DCLS', async () => {
+      const client = createClient();
+      await client.getRevisions('DCLS', 'Z_ACCESS');
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/acm/dcl/sources/Z_ACCESS/versions?'))).toBe(true);
+    });
+
+    it('keeps the source/main revisions endpoint for SRVD and BDEF', async () => {
+      const client = createClient();
+      await client.getRevisions('SRVD', 'Z_SRVD');
+      await client.getRevisions('BDEF', 'Z_BDEF');
+      const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
+      expect(urls.some((u) => u.includes('/ddic/srvd/sources/Z_SRVD/source/main/versions'))).toBe(true);
+      expect(urls.some((u) => u.includes('/bo/behaviordefinitions/Z_BDEF/source/main/versions'))).toBe(true);
+    });
+
+    it('throws descriptive error for FUNC revisions without group', async () => {
+      const client = createClient();
+      await expect(client.getRevisions('FUNC', 'Z_MY_FUNC')).rejects.toThrow(/Function group is required/i);
+    });
+
+    it('throws for unsupported type and includes type name', async () => {
+      const client = createClient();
+      await expect(client.getRevisions('TRAN', 'SE38')).rejects.toThrow(/Unsupported object type "TRAN"/);
+    });
+  });
+
+  describe('getRevisionSource', () => {
+    it('rejects non-ADT URIs', async () => {
+      const client = createClient();
+      await expect(client.getRevisionSource('https://evil.example/foo')).rejects.toThrow(/\/sap\/bc\/adt\//);
+    });
+
+    it.each([
+      '/sap/bc/adt/../../../sap/opu/odata/sap/ZSECRET',
+      '/sap/bc/adt/%2e%2e/%2e%2e/sap/opu/odata/sap/ZSECRET',
+      '/sap/bc/adt/%252e%252e/%252e%252e/sap/opu/odata/sap/ZSECRET',
+      '/sap/bc/adt/programs/%2f..%2fadmin',
+      '/sap/bc/adt/programs/%5c..%5cadmin',
+      '/sap/bc/adt\\..\\sap\\opu\\odata',
+      '/sap/bc/adt/programs/source#fragment',
+      '/sap/bc/adt/programs/source\u0000suffix',
+    ])('rejects unsafe revision URI %j before HTTP dispatch', async (versionUri) => {
+      mockFetch.mockClear();
+      const client = createClient();
+      await expect(client.getRevisionSource(versionUri)).rejects.toThrow(/canonical host-relative ADT path/i);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('returns plain source text for valid revision URI', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, "REPORT zarc1_test_report.\nWRITE: / 'hello'.", { 'x-csrf-token': 'T' }),
+      );
+      const client = createClient();
+      const source = await client.getRevisionSource(
+        '/sap/bc/adt/programs/programs/ZARC1_TEST_REPORT/source/main/versions/20260410185851/00000/content',
+      );
+      expect(source).toContain('REPORT zarc1_test_report');
+      const calledUrl = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(calledUrl).toContain('/versions/20260410185851/00000/content');
+      expect(fetchHeaders(0).Accept).toBe('text/plain');
+    });
+
+    it('rejects unrelated same-host ADT endpoints before HTTP dispatch', async () => {
+      mockFetch.mockClear();
+      const client = createClient();
+      await expect(client.getRevisionSource('/sap/bc/adt/runtime/dumps')).rejects.toThrow(/VERSIONS response/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('accepts an encoded namespace in a revision object segment', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'CLASS /arc/cl_demo DEFINITION.'));
+      const client = createClient();
+      const path = '/sap/bc/adt/oo/classes/%2FARC%2FCL_DEMO/includes/main/versions/1/00000/content';
+      await expect(client.getRevisionSource(path)).resolves.toContain('/arc/cl_demo');
+      expect(String(mockFetch.mock.calls[0]?.[0] ?? '')).toContain('%2FARC%2FCL_DEMO');
+    });
+
+    it.each([
+      '/sap/bc/adt/oo/classes/%252FARC%252FCL_DEMO/includes/main/versions/1/00000/content',
+      '/sap/bc/adt/oo/classes/ZCL_DEMO/includes/main/versions/1%2F00000%2Fcontent',
+    ])('rejects ambiguous encoded separators in revision source path %s', async (path) => {
+      mockFetch.mockClear();
+      const client = createClient();
+      await expect(client.getRevisionSource(path)).rejects.toThrow(/VERSIONS response/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('system information', () => {
+    it('getSystemInfo returns structured JSON with user', async () => {
+      const client = createClient();
+      const info = await client.getSystemInfo();
+      expect(typeof info).toBe('string');
+      const parsed = JSON.parse(info);
+      expect(parsed.user).toBe('admin');
+      expect(Array.isArray(parsed.collections)).toBe(true);
+    });
+
+    it('getEffectiveUser returns the configured SAP_USER when set', async () => {
+      const client = createClient();
+      expect(await client.getEffectiveUser()).toBe('admin');
+    });
+
+    it('getEffectiveUser derives the user from the bearer JWT user_name when no SAP_USER (BTP, G-5)', async () => {
+      // BTP bearer auth has no SAP_USER — the ABAP user rides in the JWT user_name claim.
+      const payload = Buffer.from(JSON.stringify({ user_name: 'marian@zeis.de' })).toString('base64url');
+      const jwt = `h.${payload}.sig`;
+      const client = createClient({ username: '', bearerTokenProvider: async () => jwt });
+      expect(await client.getEffectiveUser()).toBe('marian@zeis.de');
+      const parsed = JSON.parse(await client.getSystemInfo());
+      expect(parsed.user).toBe('marian@zeis.de');
+    });
+
+    it('getEffectiveUser falls back to empty (not a crash) on an unparseable bearer token', async () => {
+      const client = createClient({ username: '', bearerTokenProvider: async () => 'not-a-jwt' });
+      expect(await client.getEffectiveUser()).toBe('');
+    });
+
+    it('getEffectiveUser retries after a transient token-provider failure (does not memoize empty)', async () => {
+      // A transient provider error must not pin the user to '' forever — a later call still resolves (Codex #3).
+      const payload = Buffer.from(JSON.stringify({ user_name: 'marian@zeis.de' })).toString('base64url');
+      let calls = 0;
+      const client = createClient({
+        username: '',
+        bearerTokenProvider: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error('transient token failure');
+          return `h.${payload}.sig`;
+        },
+      });
+      expect(await client.getEffectiveUser()).toBe(''); // 1st call: provider throws → empty, NOT memoized
+      expect(await client.getEffectiveUser()).toBe('marian@zeis.de'); // retry resolves
+    });
+
+    it('getMessages returns message class XML', async () => {
+      const client = createClient();
+      const messages = await client.getMessages('SY');
+      expect(typeof messages).toBe('string');
+    });
+
+    it('getTextElements returns text elements XML', async () => {
+      const client = createClient();
+      const texts = await client.getTextElements('ZHELLO');
+      expect(typeof texts).toBe('string');
+    });
+
+    it('getVariants returns variants XML', async () => {
+      const client = createClient();
+      const variants = await client.getVariants('ZHELLO');
+      expect(typeof variants).toBe('string');
+    });
+  });
+
+  describe('text elements (text pool)', () => {
+    const SYMBOLS_CT = 'application/vnd.sap.adt.textelements.symbols.v1';
+    const SELECTIONS_CT = 'application/vnd.sap.adt.textelements.selections.v1';
+    const LOCK_BODY =
+      '<asx:abap xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><LOCK_HANDLE>H9</LOCK_HANDLE><CORRNR></CORRNR><IS_LOCAL>X</IS_LOCAL><MODIFICATION_SUPPORT>X</MODIFICATION_SUPPORT></DATA></asx:values></asx:abap>';
+
+    it('getClassTextSymbols hits the textelements service with the symbols media type', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '@MaxLength:10\r\n001=Hello'));
+      const client = createClient();
+      const body = await client.getClassTextSymbols('ZCL_FOO');
+      expect(body).toBe('@MaxLength:10\r\n001=Hello');
+      expect(String(mockFetch.mock.calls[0]?.[0])).toContain('/sap/bc/adt/textelements/classes/ZCL_FOO/source/symbols');
+      expect(fetchHeaders(0).Accept).toBe(SYMBOLS_CT);
+    });
+
+    it('writeClassTextSymbols locks, PUTs with Content-Type AND Accept, then unlocks', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+        const u = String(url);
+        const m = (init?.method ?? 'GET').toUpperCase();
+        if (u.includes('_action=LOCK')) return Promise.resolve(mockResponse(200, LOCK_BODY));
+        if (u.includes('_action=UNLOCK')) return Promise.resolve(mockResponse(200, ''));
+        if (m === 'PUT') return Promise.resolve(mockResponse(200, '@MaxLength:10\r\n001=Hi'));
+        return Promise.resolve(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient();
+      await client.writeClassTextSymbols('ZCL_FOO', '@MaxLength:10\n001=Hi\n');
+      const calls = mockFetch.mock.calls as [string, RequestInit][];
+      const put = calls.find(([, i]) => (i?.method ?? 'GET').toUpperCase() === 'PUT');
+      expect(put).toBeDefined();
+      expect(String(put?.[0])).toContain('/sap/bc/adt/textelements/classes/ZCL_FOO/source/symbols');
+      expect(String(put?.[0])).toContain('lockHandle=H9');
+      const ph = put?.[1]?.headers as Record<string, string>;
+      expect(ph['Content-Type']).toBe(SYMBOLS_CT);
+      expect(ph.Accept).toBe(SYMBOLS_CT);
+      expect(calls.some(([u]) => String(u).includes('_action=LOCK'))).toBe(true);
+      expect(calls.some(([u]) => String(u).includes('_action=UNLOCK'))).toBe(true);
+    });
+
+    it('writeClassTextSymbols still unlocks when the PUT is rejected (406 malformed pool)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+        const u = String(url);
+        const m = (init?.method ?? 'GET').toUpperCase();
+        if (u.includes('_action=LOCK')) return Promise.resolve(mockResponse(200, LOCK_BODY));
+        if (u.includes('_action=UNLOCK')) return Promise.resolve(mockResponse(200, ''));
+        if (m === 'PUT')
+          return Promise.resolve(
+            mockResponse(406, '<exc:exception><message>Text elements contain errors</message></exc:exception>'),
+          );
+        return Promise.resolve(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient();
+      await expect(client.writeClassTextSymbols('ZCL_FOO', 'bad')).rejects.toBeInstanceOf(AdtApiError);
+      const calls = mockFetch.mock.calls as [string, RequestInit][];
+      expect(calls.some(([u]) => String(u).includes('_action=UNLOCK'))).toBe(true);
+    });
+
+    it("writeTextElementPart PUTs a program's selection texts with the selections media type", async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string, init?: RequestInit) => {
+        const u = String(url);
+        const m = (init?.method ?? 'GET').toUpperCase();
+        if (u.includes('_action=LOCK')) return Promise.resolve(mockResponse(200, LOCK_BODY));
+        if (u.includes('_action=UNLOCK')) return Promise.resolve(mockResponse(200, ''));
+        if (m === 'PUT') return Promise.resolve(mockResponse(200, ''));
+        return Promise.resolve(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient();
+      await client.writeTextElementPart('PROG', 'ZHU_CREATE', 'selections', 'P_LGNUM=Warehouse\n', 'EWDK900524');
+      const calls = mockFetch.mock.calls as [string, RequestInit][];
+      const put = calls.find(([, i]) => (i?.method ?? 'GET').toUpperCase() === 'PUT');
+      expect(String(put?.[0])).toContain('/sap/bc/adt/textelements/programs/ZHU_CREATE/source/selections');
+      expect(String(put?.[0])).toContain('corrNr=EWDK900524');
+      const ph = put?.[1]?.headers as Record<string, string>;
+      expect(ph['Content-Type']).toBe(SELECTIONS_CT);
+      expect(ph.Accept).toBe(SELECTIONS_CT);
+      expect(calls.some(([u]) => String(u).includes('_action=UNLOCK'))).toBe(true);
+    });
+
+    it('getTextElements labels every non-empty part and omits empty bodies', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string) => {
+        const u = String(url);
+        if (u.includes('/source/symbols')) return Promise.resolve(mockResponse(200, ''));
+        if (u.includes('/source/selections')) return Promise.resolve(mockResponse(200, 'P_LGNUM=Warehouse'));
+        return Promise.resolve(mockResponse(200, ''));
+      });
+      const client = createClient();
+      const body = await client.getTextElements('ZHU_CREATE', { objectType: 'PROG' });
+      expect(body).toContain('=== selections ===');
+      expect(body).toContain('P_LGNUM=Warehouse');
+      // Symbols and headings came back empty, so neither is listed.
+      expect(body).not.toContain('=== symbols ===');
+      expect(body).not.toContain('=== headings ===');
+    });
+
+    it('getTextElements reports an empty pool instead of returning nothing', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, ''));
+      const client = createClient();
+      await expect(client.getTextElements('ZHU_CREATE', { objectType: 'PROG' })).resolves.toContain(
+        'No text elements maintained for PROG ZHU_CREATE.',
+      );
+    });
+
+    it('getTextElements rejects an object type that has no text pool', async () => {
+      const client = createClient();
+      await expect(client.getTextElements('ZIF_FOO', { objectType: 'INTF' })).rejects.toThrow(/exist only for/i);
+    });
+
+    it('getTextElements refuses an absent service without calling the broken legacy resource', async () => {
+      const client = createClient();
+      client.http.setDiscoveryMap(new Map([['/sap/bc/adt/programs/programs', ['text/plain']]]));
+      mockFetch.mockReset();
+      await expect(client.getTextElements('ZHU_CREATE', { objectType: 'PROG' })).rejects.toThrow(
+        /textelements service/i,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('fails clean when discovery is loaded but the textelements service is absent (NW 7.50)', async () => {
+      const client = createClient();
+      // Discovery loaded WITHOUT a textelements/classes collection → capability absent (NW 7.50).
+      client.http.setDiscoveryMap(new Map([['/sap/bc/adt/programs/programs', ['text/plain']]]));
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'should-not-be-requested'));
+      await expect(client.getClassTextSymbols('ZCL_FOO')).rejects.toThrow(/textelements service/i);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('function module properties', () => {
+    const fmDoc = (attrs: string) =>
+      `<?xml version="1.0" encoding="utf-8"?><fmodule:abapFunctionModule${attrs} adtcore:name="Z_FM" adtcore:type="FUGR/FF" xmlns:fmodule="http://www.sap.com/adt/functions/fmodules" xmlns:adtcore="http://www.sap.com/adt/core"><atom:link href="source/main" xmlns:atom="http://www.w3.org/2005/Atom"/></fmodule:abapFunctionModule>`;
+
+    it('getFunctionModuleProperties reads the lowercased fmodule resource, letting discovery pick the version', async () => {
+      // No hardcoded Accept: 7.50 serves …fmodules.v2+xml and 758 serves v3 (both live-verified),
+      // so pinning a version here would be an assumption rather than a contract.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, fmDoc(' fmodule:processingType="rfc"')));
+      const client = createClient();
+      const props = await client.getFunctionModuleProperties('ZGRP', 'Z_FM');
+      expect(props.processingType).toBe('rfc');
+      expect(String(mockFetch.mock.calls[0]?.[0])).toContain('/sap/bc/adt/functions/groups/zgrp/fmodules/z_fm');
+      expect(fetchHeaders(0).Accept).not.toMatch(/fmodules\.v\d/);
+    });
+  });
+
+  describe('getFunctionGroup pre-7.52 fallback', () => {
+    const PRIMARY = '/objectstructure';
+    const OK_TREE =
+      '<objectStructureElement name="ZGRP" type="FUGR/F"><objectStructureElement name="Z_FM" type="FUGR/FF"/></objectStructureElement>';
+    const FALLBACK_NODES =
+      '<projectexplorer:objectstructure xmlns:projectexplorer="http://www.sap.com/adt/projectexplorer">' +
+      '<projectexplorer:node nodeid="1" isfolder="false" objecttype="FUGR/FF" objectname="Z_FM750"/>' +
+      '<projectexplorer:node nodeid="2" isfolder="false" objecttype="FUGR/I" objectname="LZGRPTOP"/>' +
+      '</projectexplorer:objectstructure>';
+
+    it('uses the per-group objectstructure and issues no fallback request when it succeeds', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, OK_TREE));
+      const client = createClient();
+      const fg = await client.getFunctionGroup('ZGRP');
+      expect(fg.functions).toEqual(['Z_FM']);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(String(mockFetch.mock.calls[0]?.[0])).toContain('/functions/groups/ZGRP/objectstructure');
+    });
+
+    it('falls back to the generic repository resource with LOWERCASE params on 404', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string) =>
+        Promise.resolve(
+          String(url).includes(`/functions/groups/ZGRP${PRIMARY}`)
+            ? mockResponse(404, '<exc:exception><message>does not exist</message></exc:exception>')
+            : mockResponse(200, FALLBACK_NODES),
+        ),
+      );
+      const client = createClient();
+      const fg = await client.getFunctionGroup('ZGRP');
+      expect(fg).toEqual({ name: 'ZGRP', functions: ['Z_FM750'], includes: ['LZGRPTOP'] });
+      const fallbackUrl = String((mockFetch.mock.calls as [string][])[1]?.[0]);
+      expect(fallbackUrl).toContain('/sap/bc/adt/repository/objectstructure');
+      expect(fallbackUrl).toContain('objectname=ZGRP');
+      expect(fallbackUrl).toContain(`objecttype=${encodeURIComponent('FUGR/F')}`);
+    });
+
+    it('propagates a non-404 error without attempting the fallback', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(403, '<exc:exception><message>forbidden</message></exc:exception>'));
+      const client = createClient();
+      await expect(client.getFunctionGroup('ZGRP')).rejects.toBeInstanceOf(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('surfaces the error when both paths 404', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(404, '<exc:exception><message>does not exist</message></exc:exception>'),
+      );
+      const client = createClient();
+      await expect(client.getFunctionGroup('ZGRP')).rejects.toBeInstanceOf(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('DDIC read operations', () => {
+    it('getStructure returns source code', async () => {
+      const client = createClient();
+      const result = await client.getStructure('BAPIRET2');
+      expect(typeof result.source).toBe('string');
+    });
+
+    it('getDomain returns parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0" encoding="utf-8"?>
+<doma:domain adtcore:name="BUKRS" adtcore:description="Company code" xmlns:doma="http://www.sap.com/dictionary/domain" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="BF"/>
+  <doma:content>
+    <doma:typeInformation><doma:datatype>CHAR</doma:datatype><doma:length>000004</doma:length><doma:decimals>000000</doma:decimals></doma:typeInformation>
+    <doma:outputInformation><doma:length>000004</doma:length><doma:conversionExit/><doma:signExists>false</doma:signExists><doma:lowercase>false</doma:lowercase></doma:outputInformation>
+    <doma:valueInformation><doma:valueTableRef adtcore:name="T001"/><doma:fixValues/></doma:valueInformation>
+  </doma:content>
+</doma:domain>`,
+        ),
+      );
+      const client = createClient();
+      const domain = await client.getDomain('BUKRS');
+      expect(domain.name).toBe('BUKRS');
+      expect(domain.dataType).toBe('CHAR');
+      expect(domain.valueTable).toBe('T001');
+    });
+
+    it('getDataElement returns parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0" encoding="utf-8"?>
+<blue:wbobj adtcore:name="BUKRS" adtcore:description="Company code" xmlns:blue="http://www.sap.com/wbobj/dictionary/dtel" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="BF"/>
+  <dtel:dataElement xmlns:dtel="http://www.sap.com/adt/dictionary/dataelements">
+    <dtel:typeKind>domain</dtel:typeKind><dtel:typeName>BUKRS</dtel:typeName>
+    <dtel:dataType>CHAR</dtel:dataType><dtel:dataTypeLength>000004</dtel:dataTypeLength><dtel:dataTypeDecimals>000000</dtel:dataTypeDecimals>
+    <dtel:shortFieldLabel>CoCd</dtel:shortFieldLabel><dtel:shortFieldLength>06</dtel:shortFieldLength>
+    <dtel:mediumFieldLabel>Company Code</dtel:mediumFieldLabel><dtel:mediumFieldLength>15</dtel:mediumFieldLength>
+    <dtel:longFieldLabel>Company Code</dtel:longFieldLabel><dtel:longFieldLength>15</dtel:longFieldLength>
+    <dtel:headingFieldLabel>CoCd</dtel:headingFieldLabel><dtel:headingFieldLength>04</dtel:headingFieldLength>
+    <dtel:searchHelp>C_T001</dtel:searchHelp><dtel:defaultComponentName>COMP_CODE</dtel:defaultComponentName>
+    <dtel:deactivateInputHistory>true</dtel:deactivateInputHistory>
+  </dtel:dataElement>
+</blue:wbobj>`,
+        ),
+      );
+      const client = createClient();
+      const dtel = await client.getDataElement('BUKRS', 'inactive');
+      expect(String(mockFetch.mock.calls[0]?.[0] ?? '')).toContain(
+        '/sap/bc/adt/ddic/dataelements/BUKRS?version=inactive',
+      );
+      expect(dtel.name).toBe('BUKRS');
+      expect(dtel.typeName).toBe('BUKRS');
+      expect(dtel.searchHelp).toBe('C_T001');
+      expect(dtel.shortLength).toBe('06');
+      expect(dtel.mediumLength).toBe('15');
+      expect(dtel.longLength).toBe('15');
+      expect(dtel.headingLength).toBe('04');
+      expect(dtel.deactivateInputHistory).toBe(true);
+    });
+
+    it('getTransaction returns parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:mainObject adtcore:name="SE38" adtcore:type="TRAN/T" adtcore:description="ABAP Editor" xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:packageRef adtcore:name="SEDT"/>
+</adtcore:mainObject>`,
+        ),
+      );
+      const client = createClient();
+      const tran = await client.getTransaction('SE38');
+      expect(tran.code).toBe('SE38');
+      expect(tran.description).toBe('ABAP Editor');
+      expect(tran.package).toBe('SEDT');
+    });
+
+    it('getAuthorizationField returns parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('authorization-field.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const auth = await client.getAuthorizationField('BUKRS');
+      expect(auth.name).toBe('BUKRS');
+      expect(auth.checkTable).toBe('T001');
+      expect(auth.roleName).toBe('BUKRS');
+      expect(auth.domainName).toBe('BUKRS');
+      expect(auth.outputLength).toBe('000004');
+      expect(auth.package).toBe('BF');
+      expect(auth.orgLevelInfo).toEqual(['Field is not defined as Organizational level.']);
+    });
+
+    it('getFeatureToggle returns parsed states', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, loadFixture('feature-toggle-states.json'), { 'x-csrf-token': 'T' }),
+      );
+      const client = createClient();
+      const toggle = await client.getFeatureToggle('SFW_SWITCH_TOGGLE');
+      expect(toggle.name).toBe('SFW_SWITCH_TOGGLE');
+      expect(toggle.clientState).toBe('off');
+      expect(toggle.userState).toBe('undefined');
+      expect(toggle.states).toEqual([
+        { client: '000', state: 'off', description: 'SAP SE' },
+        { client: '001', state: 'off', description: 'SAP SE' },
+      ]);
+      expect(toggle.userStates).toEqual([]);
+    });
+
+    it('getEnhancementImplementation returns parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, loadFixture('enhancement-implementation.xml'), { 'x-csrf-token': 'T' }),
+      );
+      const client = createClient();
+      const enho = await client.getEnhancementImplementation('SFW_BCF_TCD');
+      expect(enho.name).toBe('SFW_BCF_TCD');
+      expect(enho.package).toBe('SFWTOOLS');
+      expect(enho.technology).toBe('BADI_IMPL');
+      expect(enho.switchSupported).toBe(true);
+      expect(enho.badiImplementations).toHaveLength(2);
+      expect(enho.badiImplementations[0]).toMatchObject({
+        name: 'SFW_TCD',
+        implementingClass: 'CL_SFW_TCD',
+        badiDefinition: 'BCF_TCD_REMOTE_BADI',
+        enhancementSpot: 'BCF_REMOTE_TCD',
+        active: true,
+        default: false,
+      });
+    });
+  });
+
+  // ─── API Release State ──────────────────────────────────────────
+
+  describe('getApiReleaseState', () => {
+    it('returns parsed release state for a released object', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0" encoding="utf-8"?>
+<apirelease:apiReleaseInfos xmlns:apirelease="http://www.sap.com/adt/apirelease" xmlns:adtcore="http://www.sap.com/adt/core">
+  <apirelease:releasableObject adtcore:uri="/sap/bc/adt/oo/classes/cl_salv_table" adtcore:type="CLAS/OC" adtcore:name="CL_SALV_TABLE"/>
+  <apirelease:c1Release apirelease:contract="C1" apirelease:useInKeyUserApps="true" apirelease:useInSAPCloudPlatform="true">
+    <apirelease:status apirelease:state="RELEASED" apirelease:stateDescription="Released"/>
+  </apirelease:c1Release>
+  <apirelease:apiCatalogData apirelease:isAnyAssignmentPossible="true" apirelease:isAnyContractReleased="true"/>
+</apirelease:apiReleaseInfos>`,
+        ),
+      );
+      const client = createClient();
+      const state = await client.getApiReleaseState('/sap/bc/adt/oo/classes/cl_salv_table');
+      expect(state.objectName).toBe('CL_SALV_TABLE');
+      expect(state.contracts).toHaveLength(1);
+      expect(state.contracts[0]!.state).toBe('RELEASED');
+      expect(state.isAnyContractReleased).toBe(true);
+    });
+
+    it('URL-encodes the object URI as a path segment', async () => {
+      const client = createClient();
+      await client.getApiReleaseState('/sap/bc/adt/oo/classes/cl_salv_table');
+      const calledUrl = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      // The object URI should be URL-encoded in the path
+      expect(calledUrl).toContain('/sap/bc/adt/apireleases/%2Fsap%2Fbc%2Fadt%2Foo%2Fclasses%2Fcl_salv_table');
+    });
+
+    it('sends correct Accept header', async () => {
+      const client = createClient();
+      await client.getApiReleaseState('/sap/bc/adt/oo/classes/cl_test');
+      const calledHeaders = mockFetch.mock.calls[0]?.[1]?.headers as Record<string, string> | undefined;
+      expect(calledHeaders?.Accept).toBe('application/vnd.sap.adt.apirelease.v10+xml');
+    });
+  });
+
+  describe('setApiReleaseState', () => {
+    const objectUri = '/sap/bc/adt/oo/classes/zcl_arc1_apifix';
+    const apiReleaseUnreleased = () => loadFixture('api-release-unreleased.xml');
+    const apiReleaseReleased = () =>
+      apiReleaseUnreleased()
+        .replace(
+          '<ars:status ars:state="NOT_RELEASED" ars:stateDescription="Not Released"/>',
+          '<ars:status ars:state="RELEASED" ars:stateDescription="Released"/>',
+        )
+        .replace('ars:useInSAPCloudPlatform="false"', 'ars:useInSAPCloudPlatform="true"')
+        .replace('ars:isAnyContractReleased="false"', 'ars:isAnyContractReleased="true"');
+
+    it('reads back after PUT and returns only the confirmed post-write state', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' }));
+
+      const client = createClient();
+      const result = await client.setApiReleaseState(objectUri, { state: 'RELEASED' });
+
+      expect(result.contracts.find((c) => c.contract === 'C1')?.state).toBe('RELEASED');
+      const urls = mockFetch.mock.calls.map((c) => String(c[0]));
+      expect(urls.filter((u) => u.includes('/sap/bc/adt/apireleases/'))).toHaveLength(3);
+      expect(mockFetch.mock.calls[2]?.[1]?.method).toBe('GET');
+    });
+
+    it('throws when the authoritative read-back still has the old state after a 2xx PUT', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }));
+
+      const client = createClient();
+      await expect(client.setApiReleaseState(objectUri, { state: 'RELEASED' })).rejects.toThrow(
+        /read-back.*NOT_RELEASED.*expected RELEASED/i,
+      );
+    });
+
+    it('throws when the read-back visibility does not match the requested release visibility', async () => {
+      const releasedWithoutCloudVisibility = apiReleaseReleased().replace(
+        'ars:useInSAPCloudPlatform="true"',
+        'ars:useInSAPCloudPlatform="false"',
+      );
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, releasedWithoutCloudVisibility, { 'x-csrf-token': 'T' }));
+
+      const client = createClient();
+      await expect(client.setApiReleaseState(objectUri, { state: 'RELEASED' })).rejects.toThrow(
+        /read-back visibility/i,
+      );
+    });
+
+    it('treats SAP "No changes were made" as an idempotent no-op (changed=false), not an error', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' })) // current: already released
+        .mockResolvedValueOnce(
+          mockResponse(400, '<exc:exception><message>No changes were made.</message></exc:exception>', {
+            'x-csrf-token': 'T',
+          }),
+        ) // PUT no-op
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseReleased(), { 'x-csrf-token': 'T' })); // read-back: still released
+
+      const client = createClient();
+      const result = await client.setApiReleaseState(objectUri, { state: 'RELEASED' });
+      expect(result.changed).toBe(false);
+      expect(result.contracts.find((c) => c.contract === 'C1')?.state).toBe('RELEASED');
+    });
+
+    it('routes the PUT to the requested contract path (C4)', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, apiReleaseUnreleased(), { 'x-csrf-token': 'T' }));
+
+      const client = createClient();
+      const result = await client.setApiReleaseState(objectUri, { state: 'NOT_RELEASED', contract: 'C4' });
+      expect(result.changed).toBe(true);
+      const putCall = mockFetch.mock.calls[1];
+      expect(putCall?.[1]?.method).toBe('PUT');
+      expect(String(putCall?.[0])).toMatch(/\/apireleases\/[^?]*\/c4(?:\?|$)/);
+    });
+  });
+
+  // ─── URL Encoding (Issues #18, #52) ─────────────────────────────
+
+  describe('URL encoding for namespaced objects', () => {
+    it('encodes namespaced program names in URL', async () => {
+      const client = createClient();
+      await client.getProgram('/NAMESPACE/ZPROGRAM');
+    });
+
+    it('encodes namespaced class names in URL', async () => {
+      const client = createClient();
+      await client.getClass('/USE/CL_MY_CLASS');
+    });
+
+    it('encodes namespaced interface names', async () => {
+      const client = createClient();
+      await client.getInterface('/BOBF/IF_FRW_DETERMINATION');
+    });
+
+    it('encodes namespaced function module names', async () => {
+      const client = createClient();
+      await client.getFunction('/NAMESPACE/FUGR', '/NAMESPACE/FM');
+    });
+
+    it('encodes namespaced DDLS names', async () => {
+      const client = createClient();
+      await client.getDdls('/NAMESPACE/CDS_VIEW');
+    });
+
+    it('encodes special characters in search query', async () => {
+      const client = createClient();
+      await client.searchObject('/NAMESPACE/*', 5);
+      const params = new URL(String(mockFetch.mock.calls[0]?.[0])).searchParams;
+      expect(params.get('query')).toBe('/NAMESPACE/*');
+      expect(params.has('objectType')).toBe(false);
+    });
+  });
+
+  describe('getPackageContents (search-endpoint based)', () => {
+    /**
+     * Hand-crafted minimal `adtcore:objectReferences` XML covering the case
+     * the legacy `nodestructure` endpoint got wrong: a sub-package whose own
+     * description was attributed to a contained class. Each reference here
+     * has its description correctly attached to its own name.
+     */
+    const SEARCH_RESPONSE = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/packages/zsubpkg" adtcore:type="DEVC/K" adtcore:name="ZSUBPKG" adtcore:packageName="ZSUBPKG" adtcore:description="Sub-package own description"/>
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_one" adtcore:type="CLAS/OC" adtcore:name="ZCL_ONE" adtcore:packageName="ZPARENT" adtcore:description="First class"/>
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zreport" adtcore:type="PROG/P" adtcore:name="ZREPORT" adtcore:packageName="ZPARENT" adtcore:description="A report"/>
+</adtcore:objectReferences>`;
+
+    it('hits the search endpoint, NOT nodestructure', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      await client.getPackageContents('ZPARENT');
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('/sap/bc/adt/repository/informationsystem/search');
+      expect(url).toContain('packageName=ZPARENT');
+      expect(url).toContain('operation=quickSearch');
+      expect(url).toContain('query=*');
+      expect(url).not.toContain('/nodestructure');
+      // GET, not POST — no CSRF round-trip needed
+      const method = (mockFetch.mock.calls[0]?.[1] as RequestInit)?.method ?? 'GET';
+      expect(method).toBe('GET');
+    });
+
+    it('returns objects with descriptions correctly aligned to names', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      const contents = await client.getPackageContents('ZPARENT');
+      expect(contents).toHaveLength(3);
+      const sub = contents.find((c) => c.name === 'ZSUBPKG');
+      const clas = contents.find((c) => c.name === 'ZCL_ONE');
+      const prog = contents.find((c) => c.name === 'ZREPORT');
+      // The bug we are fixing: each row's description must be its OWN, not a sibling's.
+      expect(sub?.description).toBe('Sub-package own description');
+      expect(clas?.description).toBe('First class');
+      expect(prog?.description).toBe('A report');
+    });
+
+    it('maps search field names to DEVC contract (objectType→type, objectName→name)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      const contents = await client.getPackageContents('ZPARENT');
+      // Public contract is { type, name, description, uri } — verify the rename happened
+      // and that no `objectType`/`objectName`/`packageName` leak through.
+      for (const c of contents) {
+        expect(c).toHaveProperty('type');
+        expect(c).toHaveProperty('name');
+        expect(c).toHaveProperty('description');
+        expect(c).toHaveProperty('uri');
+        expect(c).not.toHaveProperty('objectType');
+        expect(c).not.toHaveProperty('objectName');
+        expect(c).not.toHaveProperty('packageName');
+      }
+      const clas = contents.find((c) => c.name === 'ZCL_ONE');
+      expect(clas?.type).toBe('CLAS/OC');
+      expect(clas?.uri).toBe('/sap/bc/adt/oo/classes/zcl_one');
+    });
+
+    it('honors maxResults parameter (passed through to query string)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      await client.getPackageContents('ZPARENT', 50);
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('maxResults=50');
+    });
+
+    it('clamps maxResults to [1, 1000]', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      await client.getPackageContents('ZPARENT', 5000);
+      let url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('maxResults=1000');
+
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      await client.getPackageContents('ZPARENT', 0);
+      url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('maxResults=1');
+
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      await client.getPackageContents('ZPARENT', -1);
+      url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('maxResults=1');
+    });
+
+    it('uses default maxResults=200 when not specified', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      await client.getPackageContents('ZPARENT');
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('maxResults=200');
+    });
+
+    it('floors a fractional maxResults and falls back to default on NaN (no float reaches the URL)', async () => {
+      // SAPReadSchema now accepts any number (the advertised `type: number` contract); flooring +
+      // range handling is this sink's job — see docs/research/2026-06-12-maxresults-contract-asymmetry.md.
+      // NOTE: 'maxResults=50' is a SUBSTRING of the un-floored 'maxResults=50.5', so each row also
+      // pins the absence of the raw input — without that, the toContain is vacuous for floats.
+      const client = createClient();
+      for (const [input, expected, mustNotContain] of [
+        [50.5, 'maxResults=50', 'maxResults=50.5'],
+        [0.4, 'maxResults=1', 'maxResults=0.4'],
+        [Number.NaN, 'maxResults=200', 'maxResults=NaN'],
+      ] as const) {
+        mockFetch.mockReset();
+        mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+        await client.getPackageContents('ZPARENT', input);
+        const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+        expect(url).toContain(expected);
+        expect(url).not.toContain(mustNotContain);
+      }
+    });
+
+    it('encodes special characters in package names', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
+      const client = createClient();
+      await client.getPackageContents('/NAMESPACE/PKG');
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('packageName=%2FNAMESPACE%2FPKG');
+    });
+  });
+
+  describe('getSubpackages (direct DEVCLASS children — repository/nodestructure)', () => {
+    // Live fixture captured from S/4HANA 2023 (a4h.marianzeis.de):
+    //   POST /sap/bc/adt/repository/nodestructure?parent_type=DEVC/K&parent_name=SABP_UNIT
+    // The 5 returned DEVC/K children match `SELECT devclass FROM tdevc WHERE parentcl='SABP_UNIT'`.
+    const SABP_UNIT_FIXTURE = readFileSync(
+      new URL('../../fixtures/xml/nodestructure-sabp_unit-devc.xml', import.meta.url),
+      'utf8',
+    );
+    const EMPTY_FIXTURE = readFileSync(new URL('../../fixtures/xml/nodestructure-empty.xml', import.meta.url), 'utf8');
+
+    // The first mock call is the CSRF preflight; the nodestructure POST is later.
+    // Find it by URL substring so this is robust to preflight ordering.
+    const findNodestructureCall = (): [string, RequestInit] => {
+      for (const call of mockFetch.mock.calls) {
+        const url = String(call?.[0] ?? '');
+        if (url.includes('/sap/bc/adt/repository/nodestructure')) {
+          return [url, (call?.[1] as RequestInit) ?? {}];
+        }
+      }
+      throw new Error('No nodestructure call recorded — preflight only');
+    };
+
+    it('POSTs to repository/nodestructure with the expected query params', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SABP_UNIT_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.getSubpackages('SABP_UNIT');
+      const [url, init] = findNodestructureCall();
+      expect(url).toContain('/sap/bc/adt/repository/nodestructure');
+      expect(url).toContain('parent_type=DEVC%2FK');
+      expect(url).toContain('parent_name=SABP_UNIT');
+      expect(url).toContain('parent_tech_name=SABP_UNIT');
+      expect(url).toContain('withShortDescriptions=true');
+      expect(init?.method).toBe('POST');
+    });
+
+    it('sends the asx:abap envelope body with TV_NODEKEY (required by SAP — missing body returns HTTP 406)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SABP_UNIT_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.getSubpackages('SABP_UNIT');
+      const [, init] = findNodestructureCall();
+      const body = String(init?.body ?? '');
+      expect(body).toContain('<asx:abap');
+      expect(body).toContain('<TV_NODEKEY>000000</TV_NODEKEY>');
+    });
+
+    it('sends Accept: application/vnd.sap.as+xml', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SABP_UNIT_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.getSubpackages('SABP_UNIT');
+      const [, init] = findNodestructureCall();
+      const headers = init.headers as Record<string, string> | undefined;
+      const accept = headers?.Accept ?? headers?.accept;
+      expect(accept).toContain('application/vnd.sap.as+xml');
+    });
+
+    it('returns the exact 5 known children of SABP_UNIT from the live fixture', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SABP_UNIT_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const subs = await client.getSubpackages('SABP_UNIT');
+      expect([...subs].sort()).toEqual([
+        'SABP_UNIT_CORE',
+        'SABP_UNIT_EXECUTION_API',
+        'SABP_UNIT_GUI',
+        'SABP_UNIT_SCRATCH',
+        'SABP_UNIT_SHARED',
+      ]);
+    });
+
+    it('returns [] for an empty body (SAP responds 200 with no payload for unknown parents)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, EMPTY_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const subs = await client.getSubpackages('ZNO_SUCH_PKG');
+      expect(subs).toEqual([]);
+    });
+
+    it('filters out DEVC/KI (package interface) rows', async () => {
+      const MIXED = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/KI</OBJECT_TYPE><OBJECT_NAME>ZFOO_IF</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, MIXED, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const subs = await client.getSubpackages('ZFOO');
+      expect(subs).toEqual(['ZFOO_A']);
+    });
+
+    it('filters out rows with empty OBJECT_NAME (SAP placeholders for the queried package itself)', async () => {
+      const WITH_EMPTY = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME/></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, WITH_EMPTY, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const subs = await client.getSubpackages('ZFOO');
+      expect(subs).toEqual(['ZFOO_A']);
+    });
+
+    it('never returns the queried package itself (defensive self-exclusion)', async () => {
+      const SELF = `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZFOO_A</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`;
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, SELF, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const subs = await client.getSubpackages('ZFOO');
+      expect(subs).toEqual(['ZFOO_A']);
+    });
+
+    it('URL-encodes namespace package names (slashes become %2F)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, EMPTY_FIXTURE, { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.getSubpackages('/COMPANY/THING');
+      const [url] = findNodestructureCall();
+      expect(url).toContain('parent_name=%2FCOMPANY%2FTHING');
+      expect(url).toContain('parent_tech_name=%2FCOMPANY%2FTHING');
+    });
+
+    it('propagates SAP errors as AdtApiError (does NOT silently return [])', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(500, '<error/>'));
+      const client = createClient();
+      await expect(client.getSubpackages('ZFOO')).rejects.toThrow(AdtApiError);
+    });
+  });
+
+  describe('package hierarchy resolver (lazy + shared)', () => {
+    it('getPackageHierarchyResolver instantiates lazily and returns the same instance on repeat calls', () => {
+      const client = createClient();
+      const r1 = client.getPackageHierarchyResolver();
+      const r2 = client.getPackageHierarchyResolver();
+      expect(r1).toBe(r2);
+    });
+
+    it('withSafety() clones share the same resolver instance (hierarchy is per-system, not per-scope)', () => {
+      const original = createClient();
+      const cloned = original.withSafety({
+        ...unrestrictedSafetyConfig(),
+        allowWrites: false,
+      });
+      expect(cloned.getPackageHierarchyResolver()).toBe(original.getPackageHierarchyResolver());
+    });
+
+    it('resolver is wired to client.getSubpackages — descends real subtree from the nodestructure endpoint', async () => {
+      // Mock the BFS via nodestructure: ZROOT -> [ZA], ZA -> [].
+      // All mocked responses carry x-csrf-token so the POST's CSRF preflight succeeds.
+      const CSRF = { 'x-csrf-token': 'T' };
+      mockFetch.mockReset();
+      mockFetch.mockImplementation(async (url: unknown) => {
+        const s = String(url);
+        if (s.includes('/sap/bc/adt/repository/nodestructure') && s.includes('parent_name=ZROOT')) {
+          return mockResponse(
+            200,
+            `<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
+<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZA</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
+</TREE_CONTENT></DATA></asx:values></asx:abap>`,
+            CSRF,
+          );
+        }
+        if (s.includes('/sap/bc/adt/repository/nodestructure') && s.includes('parent_name=ZA')) {
+          return mockResponse(200, '', CSRF);
+        }
+        // CSRF preflight target — return empty body + token so the POST proceeds.
+        return mockResponse(200, '', CSRF);
+      });
+      const client = createClient();
+      const resolver = client.getPackageHierarchyResolver();
+      expect(await resolver.isDescendantOrSelf('ZROOT', 'ZA')).toBe(true);
+      expect(await resolver.isDescendantOrSelf('ZROOT', 'ZNOTHERE')).toBe(false);
+    });
+
+    it('invalidatePackageHierarchy() drops cached subtrees', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const resolver = client.getPackageHierarchyResolver();
+      await resolver.isDescendantOrSelf('ZROOT', 'ZA');
+      const before = mockFetch.mock.calls.length;
+      client.invalidatePackageHierarchy();
+      await resolver.isDescendantOrSelf('ZROOT', 'ZA');
+      expect(mockFetch.mock.calls.length).toBe(before + 1);
+    });
+  });
+
+  describe('lookupObjects', () => {
+    const LOOKUP_RESPONSE = `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/tables/zdm_project_d" adtcore:type="TABL/DT" adtcore:name="ZDM_PROJECT_D" adtcore:packageName="ZDEMO_MIG_RAP" adtcore:description="Draft table"/>
+  <adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/tables/zdm_project_extra" adtcore:type="TABL/DT" adtcore:name="ZDM_PROJECT_EXTRA" adtcore:packageName="ZDEMO_MIG_RAP" adtcore:description="Substring hit"/>
+</adtcore:objectReferences>`;
+
+    it('uses repository quick search and exact-filters matches', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, LOOKUP_RESPONSE));
+      const client = createClient();
+      const result = await client.lookupObjects(['ZDM_PROJECT_D']);
+
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('/sap/bc/adt/repository/informationsystem/search');
+      expect(url).toContain('operation=quickSearch');
+      expect(url).toContain('query=ZDM_PROJECT_D');
+      expect(url).not.toContain('objectType=');
+      expect(result).toEqual([
+        {
+          name: 'ZDM_PROJECT_D',
+          found: true,
+          matches: [
+            {
+              objectType: 'TABL/DT',
+              objectName: 'ZDM_PROJECT_D',
+              packageName: 'ZDEMO_MIG_RAP',
+              description: 'Draft table',
+              uri: '/sap/bc/adt/ddic/tables/zdm_project_d',
+            },
+          ],
+        },
+      ]);
+    });
+
+    it('adds objectType filters and deduplicates typed lookup results', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, LOOKUP_RESPONSE));
+      const client = createClient();
+      const result = await client.lookupObjects(['zdm_project_d'], { objectTypes: ['TABL', 'TABL'], maxResults: 5 });
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('objectType=TABL');
+      expect(url).toContain('maxResults=5');
+      expect(result[0]?.name).toBe('ZDM_PROJECT_D');
+      expect(result[0]?.matches).toHaveLength(1);
+    });
+
+    it('returns missing lookup entries when no exact match is found', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"></adtcore:objectReferences>',
+        ),
+      );
+      const client = createClient();
+      const result = await client.lookupObjects(['ZDOES_NOT_EXIST']);
+
+      expect(result).toEqual([{ name: 'ZDOES_NOT_EXIST', found: false, matches: [] }]);
+    });
+  });
+
+  describe('lookupObjectsViaDb', () => {
+    /** Build an asx:abap-shaped freestyle SQL response for given TADIR rows. */
+    function tadirSqlResponse(
+      rows: Array<{ pgmid: string; object: string; obj_name: string; devclass: string }>,
+    ): string {
+      const datasetCol = (data: string[]) =>
+        data.length > 0 ? `<DATASET>${data.map((d) => `<DATA>${d}</DATA>`).join('')}</DATASET>` : '<DATASET/>';
+      return `<?xml version="1.0" encoding="utf-8"?>
+<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0">
+  <asx:values>
+    <COLUMNS>
+      <COLUMN>
+        <METADATA name="PGMID" type="CHAR" description="Program ID" length="4" keyAttribute="false"/>
+        ${datasetCol(rows.map((r) => r.pgmid))}
+      </COLUMN>
+      <COLUMN>
+        <METADATA name="OBJECT" type="CHAR" description="Object Type" length="4" keyAttribute="false"/>
+        ${datasetCol(rows.map((r) => r.object))}
+      </COLUMN>
+      <COLUMN>
+        <METADATA name="OBJ_NAME" type="CHAR" description="Object Name" length="40" keyAttribute="false"/>
+        ${datasetCol(rows.map((r) => r.obj_name))}
+      </COLUMN>
+      <COLUMN>
+        <METADATA name="DEVCLASS" type="CHAR" description="Package" length="30" keyAttribute="false"/>
+        ${datasetCol(rows.map((r) => r.devclass))}
+      </COLUMN>
+    </COLUMNS>
+  </asx:values>
+</asx:abap>`;
+    }
+
+    function mockTadirPost(rows: Array<{ pgmid: string; object: string; obj_name: string; devclass: string }>): void {
+      mockFetch.mockReset();
+      // First call: CSRF token fetch (HEAD request)
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN_DB' }));
+      // Second call: SQL POST returns the TADIR rows
+      mockFetch.mockResolvedValueOnce(mockResponse(200, tadirSqlResponse(rows)));
+    }
+
+    it('floors a fractional maxResults into the freestyle rowNumber (no float reaches the URL)', async () => {
+      // SAPSearch tadir_lookup source=db|both reaches this sink; SAPSearchSchema accepts any number,
+      // so flooring must happen here — see docs/research/2026-06-12-maxresults-contract-asymmetry.md.
+      mockTadirPost([{ pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZA', devclass: 'ZPKG' }]);
+      const client = createClient();
+      await client.lookupObjectsViaDb(['ZA'], { maxResults: 50.5 });
+      // calls[0] = CSRF HEAD, calls[1] = the freestyle SQL POST whose URL carries rowNumber.
+      const postUrl = String(mockFetch.mock.calls[1]?.[0] ?? '');
+      expect(postUrl).toContain('rowNumber=50');
+      expect(postUrl).not.toContain('rowNumber=50.5');
+    });
+
+    it('returns three matches all tagged _origin=db when three names are present', async () => {
+      mockTadirPost([
+        { pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZA', devclass: 'ZPKG' },
+        { pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZB', devclass: 'ZPKG' },
+        { pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZC', devclass: 'ZPKG' },
+      ]);
+      const client = createClient();
+      const result = await client.lookupObjectsViaDb(['ZA', 'ZB', 'ZC']);
+
+      expect(result).toHaveLength(3);
+      for (const r of result) {
+        expect(r.found).toBe(true);
+        expect(r.matches).toHaveLength(1);
+        expect(r.matches[0]?._origin).toBe('db');
+        expect(r.matches[0]?.objectType).toBe('DDLS');
+        expect(r.matches[0]?.packageName).toBe('ZPKG');
+        expect(r.matches[0]?.uri).toBe(`/sap/bc/adt/ddic/ddl/sources/${r.name}`);
+      }
+    });
+
+    it('returns the ADT metadata URI for a SQL-sourced lock object', async () => {
+      mockTadirPost([{ pgmid: 'R3TR', object: 'ENQU', obj_name: 'EZARC1', devclass: 'ZPKG' }]);
+      const result = await createClient().lookupObjectsViaDb(['EZARC1']);
+      expect(result[0]?.matches[0]?.uri).toBe('/sap/bc/adt/ddic/lockobjects/sources/EZARC1');
+    });
+
+    it('adds AND object IN (...) when objectTypes filter is supplied', async () => {
+      mockTadirPost([{ pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZA', devclass: 'ZPKG' }]);
+      const client = createClient();
+      await client.lookupObjectsViaDb(['ZA'], { objectTypes: ['DDLS'] });
+
+      // mock.calls[0] is CSRF HEAD; mock.calls[1] is the POST with SQL body
+      const postCall = mockFetch.mock.calls[1];
+      expect(postCall).toBeDefined();
+      const body = String((postCall?.[1] as RequestInit)?.body ?? '');
+      expect(body).toContain('FROM tadir');
+      expect(body).toContain("WHERE obj_name IN ('ZA')");
+      expect(body).toContain("AND object IN ('DDLS')");
+    });
+
+    it('marks names not in the SQL result set as found=false in input order', async () => {
+      mockTadirPost([{ pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZB', devclass: 'ZPKG' }]);
+      const client = createClient();
+      const result = await client.lookupObjectsViaDb(['ZA', 'ZB', 'ZC']);
+
+      expect(result.map((r) => r.name)).toEqual(['ZA', 'ZB', 'ZC']);
+      expect(result[0]?.found).toBe(false);
+      expect(result[0]?.matches).toEqual([]);
+      expect(result[1]?.found).toBe(true);
+      expect(result[2]?.found).toBe(false);
+    });
+
+    it('throws when called with an empty names array', async () => {
+      const client = createClient();
+      await expect(client.lookupObjectsViaDb([])).rejects.toThrow(/at least one non-empty name/);
+    });
+
+    it('propagates SQL errors from runQuery (400 from ADT)', async () => {
+      mockFetch.mockReset();
+      // CSRF HEAD then 400 from POST
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'TOKEN_DB' }));
+      mockFetch.mockResolvedValueOnce(mockResponse(400, 'SQL parser error: invalid identifier'));
+      const client = createClient();
+      await expect(client.lookupObjectsViaDb(['ZA'])).rejects.toThrow(AdtApiError);
+    });
+
+    it('uppercases input names before quoting them into the SQL IN-list', async () => {
+      mockTadirPost([{ pgmid: 'R3TR', object: 'DDLS', obj_name: 'ZFOO', devclass: 'ZPKG' }]);
+      const client = createClient();
+      const result = await client.lookupObjectsViaDb(['zfoo']);
+
+      const postCall = mockFetch.mock.calls[1];
+      const body = String((postCall?.[1] as RequestInit)?.body ?? '');
+      expect(body).toContain("WHERE obj_name IN ('ZFOO')");
+      expect(result[0]?.name).toBe('ZFOO');
+    });
+  });
+
+  describe('internal user cache (createdBy trick — BTP package responsible)', () => {
+    it('noteInternalUser caches a valid XUBNAME and getInternalUser returns it', () => {
+      const client = createClient();
+      expect(client.getInternalUser()).toBeUndefined();
+      client.noteInternalUser('CB9980000000');
+      expect(client.getInternalUser()).toBe('CB9980000000');
+    });
+
+    it('noteInternalUser ignores empty and email-shaped values (failure path)', () => {
+      const client = createClient();
+      client.noteInternalUser('');
+      client.noteInternalUser('   ');
+      client.noteInternalUser('marian@zeis.de'); // email is NOT a valid responsible on cloud
+      expect(client.getInternalUser()).toBeUndefined();
+      client.noteInternalUser('  CB9980000000  ');
+      expect(client.getInternalUser()).toBe('CB9980000000');
+    });
+
+    it('withSafety() clone preserves a cached internal user', () => {
+      const client = createClient();
+      client.noteInternalUser('CB9980000000');
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      expect(derived.getInternalUser()).toBe('CB9980000000');
+    });
+  });
+
+  describe('withSafety', () => {
+    it('returns a new client with the given safety config', () => {
+      const client = createClient();
+      const restrictedSafety = { ...unrestrictedSafetyConfig(), allowWrites: false };
+      const derived = client.withSafety(restrictedSafety);
+      expect(derived.safety.allowWrites).toBe(false);
+      expect(client.safety.allowWrites).toBe(true);
+    });
+
+    it('shares the same HTTP client instance', () => {
+      const client = createClient();
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      expect(derived.http).toBe(client.http);
+    });
+
+    it('preserves username from original client', () => {
+      const client = createClient({ username: 'testuser' });
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      expect(derived.username).toBe('testuser');
+    });
+
+    it('derived client blocks operations per its safety config', async () => {
+      const client = createClient();
+      const restrictedSafety = { ...unrestrictedSafetyConfig(), allowWrites: false };
+      const derived = client.withSafety(restrictedSafety);
+      // Original client can still read (unrestricted)
+      const source = await client.getProgram('ZHELLO');
+      expect(source).toBeDefined();
+      // Derived client blocks writes but reads still work
+      const source2 = await derived.getProgram('ZHELLO');
+      expect(source2).toBeDefined();
+    });
+
+    it('is an instance of AdtClient', () => {
+      const client = createClient();
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      expect(derived).toBeInstanceOf(AdtClient);
+    });
+
+    // By-construction guard (issue #333): withSafety() now shares every own field via
+    // Object.assign and overrides only `safety`, so a NEW AdtClient field is shared
+    // automatically — there is no hand-maintained re-attach list to forget. This test
+    // enumerates the fields structurally (not by name), so it keeps holding as fields
+    // are added: every own-enumerable property except `safety` must be the SAME reference
+    // on the clone. A field that silently fails to share (e.g. a stray `#private`) fails here.
+    it('shares every instance field except safety, by reference (no per-field re-attach list)', () => {
+      const client = createClient({ username: 'u' });
+      const newSafety = { ...unrestrictedSafetyConfig(), allowWrites: false };
+      const derived = client.withSafety(newSafety);
+      expect(derived.safety).toBe(newSafety);
+      const fields = Object.keys(client);
+      expect(fields).toContain('safety'); // sanity: the override target is actually an own field
+      expect(fields.length).toBeGreaterThan(1); // there ARE other fields to share
+      for (const key of fields) {
+        if (key === 'safety') continue;
+        const sameRef = Object.is(
+          (derived as unknown as Record<string, unknown>)[key],
+          (client as unknown as Record<string, unknown>)[key],
+        );
+        expect(sameRef, `clone must share field '${key}' by reference (issue #333)`).toBe(true);
+      }
+    });
+
+    // Regression: issue #333 — withSafety() must share EVERY AdtClient instance field
+    // (the clone skips the constructor via Object.create). A cache field missing from the
+    // clone once crashed TABL writes/activates with "Cannot read properties of undefined
+    // (reading 'get')" on every authenticated HTTP path (XSUAA/OIDC scopes or API-key
+    // profile). These named-field checks complement the structural guard above.
+    type CacheView = { tablUrlCache?: Map<string, string> };
+    const searchResponse = (uri: string, type: string, name: string) =>
+      mockResponse(
+        200,
+        `<?xml version="1.0" encoding="utf-8"?>
+<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
+  <adtcore:objectReference adtcore:uri="${uri}" adtcore:type="${type}" adtcore:name="${name}"/>
+</adtcore:objectReferences>`,
+      );
+
+    it('shares the same tablUrlCache Map instance with the clone', () => {
+      const client = createClient();
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      const original = (client as unknown as CacheView).tablUrlCache;
+      const clone = (derived as unknown as CacheView).tablUrlCache;
+      expect(clone).toBeInstanceOf(Map);
+      expect(clone).toBe(original);
+    });
+
+    it('resolveTablObjectUrlForWrite() does not crash on a clone (issue #333 regression)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(searchResponse('/sap/bc/adt/ddic/structures/BAPIRET2', 'TABL/DS', 'BAPIRET2'));
+      const client = createClient();
+      const derived = client.withSafety(unrestrictedSafetyConfig());
+      // Before the fix this threw TypeError: Cannot read properties of undefined (reading 'get').
+      const url = await derived.resolveTablObjectUrlForWrite('BAPIRET2', { tablesEndpointAvailable: false });
+      expect(url).toBe('/sap/bc/adt/ddic/structures/BAPIRET2');
+    });
+  });
+
+  describe('safety checks', () => {
+    it('blocks free SQL when allowFreeSQL is false', async () => {
+      const client = createClient({
+        safety: { ...unrestrictedSafetyConfig(), allowFreeSQL: false },
+      });
+      await expect(client.runQuery('SELECT * FROM T000')).rejects.toThrow(AdtSafetyError);
+    });
+
+    it('allows read when safety is unrestricted', async () => {
+      const client = createClient();
+      const source = await client.getProgram('ZHELLO');
+      expect(source).toBeDefined();
+    });
+  });
+
+  describe('runTableQuery (TABLE_QUERY)', () => {
+    it('is blocked by the data-preview gate even when free SQL is allowed', async () => {
+      // The security contract: TABLE_QUERY requires allowDataPreview specifically — holding the
+      // higher allowFreeSQL permission must NOT grant it (it routes through OperationType.Query).
+      const client = createClient({
+        safety: { ...unrestrictedSafetyConfig(), allowDataPreview: false, allowFreeSQL: true },
+      });
+      await expect(client.runTableQuery('MARA', { where: [{ field: 'MATNR', op: '=', value: 'X' }] })).rejects.toThrow(
+        AdtSafetyError,
+      );
+    });
+
+    it('posts the built SELECT to the freestyle endpoint and clamps an oversized row limit', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      const result = await client.runTableQuery('MARA', {
+        columns: ['MATNR'],
+        where: [{ field: 'MATNR', op: '=', value: 'X' }],
+        maxRows: 999_999,
+      });
+      const postCall = mockFetch.mock.calls.find((c) => String(c[0]).includes('/datapreview/freestyle'));
+      expect(postCall).toBeDefined();
+      expect(String(postCall?.[0])).toContain('rowNumber=10000'); // clamped from 999999
+      expect(String((postCall?.[1] as RequestInit)?.body)).toBe("SELECT MATNR FROM MARA WHERE MATNR = 'X'");
+      expect(result.columns.length).toBeGreaterThan(0);
+    });
+
+    it('falls back to the default row limit when maxRows is NaN (no rowNumber=NaN)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.runTableQuery('T000', { maxRows: Number.NaN });
+      const postCall = mockFetch.mock.calls.find((c) => String(c[0]).includes('/datapreview/freestyle'));
+      expect(String(postCall?.[0])).toContain('rowNumber=100');
+    });
+  });
+
+  describe('experimental data-source blocklist', () => {
+    const strictSafety = (blockedDataSources: string[]) => ({
+      ...unrestrictedSafetyConfig(),
+      blockedDataSources,
+    });
+
+    it.each([
+      ['TABLE_CONTENTS', (client: InstanceType<typeof AdtClient>) => client.getTableContents('USR02')],
+      ['TABLE_QUERY', (client: InstanceType<typeof AdtClient>) => client.runTableQuery('USR02')],
+      ['SAPQuery', (client: InstanceType<typeof AdtClient>) => client.runQuery('SELECT * FROM USR02')],
+      [
+        'SAPQuery join with blocked second source',
+        (client: InstanceType<typeof AdtClient>) =>
+          client.runQuery('SELECT * FROM SCARR AS a INNER JOIN USR02 AS b ON a~MANDT = b~MANDT'),
+      ],
+    ])('denies a direct blocked source before any SAP request on %s', async (_label, call) => {
+      const client = createClient({ safety: strictSafety(['USR02']) });
+      await expect(call(client)).rejects.toMatchObject({
+        code: 'DATA_SOURCE_BLOCKED',
+        sourcePath: ['USR02'],
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    // Phase 3 invariant: the identifier ARC-1 authorizes is byte-for-byte the identifier it sends.
+    // The old builder stripped anything outside [\w/], so `USR02$` was checked as USR02$ and
+    // executed as USR02. Identifier handling must not depend on whether the blocklist is active.
+    it('with the blocklist off, executes the exact canonical identity', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient({ safety: strictSafety([]) });
+
+      await client.runTableQuery('usr02$');
+
+      const post = mockFetch.mock.calls.find((call) => String(call[0]).includes('/datapreview/freestyle'));
+      expect(String(post?.[1]?.body)).toBe('SELECT * FROM USR02$');
+    });
+
+    it('with the blocklist on, authorizes that same exact identity', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(objectSearchResponses([]));
+      const client = createClient({ safety: strictSafety(['SCARR']) });
+
+      // Unresolvable here (the mocked search returns nothing), which is correct fail-closed
+      // behaviour. What this asserts is the identity the policy was handed: USR02$, not USR02.
+      await expect(client.runTableQuery('usr02$')).rejects.toMatchObject({ code: 'DATA_LINEAGE_UNRESOLVED' });
+
+      const searchUrl = mockFetch.mock.calls
+        .map((call) => String(call[0]))
+        .find((url) => url.includes('/repository/informationsystem/search'));
+      expect(decodeURIComponent(String(searchUrl))).toContain('USR02$');
+      expect(mockFetch.mock.calls.some((call) => String(call[0]).includes('/datapreview/'))).toBe(false);
+    });
+
+    it('does not strip characters from a TABLE_CONTENTS entity name', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient({ safety: strictSafety([]) });
+
+      await client.getTableContents('usr02$');
+
+      const url = mockFetch.mock.calls.map((call) => String(call[0])).find((u) => u.includes('/datapreview/ddic'));
+      expect(url).toContain('ddicEntityName=USR02%24');
+    });
+
+    it.each([
+      ['TABLE_QUERY', (c: InstanceType<typeof AdtClient>) => c.runTableQuery('US R02')],
+      ['TABLE_CONTENTS', (c: InstanceType<typeof AdtClient>) => c.getTableContents('T000; DROP')],
+    ])('refuses an identifier that would need rewriting on %s', async (_label, call) => {
+      mockFetch.mockReset();
+      const client = createClient({ safety: strictSafety([]) });
+      await expect(call(client)).rejects.toThrow(/not an exact technical name/);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    // ── One decision per logical request (no cross-request cache) ──────────────
+    describe('batched authorization', () => {
+      const chunks = [
+        "SELECT * FROM SCARR WHERE CARRID IN ('A','B')",
+        "SELECT * FROM SCARR WHERE CARRID IN ('C','D')",
+        "SELECT * FROM SCARR WHERE CARRID IN ('E','F')",
+      ];
+
+      const allowMocks = () => {
+        mockFetch.mockReset();
+        mockFetch.mockImplementation(async (url: string, opts: RequestInit) => {
+          const u = String(url);
+          if (u.includes('/repository/informationsystem/search')) {
+            return objectSearchResponses([{ uri: '/sap/bc/adt/ddic/tables/scarr', type: 'TABL/DT', name: 'SCARR' }]);
+          }
+          if (String(opts.body).includes('FROM DD02L AS d')) {
+            return mockResponse(200, loadFixture('replacement-catalog-scarr.xml'), { 'x-csrf-token': 'T' });
+          }
+          return mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' });
+        });
+      };
+
+      it('resolves lineage once for N chunks and posts each chunk', async () => {
+        allowMocks();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+
+        await client.runQueryBatch(chunks, 100);
+
+        const urls = mockFetch.mock.calls.map((call) => String(call[0]));
+        // One search and one catalog read for the single distinct source across all chunks.
+        expect(urls.filter((u) => u.includes('/repository/informationsystem/search'))).toHaveLength(1);
+        expect(mockFetch.mock.calls.filter(([, opts]) => String(opts.body).includes('FROM DD02L AS d'))).toHaveLength(
+          1,
+        );
+        // …but every chunk still executes.
+        expect(urls.filter((u) => u.includes('/datapreview/freestyle'))).toHaveLength(chunks.length + 1);
+      });
+
+      it('covers the union of all chunk sources, not just the first chunk', async () => {
+        allowMocks();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+
+        // USR02 appears ONLY in the last chunk; it must still deny the whole batch.
+        await expect(client.runQueryBatch([...chunks, 'SELECT * FROM USR02'], 100)).rejects.toMatchObject({
+          code: 'DATA_SOURCE_BLOCKED',
+          sourcePath: ['USR02'],
+        });
+
+        // Direct block short-circuits before any SAP call at all.
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it('makes zero SAP calls when any chunk names a directly blocked source', async () => {
+        mockFetch.mockReset();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+        await expect(client.runQueryBatch(['SELECT * FROM USR02'], 100)).rejects.toMatchObject({
+          code: 'DATA_SOURCE_BLOCKED',
+        });
+        expect(mockFetch).not.toHaveBeenCalled();
+      });
+
+      it('bounds the whole batch with ONE shared response-memory budget', async () => {
+        // #739 bounds data-preview response memory per logical request. The batch must share a
+        // single scope, or N chunks would each get a fresh budget and together exceed the limit a
+        // single response may consume.
+        allowMocks();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+        const postSpy = vi.spyOn(client.http, 'post');
+
+        await client.runQueryBatch(chunks, 100);
+
+        const budgets = postSpy.mock.calls
+          .filter((call) => String(call[0]).includes('/datapreview/freestyle'))
+          .map((call) => (call[4] as { responseBudget?: unknown } | undefined)?.responseBudget);
+
+        expect(budgets).toHaveLength(chunks.length + 1);
+        expect(budgets.every((budget) => budget !== undefined)).toBe(true);
+        // Same object for every chunk — cumulative, not reset per chunk.
+        expect(new Set(budgets).size).toBe(1);
+      });
+
+      it('re-resolves lineage on a second request: no decision survives the first', async () => {
+        allowMocks();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+
+        await client.runQueryBatch(['SELECT * FROM SCARR'], 100);
+        const afterFirst = mockFetch.mock.calls.filter((c) =>
+          String(c[0]).includes('/repository/informationsystem/search'),
+        ).length;
+
+        await client.runQueryBatch(['SELECT * FROM SCARR'], 100);
+        const afterSecond = mockFetch.mock.calls.filter((c) =>
+          String(c[0]).includes('/repository/informationsystem/search'),
+        ).length;
+
+        // A cache would make the second request cost nothing; there is deliberately none.
+        expect(afterFirst).toBe(1);
+        expect(afterSecond).toBe(2);
+      });
+
+      it('runQuery and runQueryWithMetrics are a batch of one', async () => {
+        allowMocks();
+        const client = createClient({ safety: strictSafety(['USR02']) });
+        await client.runQuery('SELECT * FROM SCARR');
+        const first = mockFetch.mock.calls.filter((c) => String(c[0]).includes('/datapreview/freestyle')).length;
+        expect(first).toBe(2);
+
+        const withMetrics = await client.runQueryWithMetrics('SELECT * FROM SCARR');
+        expect(withMetrics.columns.length).toBeGreaterThan(0);
+      });
+    });
+
+    it('keeps empty-list behavior byte-for-byte and performs no metadata lookup', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient({ safety: strictSafety([]) });
+      await client.runQuery('SELECT * FROM SCARR');
+      const urls = mockFetch.mock.calls.map((call) => String(call[0]));
+      expect(urls.some((url) => url.includes('/repository/informationsystem/search'))).toBe(false);
+      expect(urls.some((url) => url.includes('/ddl/dependencies/graphdata'))).toBe(false);
+      expect(urls.some((url) => url.includes('/datapreview/freestyle'))).toBe(true);
+    });
+
+    it('rejects filtered DDIC preview before any request while strict analysis is active', async () => {
+      const client = createClient({ safety: strictSafety(['USR02']) });
+      await expect(client.getTableContents('SCARR', 10, "CARRID = 'LH'")).rejects.toMatchObject({
+        code: 'DATA_SQL_UNSUPPORTED',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      'SELECT * FROM (lv_table)',
+      'SELECT * FROM SCARR WHERE CARRID = @lv_carrid',
+      'SELECT * FROM SCARR. DELETE FROM USR02',
+    ])('returns DATA_SQL_UNSUPPORTED before SAP for unsupported SQL: %s', async (sql) => {
+      const client = createClient({ safety: strictSafety(['USR02']) });
+      await expect(client.runQuery(sql)).rejects.toMatchObject({
+        code: 'DATA_SQL_UNSUPPORTED',
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('allows an unrelated static table query only after exact lookup and replacement inspection', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string, opts: RequestInit) => {
+        if (url.includes('/repository/informationsystem/search')) {
+          return Promise.resolve(objectSearchResponse('/sap/bc/adt/ddic/tables/SCARR', 'TABL/DT', 'SCARR'));
+        }
+        if (String(opts.body).includes('FROM DD02L AS d')) {
+          return Promise.resolve(mockResponse(200, loadFixture('replacement-catalog-scarr.xml')));
+        }
+        return Promise.resolve(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient({ safety: strictSafety(['USR02']) });
+      await expect(client.runQuery('SELECT * FROM SCARR')).resolves.toMatchObject({ columns: expect.any(Array) });
+      const urls = mockFetch.mock.calls.map((call) => String(call[0]));
+      expect(urls.some((url) => url.includes('/repository/informationsystem/search'))).toBe(true);
+      expect(mockFetch.mock.calls.some(([, opts]) => String(opts.body).includes('FROM DD02L AS d'))).toBe(true);
+      expect(urls.some((url) => url.includes('/datapreview/freestyle'))).toBe(true);
+    });
+
+    it('denies a blocked transitive CDS table using the live graph before the data POST', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('/repository/informationsystem/search')) {
+          return Promise.resolve(
+            objectSearchResponse(
+              '/sap/bc/adt/ddic/ddl/sources/DEMO_CDS_SUMDIST/source/main#name=DEMO_CDS_SUMDIST',
+              'STOB/DO',
+              'DEMO_CDS_SUMDIST',
+            ),
+          );
+        }
+        if (url.includes('/ddl/dependencies/graphdata')) {
+          return Promise.resolve(mockResponse(200, loadFixture('cds-dependency-graph-758.xml')));
+        }
+        return Promise.resolve(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient({ safety: strictSafety(['SPFLI']) });
+      client.http.setDiscoveryMap(
+        new Map([
+          ['/sap/bc/adt/ddic/ddl/dependencies/graphdata', ['application/vnd.sap.adt.ddl.SQLDependencyModel.v3+xml']],
+        ]),
+      );
+      await expect(client.runQuery('SELECT * FROM DEMO_CDS_SUMDIST')).rejects.toMatchObject({
+        code: 'DATA_SOURCE_BLOCKED',
+        sourcePath: ['DEMO_CDS_SUMDIST', 'SPFLI'],
+      });
+      const urls = mockFetch.mock.calls.map((call) => String(call[0]));
+      expect(
+        urls.some((url) => url.includes('ddlsourceName=DEMO_CDS_SUMDIST') && url.includes('addMetrics=false')),
+      ).toBe(true);
+      expect(urls.some((url) => url.includes('/datapreview/'))).toBe(false);
+    });
+
+    it('resolves decorated NW 7.50 entity and DDLS search results before reading the old graph', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string) => {
+        if (url.includes('/repository/informationsystem/search')) {
+          return Promise.resolve(
+            objectSearchResponses([
+              {
+                uri: '/sap/bc/adt/vit/wb/object_type/stobdo/object_name/DEMO_CDS_SUMDIST',
+                type: 'STOB/DO',
+                name: 'DEMO_CDS_SUMDIST (Entity)',
+              },
+              {
+                uri: '/sap/bc/adt/ddic/ddl/sources/demo_cds_sumdist',
+                type: 'DDLS/DF',
+                name: 'DEMO_CDS_SUMDIST (Data Definition)',
+              },
+            ]),
+          );
+        }
+        if (url.includes('/ddl/dependencies/graphdata')) {
+          return Promise.resolve(mockResponse(200, loadFixture('cds-dependency-graph-750.xml')));
+        }
+        return Promise.resolve(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient({ safety: strictSafety(['SPFLI']) });
+      client.http.setDiscoveryMap(
+        new Map([['/sap/bc/adt/ddic/ddl/dependencies/graphdata', ['application/vnd.sap.adt.elementinfo+xml']]]),
+      );
+      await expect(client.runQuery('SELECT * FROM DEMO_CDS_SUMDIST')).rejects.toMatchObject({
+        code: 'DATA_SOURCE_BLOCKED',
+        sourcePath: ['DEMO_CDS_SUMDIST', 'SPFLI'],
+      });
+      expect(mockFetch.mock.calls.some((call) => String(call[0]).includes('/datapreview/'))).toBe(false);
+    });
+
+    it('expands a DDIC replacement object before allowing the request', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockImplementation((url: string, opts: RequestInit) => {
+        if (url.includes('query=DEMO_SUMDIST')) {
+          return Promise.resolve(
+            objectSearchResponse('/sap/bc/adt/ddic/tables/DEMO_SUMDIST', 'TABL/DT', 'DEMO_SUMDIST'),
+          );
+        }
+        if (String(opts.body).includes('FROM DD02L AS d')) {
+          return Promise.resolve(mockResponse(200, loadFixture('replacement-catalog-demo_sumdist.xml')));
+        }
+        if (url.includes('query=DEMO_CDS_SUMDIST')) {
+          return Promise.resolve(
+            objectSearchResponse(
+              '/sap/bc/adt/ddic/ddl/sources/DEMO_CDS_SUMDIST/source/main#name=DEMO_CDS_SUMDIST',
+              'STOB/DO',
+              'DEMO_CDS_SUMDIST',
+            ),
+          );
+        }
+        if (url.includes('/ddl/dependencies/graphdata')) {
+          return Promise.resolve(mockResponse(200, loadFixture('cds-dependency-graph-758.xml')));
+        }
+        return Promise.resolve(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      });
+      const client = createClient({ safety: strictSafety(['SCARR']) });
+      await expect(client.runTableQuery('DEMO_SUMDIST')).rejects.toMatchObject({
+        sourcePath: ['DEMO_SUMDIST', 'DEMO_CDS_SUDI', 'DEMO_CDS_SUMDIST', 'SCARR'],
+      });
+      expect(mockFetch.mock.calls.filter(([, opts]) => opts.method === 'POST')).toHaveLength(1);
+    });
+
+    it('fails closed for a classic view and does not reach data preview', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        objectSearchResponse('/sap/bc/adt/vit/wb/object_type/viewdv/V_USR_NAME', 'VIEW/DV', 'V_USR_NAME'),
+      );
+      const client = createClient({ safety: strictSafety(['USR02']) });
+      await expect(client.runQuery('SELECT * FROM V_USR_NAME')).rejects.toBeInstanceOf(DataSourcePolicyError);
+      expect(mockFetch.mock.calls.some((call) => String(call[0]).includes('/datapreview/'))).toBe(false);
+    });
+  });
+
+  describe('result-limit clamping (unbounded count DoS guard)', () => {
+    it('clampSearchResults bounds to [1, 1000] and falls back on invalid input', () => {
+      expect(clampSearchResults(50, 100)).toBe(50);
+      expect(clampSearchResults(5000, 100)).toBe(1000); // capped
+      expect(clampSearchResults(12.9, 100)).toBe(12); // floored
+      expect(clampSearchResults(0, 100)).toBe(100); // <1 -> fallback
+      expect(clampSearchResults(-1, 50)).toBe(50);
+      expect(clampSearchResults(Number.NaN, 100)).toBe(100);
+      expect(clampSearchResults(undefined, 50)).toBe(50);
+    });
+
+    it('searchObject clamps an oversized maxResults in the query string', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<empty/>'));
+      const client = createClient();
+      await client.searchObject('Z*', 999_999);
+      expect(String(mockFetch.mock.calls[0]?.[0] ?? '')).toContain('maxResults=1000');
+    });
+
+    it('searchSource clamps an oversized limit into the paging window', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<empty/>'));
+      const client = createClient();
+      await client.searchSource('foo', 999_999);
+      // textsearch has no maxResults parameter — the limit becomes the 1-based paging window.
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('searchFromIndex=1');
+      expect(url).toContain('searchToIndex=1000');
+      expect(url).not.toContain('maxResults=');
+    });
+
+    it('searchSource targets the lowercase textsearch collection', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<empty/>'));
+      const client = createClient();
+      await client.searchSource('foo');
+      // `textSearch` (camelCase) is answered with 404 "No suitable resource found".
+      expect(String(mockFetch.mock.calls[0]?.[0] ?? '')).toContain(
+        '/sap/bc/adt/repository/informationsystem/textsearch?',
+      );
+    });
+
+    it('searchSource sends the short object type the filter matches on', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<empty/>'));
+      const client = createClient();
+      await client.searchSource('foo', 10, 'CLAS/OC', 'ZDEMO_PKG');
+      // The slash form is accepted with HTTP 200 but silently returns zero results.
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('objectType=CLAS');
+      expect(url).not.toContain('CLAS%2FOC');
+      expect(url).toContain('packageName=ZDEMO_PKG');
+    });
+
+    it('maps the live-advertised function group and function module types to distinct filters', async () => {
+      expect(toTextSearchObjectType('FUGR/F')).toBe('FUGR');
+      expect(toTextSearchObjectType('FUGR/FF')).toBe('FUNC');
+
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<empty/>'));
+      const client = createClient();
+      await client.searchSource('foo', 10, 'FUGR/FF');
+      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
+      expect(url).toContain('objectType=FUNC');
+      expect(url).not.toContain('objectType=FUGR');
+    });
+
+    it('getTableContents (TABLE_CONTENTS) clamps rowNumber to <= 10000 and NaN to the default', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.getTableContents('MARA', 999_999);
+      const big = mockFetch.mock.calls.find((c) => String(c[0]).includes('/datapreview/ddic'));
+      expect(String(big?.[0])).toContain('rowNumber=10000');
+
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      await client.getTableContents('MARA', Number.NaN);
+      const nan = mockFetch.mock.calls.find((c) => String(c[0]).includes('/datapreview/ddic'));
+      expect(String(nan?.[0])).toContain('rowNumber=100');
+    });
+
+    it('runQuery clamps rowNumber at the private freestyle sink', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('table-contents.xml'), { 'x-csrf-token': 'T' }));
+      const client = createClient();
+      await client.runQuery('SELECT * FROM T000', 999_999);
+      const postCall = mockFetch.mock.calls.find((c) => String(c[0]).includes('/datapreview/freestyle'));
+      expect(String(postCall?.[0])).toContain('rowNumber=10000');
+    });
+
+    it('routes every known data-preview endpoint through the required-budget sink', () => {
+      const source = readFileSync(new URL('../../../src/adt/client.ts', import.meta.url), 'utf8');
+      const endpointLiterals = source.match(/\/sap\/bc\/adt\/datapreview\/(?:ddic|freestyle)/g) ?? [];
+
+      expect(endpointLiterals).toEqual(['/sap/bc/adt/datapreview/ddic', '/sap/bc/adt/datapreview/freestyle']);
+      expect(source).not.toMatch(/this\.http\.post\([\s\S]{0,160}\/sap\/bc\/adt\/datapreview\//);
+      expect(source).toContain('private async postDataPreview(');
+      expect(source).toContain('budget: DataResponseBudget');
+    });
+  });
+
+  describe('class metadata and structured read', () => {
+    const classMetadataXml = `<?xml version="1.0" encoding="utf-8"?>
+<class:abapClass class:final="true" class:visibility="public" class:category="00" class:sharedMemoryEnabled="false" class:fixPointArithmetic="true"
+    adtcore:responsible="DEVELOPER" adtcore:masterLanguage="EN" adtcore:masterSystem="NPL" adtcore:abapLanguageVersion="standard"
+    adtcore:name="ZCL_EXAMPLE" adtcore:type="CLAS/OC" adtcore:changedAt="2025-03-15T10:30:00Z" adtcore:version="active"
+    adtcore:changedBy="DEVELOPER" adtcore:createdBy="DEVELOPER" adtcore:description="Example test class" adtcore:language="EN"
+    xmlns:class="http://www.sap.com/adt/oo/classes" xmlns:adtcore="http://www.sap.com/adt/core">
+  <atom:link href="source/main" rel="http://www.sap.com/adt/relations/source" type="text/plain" title="Source" xmlns:atom="http://www.w3.org/2005/Atom"/>
+  <adtcore:packageRef adtcore:uri="/sap/bc/adt/packages/%24tmp" adtcore:type="DEVC/K" adtcore:name="$TMP" adtcore:description="Local Objects"/>
+</class:abapClass>`;
+
+    it('getClassMetadata makes GET request without /source/main', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, classMetadataXml));
+      const client = createClient();
+      await client.getClassMetadata('ZCL_EXAMPLE');
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const urlUsed = urls.find((u) => u.includes('ZCL_EXAMPLE'));
+      expect(urlUsed).toContain('/sap/bc/adt/oo/classes/ZCL_EXAMPLE');
+      expect(urlUsed).not.toContain('/source/main');
+    });
+
+    it('getClassMetadata passes through parsed metadata', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, classMetadataXml));
+      const client = createClient();
+      const metadata = await client.getClassMetadata('ZCL_EXAMPLE');
+      expect(metadata.name).toBe('ZCL_EXAMPLE');
+      expect(metadata.description).toBe('Example test class');
+      expect(metadata.language).toBe('EN');
+      expect(metadata.abapLanguageVersion).toBe('standard');
+      expect(metadata.category).toBe('generalObjectType');
+      expect(metadata.fixPointArithmetic).toBe(true);
+      expect(metadata.package).toBe('$TMP');
+    });
+
+    it('getClassMetadata uses default Accept header (wildcard)', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, classMetadataXml));
+      const client = createClient();
+      await client.getClassMetadata('ZCL_EXAMPLE');
+      const callIdx = mockFetch.mock.calls.findIndex((_: any, i: number) => {
+        const url = mockFetch.mock.calls[i]?.[0] as string;
+        return url.includes('ZCL_EXAMPLE') && !url.includes('/source/main');
+      });
+      // Default Accept is */* (set by http.ts) — SAP rejects application/xml with 406
+      expect(fetchHeaders(callIdx).Accept).toBe('*/*');
+    });
+
+    it('getClassStructured fetches metadata + main + all includes', async () => {
+      mockFetch.mockReset();
+      // Each call returns a different response — metadata XML, then source for main + 4 includes
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, classMetadataXml)) // metadata
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS zcl_example DEFINITION.')) // main
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS zcl_example DEFINITION FOR TESTING.')) // testclasses
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS lcl_helper DEFINITION.')) // definitions
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS lcl_helper IMPLEMENTATION.')) // implementations
+        .mockResolvedValueOnce(mockResponse(200, 'DEFINE my_macro.')); // macros
+      const client = createClient();
+      const result = await client.getClassStructured('ZCL_EXAMPLE');
+      expect(result.metadata.name).toBe('ZCL_EXAMPLE');
+      expect(result.main).toBe('CLASS zcl_example DEFINITION.');
+      expect(result.testclasses).toBe('CLASS zcl_example DEFINITION FOR TESTING.');
+      expect(result.definitions).toBe('CLASS lcl_helper DEFINITION.');
+      expect(result.implementations).toBe('CLASS lcl_helper IMPLEMENTATION.');
+      expect(result.macros).toBe('DEFINE my_macro.');
+    });
+
+    it('getClassStructured sets null for 404 includes', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, classMetadataXml)) // metadata
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS zcl_example DEFINITION.')) // main
+        .mockRejectedValueOnce(new AdtApiError('Not found', 404, '/includes/testclasses')) // testclasses 404
+        .mockRejectedValueOnce(new AdtApiError('Not found', 404, '/includes/definitions')) // definitions 404
+        .mockRejectedValueOnce(new AdtApiError('Not found', 404, '/includes/implementations')) // implementations 404
+        .mockRejectedValueOnce(new AdtApiError('Not found', 404, '/includes/macros')); // macros 404
+      const client = createClient();
+      const result = await client.getClassStructured('ZCL_EXAMPLE');
+      expect(result.metadata.name).toBe('ZCL_EXAMPLE');
+      expect(result.main).toBe('CLASS zcl_example DEFINITION.');
+      expect(result.testclasses).toBeNull();
+      expect(result.definitions).toBeNull();
+      expect(result.implementations).toBeNull();
+      expect(result.macros).toBeNull();
+    });
+
+    it('getClassStructured re-throws non-404 errors', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, classMetadataXml)) // metadata
+        .mockResolvedValueOnce(mockResponse(200, 'CLASS zcl_example DEFINITION.')) // main
+        .mockRejectedValueOnce(new AdtApiError('Server error', 500, '/includes/testclasses')) // 500 error
+        .mockResolvedValueOnce(mockResponse(200, '')) // definitions
+        .mockResolvedValueOnce(mockResponse(200, '')) // implementations
+        .mockResolvedValueOnce(mockResponse(200, '')); // macros
+      const client = createClient();
+      await expect(client.getClassStructured('ZCL_EXAMPLE')).rejects.toThrow(AdtApiError);
+    });
+
+    it('getClassStructured makes parallel requests for includes', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, classMetadataXml))
+        .mockResolvedValueOnce(mockResponse(200, 'main source'))
+        .mockResolvedValueOnce(mockResponse(200, 'test source'))
+        .mockResolvedValueOnce(mockResponse(200, 'def source'))
+        .mockResolvedValueOnce(mockResponse(200, 'impl source'))
+        .mockResolvedValueOnce(mockResponse(200, 'macro source'));
+      const client = createClient();
+      await client.getClassStructured('ZCL_EXAMPLE');
+      // All 6 requests should be made (metadata + main + 4 includes)
+      const urls = mockFetch.mock.calls.map((c: any[]) => c[0] as string);
+      const classUrls = urls.filter((u) => u.includes('ZCL_EXAMPLE'));
+      expect(classUrls).toHaveLength(6);
+      // Check include URLs
+      expect(classUrls.some((u) => u.includes('/includes/testclasses'))).toBe(true);
+      expect(classUrls.some((u) => u.includes('/includes/definitions'))).toBe(true);
+      expect(classUrls.some((u) => u.includes('/includes/implementations'))).toBe(true);
+      expect(classUrls.some((u) => u.includes('/includes/macros'))).toBe(true);
+    });
+  });
+
+  describe('BSP / UI5 Filestore operations', () => {
+    const bspAppListXml = `<?xml version="1.0" encoding="UTF-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:title>ZAPP_BOOKING</atom:title>
+    <atom:summary>Manage Bookings</atom:summary>
+  </atom:entry>
+  <atom:entry>
+    <atom:title>ZAPP_TRAVEL</atom:title>
+    <atom:summary>Travel Management</atom:summary>
+  </atom:entry>
+</atom:feed>`;
+
+    const bspFolderXml = `<?xml version="1.0" encoding="UTF-8"?>
+<atom:feed xmlns:atom="http://www.w3.org/2005/Atom">
+  <atom:entry>
+    <atom:category term="file"/>
+    <atom:content xmlns:afr="http://www.sap.com/adt/afr"
+                  afr:etag="20230112203908"
+                  type="application/octet-stream"/>
+    <atom:title>ZAPP_BOOKING/manifest.json</atom:title>
+  </atom:entry>
+  <atom:entry>
+    <atom:category term="folder"/>
+    <atom:content type="application/atom+xml;type=feed"/>
+    <atom:title>ZAPP_BOOKING/i18n</atom:title>
+  </atom:entry>
+</atom:feed>`;
+
+    it('listBspApps returns parsed app list', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspAppListXml));
+      const client = createClient();
+      const apps = await client.listBspApps();
+      expect(apps).toHaveLength(2);
+      expect(apps[0].name).toBe('ZAPP_BOOKING');
+      expect(apps[1].description).toBe('Travel Management');
+    });
+
+    it('listBspApps passes query parameter in URL', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspAppListXml));
+      const client = createClient();
+      await client.listBspApps('ZAPP');
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('name=ZAPP');
+    });
+
+    it('listBspApps passes maxResults parameter', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspAppListXml));
+      const client = createClient();
+      await client.listBspApps(undefined, 10);
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain('maxResults=10');
+    });
+
+    it('getBspAppStructure returns files and folders', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml' }));
+      const client = createClient();
+      const nodes = await client.getBspAppStructure('zapp_booking');
+      expect(nodes).toHaveLength(2);
+      expect(nodes[0].type).toBe('file');
+      expect(nodes[0].name).toBe('manifest.json');
+      expect(nodes[1].type).toBe('folder');
+      expect(nodes[1].name).toBe('i18n');
+    });
+
+    it('getBspAppStructure rejects a file response with the requested ADT path', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'file content', { 'content-type': 'text/plain' }));
+      const client = createClient();
+      await expect(client.getBspAppStructure('zapp_booking', 'manifest.json')).rejects.toMatchObject({
+        statusCode: 400,
+        path: `/sap/bc/adt/filestore/ui5-bsp/objects/${encodeURIComponent('ZAPP_BOOKING/manifest.json')}/content`,
+        message: expect.stringContaining('file, not a folder'),
+      });
+    });
+
+    it('getBspAppStructure URL-encodes the app path with %2f', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml' }));
+      const client = createClient();
+      await client.getBspAppStructure('zapp_booking', '/i18n');
+      const url = mockFetch.mock.calls[0][0] as string;
+      // The path ZAPP_BOOKING/i18n should be encoded as a single segment
+      expect(url).toContain(encodeURIComponent('ZAPP_BOOKING/i18n'));
+      expect(url).toContain('/content');
+    });
+
+    it('getBspFileContent returns raw text body', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '{"sap.app":{"id":"zapp.booking"}}'));
+      const client = createClient();
+      const content = await client.getBspFileContent('zapp_booking', 'manifest.json');
+      expect(content).toContain('sap.app');
+    });
+
+    it('getBspFileContent rejects a folder response with the requested ADT path', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml' }));
+      const client = createClient();
+      await expect(client.getBspFileContent('zapp_booking', 'i18n')).rejects.toMatchObject({
+        statusCode: 400,
+        path: `/sap/bc/adt/filestore/ui5-bsp/objects/${encodeURIComponent('ZAPP_BOOKING/i18n')}/content`,
+        message: expect.stringContaining('folder, not a file'),
+      });
+    });
+
+    it('getBspFileContent URL-encodes appName/filePath as single segment', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'file content'));
+      const client = createClient();
+      await client.getBspFileContent('ZAPP_BOOKING', 'view/Main.view.xml');
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain(encodeURIComponent('ZAPP_BOOKING/view/Main.view.xml'));
+    });
+
+    it('getBspAppStructure normalizes subPath without leading slash', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml' }));
+      const client = createClient();
+      await client.getBspAppStructure('zapp_booking', 'i18n');
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain(encodeURIComponent('ZAPP_BOOKING/i18n'));
+    });
+
+    it('getBspFileContent strips leading slash from filePath', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'file content'));
+      const client = createClient();
+      await client.getBspFileContent('ZAPP_BOOKING', '/manifest.json');
+      const url = mockFetch.mock.calls[0][0] as string;
+      expect(url).toContain(encodeURIComponent('ZAPP_BOOKING/manifest.json'));
+      // Verify no double-slash in the path portion (after the protocol)
+      const pathPortion = url.replace('http://', '');
+      expect(pathPortion).not.toContain('//');
+    });
+
+    it('legacy BSP structure reads preserve a mixed-case path appended to the app name', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml;type=feed' }),
+      );
+      const client = createClient();
+      await client.getBspAppStructure('zapp_booking/WebContent');
+      expect(String(mockFetch.mock.calls[0]?.[0])).toContain(encodeURIComponent('ZAPP_BOOKING/WebContent'));
+    });
+
+    it('getBspPathContent identifies folders from the response media type', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, bspFolderXml, { 'content-type': 'application/atom+xml;type=feed' }),
+      );
+      const client = createClient();
+      const result = await client.getBspPathContent('zapp_booking', '/WebContent');
+      expect(result.kind).toBe('folder');
+      if (result.kind === 'folder') expect(result.nodes).toHaveLength(2);
+      expect(String(mockFetch.mock.calls[0]?.[0])).toContain(encodeURIComponent('ZAPP_BOOKING/WebContent'));
+    });
+
+    it('getBspPathContent identifies extensionless files from the response media type', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, 'license text', { 'content-type': 'text/plain' }));
+      const client = createClient();
+      const result = await client.getBspPathContent('zapp_booking', 'LICENSE');
+      expect(result).toEqual({ kind: 'file', content: 'license text' });
+    });
+
+    it('listBspApps returns empty array for empty feed', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(200, '<?xml version="1.0"?><atom:feed xmlns:atom="http://www.w3.org/2005/Atom"></atom:feed>'),
+      );
+      const client = createClient();
+      const apps = await client.listBspApps();
+      expect(apps).toEqual([]);
+    });
+  });
+
+  describe('resolveObjectPackage', () => {
+    it('extracts package name from ADT metadata XML', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<class:abapClass xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZCL_TEST"><adtcore:packageRef adtcore:uri="/sap/bc/adt/packages/%24tmp" adtcore:type="DEVC/K" adtcore:name="$TMP" adtcore:description="Local Objects"/></class:abapClass>',
+        ),
+      );
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage('/sap/bc/adt/oo/classes/ZCL_TEST');
+      expect(pkg).toBe('$TMP');
+    });
+
+    it('returns empty string when no packageRef in response', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, '<some:element/>'));
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage('/sap/bc/adt/programs/programs/ZTEST');
+      expect(pkg).toBe('');
+    });
+
+    it('extracts package from minimal packageRef element', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<prog:program xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:packageRef adtcore:name="ZPACKAGE"/></prog:program>',
+        ),
+      );
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage('/sap/bc/adt/programs/programs/ZTEST');
+      expect(pkg).toBe('ZPACKAGE');
+    });
+
+    it('falls back to adtcore:containerRef@packageName for FUNC (no own packageRef)', async () => {
+      // Live shape captured from a4h: FUNC metadata exposes the package only
+      // via the containerRef's denormalised packageName attribute. Pre-existing
+      // regex would miss it → P2 fail-closed fires for every FUNC update.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<fmodule:abapFunctionModule xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="SCMS_STRING_TO_XSTRING">' +
+            '<adtcore:containerRef adtcore:uri="/sap/bc/adt/functions/groups/scms_conv" adtcore:type="FUGR/F" adtcore:name="SCMS_CONV" adtcore:packageName="SCMS"/>' +
+            '</fmodule:abapFunctionModule>',
+        ),
+      );
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage(
+        '/sap/bc/adt/functions/groups/scms_conv/fmodules/scms_string_to_xstring',
+      );
+      expect(pkg).toBe('SCMS');
+    });
+
+    it('prefers packageRef over containerRef when both are present', async () => {
+      // Defensive: if SAP ever returns both, packageRef is the authoritative source.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<obj xmlns:adtcore="http://www.sap.com/adt/core">' +
+            '<adtcore:packageRef adtcore:name="REAL_PACKAGE"/>' +
+            '<adtcore:containerRef adtcore:packageName="WRONG_PACKAGE"/>' +
+            '</obj>',
+        ),
+      );
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage('/sap/bc/adt/anything');
+      expect(pkg).toBe('REAL_PACKAGE');
+    });
+
+    it('forwards an explicit Accept (server-driven blues metadata) and parses its packageRef', async () => {
+      // Server-driven objects (8.16+) only render <blue:blueSource> (with the packageRef) under the
+      // blues.vN+xml Accept — resolveObjectPackage threads it so the allowedPackages ceiling resolves
+      // the real package of an SDO on update/delete/activate.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<blue:blueSource xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZSDO" adtcore:type="DESD/TYP">' +
+            '<adtcore:packageRef adtcore:name="ZSDO_PKG"/></blue:blueSource>',
+        ),
+      );
+      const client = createClient();
+      const accept = 'application/vnd.sap.adt.blues.v1+xml';
+      const pkg = await client.resolveObjectPackage('/sap/bc/adt/ddic/desd/ZSDO', accept);
+      expect(pkg).toBe('ZSDO_PKG');
+      expect(fetchHeaders(0).Accept).toBe(accept);
+    });
+
+    it('does not force the blues Accept when no accept is supplied', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<obj xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:packageRef adtcore:name="P"/></obj>',
+        ),
+      );
+      const client = createClient();
+      await client.resolveObjectPackage('/sap/bc/adt/oo/classes/ZCL_X');
+      expect(fetchHeaders(0).Accept ?? '').not.toContain('blues');
+    });
+
+    it('strips media-type parameters from a caller-supplied Accept', async () => {
+      // On-prem backends (758 + 816, live-verified on the SRVB bindings resource) reject an
+      // Accept carrying "; charset=utf-8" with 406 SADT_RESOURCE 037 — and that body names no
+      // accepted type, so the negotiation retry cannot recover. The choke point sends the bare
+      // media type regardless of what the caller passes.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<srvb:serviceBinding xmlns:adtcore="http://www.sap.com/adt/core">' +
+            '<adtcore:packageRef adtcore:name="Z_GATED"/></srvb:serviceBinding>',
+        ),
+      );
+      const client = createClient();
+      const pkg = await client.resolveObjectPackage(
+        '/sap/bc/adt/businessservices/bindings/ZSB_X',
+        'application/vnd.sap.adt.businessservices.servicebinding.v2+xml; charset=utf-8',
+      );
+      expect(pkg).toBe('Z_GATED');
+      expect(fetchHeaders(0).Accept).toBe('application/vnd.sap.adt.businessservices.servicebinding.v2+xml');
+    });
+  });
+
+  describe('getInactiveObjects', () => {
+    it('returns parsed inactive objects from ADT response', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          `<?xml version="1.0"?>
+          <ioc:inactiveObjects xmlns:ioc="http://www.sap.com/abapxml/inactiveCtsObjects" xmlns:adtcore="http://www.sap.com/adt/core">
+            <ioc:entry>
+              <ioc:object ioc:user="MARIAN" ioc:deleted="false">
+                <ioc:ref adtcore:uri="/sap/bc/adt/oo/classes/zcl_test" adtcore:type="CLAS/OC" adtcore:name="ZCL_TEST" adtcore:description="Test class"/>
+              </ioc:object>
+              <ioc:transport ioc:linked="true">
+                <ioc:ref adtcore:uri="/sap/bc/adt/cts/transportrequests/A4HK901087" adtcore:type="/RQ" adtcore:name="A4HK901087"/>
+              </ioc:transport>
+            </ioc:entry>
+          </ioc:inactiveObjects>`,
+        ),
+      );
+      const client = createClient();
+      const objects = await client.getInactiveObjects();
+      const url = mockFetch.mock.calls[0]?.[0] as string;
+      expect(url).toContain('/sap/bc/adt/activation/inactiveobjects');
+      expect(fetchHeaders(0).Accept).toContain('application/vnd.sap.adt.inactivectsobjects.v1+xml');
+      expect(objects).toHaveLength(1);
+      expect(objects[0]).toEqual({
+        name: 'ZCL_TEST',
+        type: 'CLAS/OC',
+        uri: '/sap/bc/adt/oo/classes/zcl_test',
+        description: 'Test class',
+        user: 'MARIAN',
+        deleted: false,
+        transport: 'A4HK901087',
+      });
+    });
+  });
+});

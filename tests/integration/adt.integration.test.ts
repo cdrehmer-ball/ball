@@ -1,0 +1,3091 @@
+/**
+ * Integration tests for ARC-1 ADT client.
+ *
+ * These tests run against a live SAP system.
+ * Missing credentials are treated as setup errors and fail the suite.
+ *
+ * Run: npm run test:integration
+ */
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { classifyCdsImpact } from '../../src/adt/cds-impact.js';
+import type { AdtClient } from '../../src/adt/client.js';
+import { findWhereUsed } from '../../src/adt/codeintel.js';
+import {
+  getAtcSystemDefaultVariant,
+  getCdsTestCases,
+  runAtcCheck,
+  supportsCdsTestCases,
+} from '../../src/adt/devtools.js';
+import {
+  getDump,
+  getGatewayErrorDetail,
+  listDumps,
+  listGatewayErrors,
+  listSystemMessages,
+  listTraces,
+} from '../../src/adt/diagnostics.js';
+import { fetchDiscoveryDocument, resolveAcceptType } from '../../src/adt/discovery.js';
+import { AdtApiError } from '../../src/adt/errors.js';
+import {
+  createCatalog,
+  deleteCatalog,
+  FLP_SERVICE_PATH,
+  listCatalogs,
+  listGroups,
+  listTiles,
+} from '../../src/adt/flp.js';
+import {
+  applyRapHandlerSignatures,
+  extractRapHandlerRequirements,
+  findMissingRapHandlerRequirements,
+} from '../../src/adt/rap-handlers.js';
+import { unrestrictedSafetyConfig } from '../../src/adt/safety.js';
+import { getServerDrivenObject, supportsServerDrivenObject } from '../../src/adt/server-driven.js';
+import { expectSapFailureClass } from '../helpers/expected-error.js';
+import { requireOrSkip, SkipReason, skipTest } from '../helpers/skip-policy.js';
+import { getTestClient, requireSapCredentials } from './helpers.js';
+
+describe('ADT Integration Tests', () => {
+  let client: AdtClient;
+  let hasFlightAmdp = false;
+  let hasDmoDdlx = false;
+  let hasDmoSrvb = false;
+
+  beforeAll(async () => {
+    requireSapCredentials();
+    client = getTestClient();
+    // Probe SAP demo fixture availability once — /DMO/* and I_ABAPPACKAGE are
+    // shipped on S/4 boxes only; plain NetWeaver systems won't have them.
+    try {
+      await client.getClass('/DMO/CL_FLIGHT_AMDP');
+      hasFlightAmdp = true;
+    } catch {
+      hasFlightAmdp = false;
+    }
+    try {
+      await client.getDdlx('/DMO/C_AGENCYTP');
+      hasDmoDdlx = true;
+    } catch {
+      hasDmoDdlx = false;
+    }
+    try {
+      await client.getSrvb('/DMO/UI_AGENCY_O4');
+      hasDmoSrvb = true;
+    } catch {
+      hasDmoSrvb = false;
+    }
+  });
+
+  function requireFlightAmdp(ctx: import('vitest').TestContext): void {
+    if (!hasFlightAmdp) {
+      requireOrSkip(ctx, undefined, `${SkipReason.NO_FIXTURE} (/DMO/CL_FLIGHT_AMDP) — S/4 AMDP demo`);
+    }
+  }
+  function requireDmoDdlx(ctx: import('vitest').TestContext): void {
+    if (!hasDmoDdlx) {
+      requireOrSkip(ctx, undefined, `${SkipReason.NO_FIXTURE} (/DMO/ DDLX) — S/4 metadata extensions`);
+    }
+  }
+  function requireDmoSrvb(ctx: import('vitest').TestContext): void {
+    if (!hasDmoSrvb) {
+      requireOrSkip(ctx, undefined, `${SkipReason.NO_FIXTURE} (/DMO/ SRVB) — S/4 service bindings`);
+    }
+  }
+
+  // ─── System Information ─────────────────────────────────────────
+
+  describe('system info', () => {
+    it('gets structured system info with user', async () => {
+      const info = await client.getSystemInfo();
+      expect(info).toBeTruthy();
+      // Response is structured JSON
+      const parsed = JSON.parse(info);
+      expect(parsed.user).toBeTruthy();
+      expect(Array.isArray(parsed.collections)).toBe(true);
+      // Collections may be empty on minimal SAP systems — that's OK
+    });
+
+    it('gets installed components', async () => {
+      const components = await client.getInstalledComponents();
+      expect(components.length).toBeGreaterThan(0);
+      const basis = components.find((c) => c.name === 'SAP_BASIS');
+      expect(basis).toBeDefined();
+      expect(basis?.release).toBeTruthy();
+    });
+
+    it('installed components have valid structure', async () => {
+      const components = await client.getInstalledComponents();
+      for (const comp of components) {
+        expect(comp.name).toBeTruthy();
+        expect(comp.release).toBeTruthy();
+        // description may be empty for some components
+        expect(typeof comp.description).toBe('string');
+      }
+    });
+  });
+
+  describe('BSP filestore', () => {
+    it('classifies a BSP root from SAP response media type', async (ctx) => {
+      let apps: Awaited<ReturnType<AdtClient['listBspApps']>> | undefined;
+      try {
+        apps = await client.listBspApps(undefined, 1);
+      } catch (error) {
+        if (error instanceof AdtApiError && (error.statusCode === 403 || error.statusCode === 404)) {
+          requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED}: BSP filestore unavailable`);
+        }
+        throw error;
+      }
+      const app = apps?.[0];
+      requireOrSkip(ctx, app, `${SkipReason.NO_FIXTURE}: no BSP application available`);
+      const content = await client.getBspPathContent(app.name);
+      expect(content.kind).toBe('folder');
+      if (content.kind === 'folder') expect(Array.isArray(content.nodes)).toBe(true);
+    });
+  });
+
+  // ─── ADT Discovery (MIME Negotiation) ─────────────────────────
+
+  describe('discovery MIME negotiation', () => {
+    it('fetches discovery map with key ADT endpoints and MIME types', async (ctx) => {
+      const { map: discoveryMap } = await fetchDiscoveryDocument(client.http);
+      const nonEmptyMap = discoveryMap.size > 0 ? discoveryMap : undefined;
+      requireOrSkip(ctx, nonEmptyMap, SkipReason.BACKEND_UNSUPPORTED);
+
+      expect(nonEmptyMap.has('/sap/bc/adt/oo/classes')).toBe(true);
+      expect(nonEmptyMap.has('/sap/bc/adt/programs/programs')).toBe(true);
+
+      const classesTypes = nonEmptyMap.get('/sap/bc/adt/oo/classes') ?? [];
+      expect(classesTypes.length).toBeGreaterThan(0);
+      expect(classesTypes[0]).toMatch(/^application\/vnd\.sap\.adt\./);
+    });
+
+    it('resolveAcceptType returns sensible MIME type for known endpoints', async (ctx) => {
+      const { map: discoveryMap } = await fetchDiscoveryDocument(client.http);
+      const nonEmptyMap = discoveryMap.size > 0 ? discoveryMap : undefined;
+      requireOrSkip(ctx, nonEmptyMap, SkipReason.BACKEND_UNSUPPORTED);
+
+      // Shallow match: object-level metadata paths resolve to discovered MIME types
+      const classes = resolveAcceptType(nonEmptyMap, '/sap/bc/adt/oo/classes/CL_ABAP_CHAR_UTILITIES');
+      const programs = resolveAcceptType(nonEmptyMap, '/sap/bc/adt/programs/programs/RSHOWTIM');
+      const ddls = resolveAcceptType(nonEmptyMap, '/sap/bc/adt/ddic/ddl/sources/ZI_TRAVEL');
+      const transports = resolveAcceptType(nonEmptyMap, '/sap/bc/adt/cts/transportrequests?user=DEVELOPER');
+
+      // Deep sub-resource paths (source/main) should NOT resolve — different Accept needed
+      const classSource = resolveAcceptType(nonEmptyMap, '/sap/bc/adt/oo/classes/CL_ABAP_CHAR_UTILITIES/source/main');
+      expect(classSource).toBeUndefined();
+
+      expect(classes).toBeTruthy();
+      expect(programs).toBeTruthy();
+      expect(classes).toMatch(/^application\/vnd\.sap\.adt\./);
+      expect(programs).toMatch(/^application\/vnd\.sap\.adt\./);
+
+      // DDL/transports may be missing depending on backend release/authorizations.
+      if (ddls) {
+        expect(ddls).toMatch(/^application\/vnd\.sap\.adt\./);
+      }
+      if (transports) {
+        expect(transports).toMatch(/^application\/vnd\.sap\.adt\./);
+      }
+    });
+  });
+
+  // ─── FLP (PAGE_BUILDER_CUST) ────────────────────────────────────
+
+  describe('FLP (PAGE_BUILDER_CUST)', () => {
+    let serviceAvailable: true | undefined;
+
+    beforeAll(async () => {
+      try {
+        await client.http.get(`${FLP_SERVICE_PATH}/`, { Accept: 'application/json' });
+        serviceAvailable = true;
+      } catch (err) {
+        if (err instanceof AdtApiError && err.statusCode === 404) {
+          serviceAvailable = undefined;
+          return;
+        }
+        throw err;
+      }
+    });
+
+    it('probes FLP service availability', async (ctx) => {
+      requireOrSkip(ctx, serviceAvailable, SkipReason.BACKEND_UNSUPPORTED);
+      expect(serviceAvailable).toBe(true);
+    });
+
+    it('lists catalogs', async (ctx) => {
+      requireOrSkip(ctx, serviceAvailable, SkipReason.BACKEND_UNSUPPORTED);
+      const catalogs = await listCatalogs(client.http, unrestrictedSafetyConfig());
+      expect(Array.isArray(catalogs)).toBe(true);
+      expect(catalogs.length).toBeGreaterThan(0);
+      expect(catalogs.some((c) => c.id.length > 0 && c.domainId.length > 0)).toBe(true);
+    }, 60000);
+
+    it('lists groups', async (ctx) => {
+      requireOrSkip(ctx, serviceAvailable, SkipReason.BACKEND_UNSUPPORTED);
+      const groups = await listGroups(client.http, unrestrictedSafetyConfig());
+      expect(Array.isArray(groups)).toBe(true);
+      for (const group of groups) {
+        expect(group.catalogId).toBe('/UI2/FLPD_CATALOG');
+      }
+    }, 60000);
+
+    it('lists every tile of a catalog without dumping the backend', async (ctx) => {
+      requireOrSkip(ctx, serviceAvailable, SkipReason.BACKEND_UNSUPPORTED);
+      const catalogs = await listCatalogs(client.http, unrestrictedSafetyConfig());
+      // Prefer a catalog that actually has tiles so the count assertion has teeth.
+      const populated = catalogs.find((c) => c.id.startsWith('X-SAP-UI2-CATALOGPAGE:') && Number(c.chipCount) > 0);
+      requireOrSkip(ctx, populated, SkipReason.NO_FIXTURE);
+
+      // Full ID on purpose — verifies prefix normalization AND key encoding.
+      // No dump-tolerant catch here: a 500 means ARC-1 sent a $filter to
+      // PageChipInstances again (/UI2/CL_EDM_DA_V06_USAGE asserts), and this
+      // test exists to fail loudly if it does.
+      const tiles = await listTiles(client.http, unrestrictedSafetyConfig(), populated.id);
+      expect(tiles.length).toBe(Number(populated.chipCount));
+    }, 60000);
+
+    it('CRUD lifecycle — create and delete catalog', async (ctx) => {
+      requireOrSkip(ctx, serviceAvailable, SkipReason.BACKEND_UNSUPPORTED);
+      const domainId = `ZARC1_INTTEST_${Date.now().toString(36).toUpperCase()}`.slice(0, 30);
+      let createdCatalogId: string | undefined;
+
+      try {
+        const created = await createCatalog(
+          client.http,
+          unrestrictedSafetyConfig(),
+          domainId,
+          'ARC1 Integration Catalog',
+        );
+        createdCatalogId = created.id;
+        expect(created.id.startsWith('X-SAP-UI2-CATALOGPAGE:')).toBe(true);
+      } finally {
+        if (createdCatalogId) {
+          await deleteCatalog(client.http, unrestrictedSafetyConfig(), createdCatalogId);
+        }
+      }
+    }, 120000);
+  });
+
+  // ─── Search ─────────────────────────────────────────────────────
+
+  describe('search', () => {
+    it('searches for objects by pattern', async () => {
+      const results = await client.searchObject('CL_ABAP_*', 10);
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0]?.objectName).toMatch(/^CL_ABAP_/);
+    });
+
+    it('returns empty results for non-existent pattern', async () => {
+      const results = await client.searchObject('ZZZNONEXISTENT999*', 10);
+      expect(results).toHaveLength(0);
+    });
+
+    it('respects maxResults limit', async () => {
+      const results = await client.searchObject('CL_*', 3);
+      expect(results.length).toBeLessThanOrEqual(3);
+    });
+
+    it('returns correct object structure', async () => {
+      const results = await client.searchObject('CL_ABAP_CHAR*', 5);
+      expect(results.length).toBeGreaterThan(0);
+      const first = results[0]!;
+      expect(first.objectName).toBeTruthy();
+      expect(first.objectType).toBeTruthy();
+      expect(first.uri).toBeTruthy();
+    });
+
+    it('finds programs by pattern', async (ctx) => {
+      const results = await client.searchObject('RSHOWTIM*', 5);
+      // RSHOWTIM is not on every SAP release — skip if it isn't indexed here.
+      const match = results.find((r) => r.objectName === 'RSHOWTIM');
+      requireOrSkip(ctx, match, `${SkipReason.NO_FIXTURE} (RSHOWTIM) — not on this system`);
+      expect(results.length).toBeGreaterThan(0);
+      expect(match).toBeDefined();
+    });
+  });
+
+  // ─── Package Listing (search-endpoint based) ────────────────────
+  //
+  // Regression coverage for the description-misalignment fix: pre-fix,
+  // SAPRead(type=DEVC) returned descriptions attributed to wrong objects
+  // (verified server-side bug in /repository/nodestructure?withShortDescriptions=true).
+  // The fix routes getPackageContents through informationsystem/search,
+  // which returns descriptions correctly aligned to names.
+  //
+  // Depends on the demo package ZDEMO_MIG existing on the test system
+  // (created by the SEGW->RAP migration demo). If the package isn't there,
+  // the test skips cleanly. See `demo/setup/` in the related demo workspace
+  // for how to create it.
+  describe('getPackageContents (search-endpoint based)', () => {
+    async function getPackageContentsFixtureOrSkip(
+      ctx: import('vitest').TestContext,
+      packageName: string,
+      maxResults?: number,
+    ) {
+      try {
+        return await client.getPackageContents(packageName, maxResults);
+      } catch (err) {
+        if (err instanceof AdtApiError && err.statusCode === 400 && /Package is invalid/i.test(err.message)) {
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.NO_FIXTURE} (${packageName}) — demo package not on this SAP system; see SEGW->RAP demo setup`,
+          );
+          return [];
+        }
+        throw err;
+      }
+    }
+
+    it('returns objects with descriptions correctly aligned to names', async (ctx) => {
+      const contents = await getPackageContentsFixtureOrSkip(ctx, 'ZDEMO_MIG');
+      const proj = contents.find((c) => c.name === 'ZDM_PROJECT');
+      requireOrSkip(
+        ctx,
+        proj,
+        `${SkipReason.NO_FIXTURE} (ZDEMO_MIG.ZDM_PROJECT) — demo package not on test system; see SEGW->RAP demo setup`,
+      );
+      // Anchor 1: DDIC table description (we set it during demo creation).
+      expect(proj.description).toBe('Demo: Project (legacy SEGW era)');
+      expect(proj.type).toBe('TABL/DT');
+      expect(proj.uri).toContain('/sap/bc/adt/ddic/tables/zdm_project');
+    });
+
+    it('aligns sub-package description with the sub-package name (the original bug)', async (ctx) => {
+      const contents = await getPackageContentsFixtureOrSkip(ctx, 'ZDEMO_MIG');
+      const sub = contents.find((c) => c.name === 'ZDEMO_MIG_RAP');
+      requireOrSkip(ctx, sub, `${SkipReason.NO_FIXTURE} (ZDEMO_MIG_RAP sub-package) — demo workspace not fully set up`);
+      expect(sub.type).toBe('DEVC/K');
+      // The sub-package's OWN description must be on its OWN row — pre-fix,
+      // this string showed up on a CLAS row instead.
+      expect(sub.description).toBe('Demo: RAP migration outputs from migrate-segw-to-rap skill');
+    });
+
+    it('aligns SEGW-generated CLAS descriptions with their own names', async (ctx) => {
+      const contents = await getPackageContentsFixtureOrSkip(ctx, 'ZDEMO_MIG');
+      const dpc = contents.find((c) => c.name === 'ZCL_ZDEMO_MIG_PROJECTS_DPC');
+      requireOrSkip(
+        ctx,
+        dpc,
+        `${SkipReason.NO_FIXTURE} (ZCL_ZDEMO_MIG_PROJECTS_DPC) — SEGW project not built on test system`,
+      );
+      // SEGW's auto-generated description for the base DPC class.
+      // Pre-fix this row received the sub-package's description — that bug must stay dead.
+      expect(dpc.description).toBe('Data Provider Base Class');
+      expect(dpc.type).toBe('CLAS/OC');
+    });
+
+    it('returns an empty array for an existing but empty package', async (ctx) => {
+      // ZDEMO_MIG_RAP is the migration target package — empty until skill output lands.
+      // Skip if it isn't there (separate fixture from ZDEMO_MIG itself).
+      const contents = await getPackageContentsFixtureOrSkip(ctx, 'ZDEMO_MIG_RAP');
+      // The package itself may show up as a parent reference, plus there might be 0 contained objects.
+      // Either way, the response must be a typed array with zero or one entries — never an exception.
+      expect(Array.isArray(contents)).toBe(true);
+      // If the package isn't on the system at all, we'd hit the 400 error path tested below; tolerate that.
+      requireOrSkip(
+        ctx,
+        contents.length <= 1 ? true : null,
+        `${SkipReason.NO_FIXTURE} (ZDEMO_MIG_RAP empty) — package has ${contents.length} children, expected 0 or 1`,
+      );
+    });
+
+    it('throws AdtApiError 400 for a non-existent package name', async () => {
+      // The search endpoint validates package names server-side: invalid → 400.
+      // This is the documented behaviour we propagate to callers (don't silently swallow).
+      await expect(client.getPackageContents('ZNONEXISTENT_PKG_99X')).rejects.toThrow(AdtApiError);
+    });
+
+    it('honors maxResults parameter', async (ctx) => {
+      // ZDEMO_MIG has roughly 17 objects via the search endpoint.
+      // Asking for 3 must cap at 3.
+      const contents = await getPackageContentsFixtureOrSkip(ctx, 'ZDEMO_MIG', 3);
+      requireOrSkip(
+        ctx,
+        contents.length > 0 ? contents : null,
+        `${SkipReason.NO_FIXTURE} (ZDEMO_MIG) — demo package not on test system`,
+      );
+      expect(contents.length).toBeLessThanOrEqual(3);
+    });
+  });
+
+  // ─── getSubpackages (repository/nodestructure) ────────────────────
+  //
+  // Direct-child enumeration of a DEVCLASS. Backs `allowedPackages`
+  // subtree rules (`ZFOO/**`). The PREVIOUS implementation used
+  // `informationsystem/search?packageName=X&objectType=DEVC/K`, which
+  // live S/4HANA 2023 silently ignores the `packageName` filter on —
+  // returning ~1000 unrelated packages instead of children. The fix
+  // uses `POST /sap/bc/adt/repository/nodestructure`, which matches
+  // `SELECT devclass FROM tdevc WHERE parentcl = ?` exactly. These
+  // tests are the missing safety net that would have caught the bug.
+  describe('getSubpackages (repository/nodestructure)', () => {
+    it('returns the exact 5 known DEVC/K children of SABP_UNIT', async () => {
+      // SABP_UNIT is the ABAP unit-test framework root package — present
+      // on every SAP_BASIS 7.5+ system the project supports, with five
+      // stable direct children. If your test landscape has additions,
+      // the assertion uses `arrayContaining` so it tolerates a superset.
+      const subs = await client.getSubpackages('SABP_UNIT');
+      expect(subs).toEqual(
+        expect.arrayContaining([
+          'SABP_UNIT_CORE',
+          'SABP_UNIT_EXECUTION_API',
+          'SABP_UNIT_GUI',
+          'SABP_UNIT_SCRATCH',
+          'SABP_UNIT_SHARED',
+        ]),
+      );
+      // Every entry must be uppercase and not contain the parent itself.
+      expect(subs.every((n) => n === n.toUpperCase())).toBe(true);
+      expect(subs).not.toContain('SABP_UNIT');
+    });
+
+    it('returns a non-empty array for SABP_UNIT_CORE (one level deeper)', async () => {
+      // Proves BFS continuation: SABP_UNIT_CORE has its own children.
+      // We don't pin the exact set — newer SAP_BASIS releases may add
+      // more — but the array must be non-empty and uppercased.
+      const subs = await client.getSubpackages('SABP_UNIT_CORE');
+      expect(subs.length).toBeGreaterThan(0);
+      expect(subs.every((n) => n === n.toUpperCase() && n.length > 0)).toBe(true);
+      expect(new Set(subs).size).toBe(subs.length); // no duplicates
+    });
+
+    it('returns [] for a non-existent parent (not an error — SAP responds 200 with empty body)', async () => {
+      // Regression guard: the broken endpoint used to return ~1000
+      // unrelated packages for ANY query. nodestructure correctly
+      // returns an empty response when the parent does not exist.
+      const subs = await client.getSubpackages('ZNO_SUCH_PKG_99X');
+      expect(subs).toEqual([]);
+    });
+
+    it('handles namespace packages with proper URL encoding', async (ctx) => {
+      // `/AIF/MAIN` is a SAP-shipped namespace package with ~50 children
+      // on S/4HANA 2023. Verifies that the `%2FAIF%2FMAIN` URL encoding
+      // survives the round-trip and the response parses correctly.
+      const subs = await client.getSubpackages('/AIF/MAIN');
+      // The namespace package may not exist on every test system
+      // (e.g. AIF is not always installed on NW 7.5 trials). Use a visible
+      // skip rather than a silent pass so missing coverage is auditable.
+      requireOrSkip(
+        ctx,
+        subs.length > 0 ? subs : null,
+        `${SkipReason.NO_FIXTURE} (/AIF/MAIN) — namespace package not on this system`,
+      );
+      // Every child name should also be namespace-prefixed.
+      expect(subs.every((n) => n.startsWith('/AIF/'))).toBe(true);
+    });
+  });
+
+  // ─── Read Operations ────────────────────────────────────────────
+
+  describe('read operations', () => {
+    it('reads a standard SAP program', async () => {
+      // RSHOWTIM is a standard SAP report available on most systems
+      const { source } = await client.getProgram('RSHOWTIM');
+      expect(source).toBeTruthy();
+      // Standard SAP programs start with a comment header
+      expect(source.length).toBeGreaterThan(10);
+    });
+
+    it('reads a standard SAP class', async () => {
+      const { source } = await client.getClass('CL_ABAP_CHAR_UTILITIES');
+      expect(source).toBeTruthy();
+      expect(source.length).toBeGreaterThan(0);
+    });
+
+    it('reads table contents', async (ctx) => {
+      let result: Awaited<ReturnType<typeof client.getTableContents>>;
+      try {
+        result = await client.getTableContents('T000', 5);
+      } catch (err) {
+        // /datapreview/ddic was not yet active on NW 7.50 (added in a later SP).
+        expectSapFailureClass(err, [404], [/No suitable resource/i, /not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: /datapreview/ddic endpoint not available on this release`,
+        );
+        return;
+      }
+      expect(result.columns).toContain('MANDT');
+      expect(result.rows.length).toBeGreaterThan(0);
+      // Each row should have all columns
+      for (const row of result.rows) {
+        for (const col of result.columns) {
+          expect(col in row).toBe(true);
+        }
+      }
+    });
+
+    it('reads table contents with row limit', async (ctx) => {
+      let result: Awaited<ReturnType<typeof client.getTableContents>>;
+      try {
+        result = await client.getTableContents('T000', 1);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/No suitable resource/i, /not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: /datapreview/ddic endpoint not available on this release`,
+        );
+        return;
+      }
+      expect(result.rows.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('returns 404 for non-existent program', async () => {
+      await expect(client.getProgram('ZZZNOTEXIST999')).rejects.toThrow();
+    });
+  });
+
+  describe('Version history (VERSIONS / VERSION_SOURCE)', () => {
+    it('lists revisions for PROG ZARC1_TEST_REPORT', async (ctx) => {
+      try {
+        const result = await client.getRevisions('PROG', 'ZARC1_TEST_REPORT');
+        const hasRevisions = result.revisions.length > 0 ? result : undefined;
+        requireOrSkip(ctx, hasRevisions, 'Persistent fixture ZARC1_TEST_REPORT has no revisions on this system');
+        expect(result.object.name).toBe('ZARC1_TEST_REPORT');
+        for (const revision of result.revisions) {
+          expect(revision.uri.startsWith('/sap/bc/adt/')).toBe(true);
+        }
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(ctx, undefined, 'Persistent fixture ZARC1_TEST_REPORT is missing on this system');
+      }
+    });
+
+    it('lists revisions for CLAS ZCL_ARC1_TEST include=main', async (ctx) => {
+      try {
+        const result = await client.getRevisions('CLAS', 'ZCL_ARC1_TEST', { include: 'main' });
+        const first = result.revisions[0];
+        requireOrSkip(ctx, first, 'No CLAS revisions available for ZCL_ARC1_TEST include=main');
+        // Release-specific URI shape:
+        //   newer: .../includes/main/versions/<id>
+        //   older: .../source/main  (NW 7.50 — no /versions/ segment)
+        // Both are valid ADT paths — assert the anchor that's invariant.
+        expect(first.uri.startsWith('/sap/bc/adt/oo/classes/ZCL_ARC1_TEST')).toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(ctx, undefined, 'Persistent fixture ZCL_ARC1_TEST is missing on this system');
+      }
+    });
+
+    it('lists revisions for CLAS ZCL_ARC1_TEST include=definitions', async (ctx) => {
+      try {
+        const result = await client.getRevisions('CLAS', 'ZCL_ARC1_TEST', { include: 'definitions' });
+        const first = result.revisions[0];
+        requireOrSkip(ctx, first, 'No CLAS definition revisions available for ZCL_ARC1_TEST');
+        // Older releases return just the class-level URI; newer ones drill into /includes/definitions/versions/.
+        expect(first.uri.startsWith('/sap/bc/adt/oo/classes/ZCL_ARC1_TEST')).toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: CLAS include=definitions revision endpoint unavailable or fixture has no definitions include`,
+        );
+      }
+    });
+
+    it('lists revisions for INTF ZIF_ARC1_TEST (source/main endpoint)', async (ctx) => {
+      try {
+        const result = await client.getRevisions('INTF', 'ZIF_ARC1_TEST');
+        const first = result.revisions[0];
+        requireOrSkip(ctx, first, 'No INTF revisions available for ZIF_ARC1_TEST');
+        // URI shape varies by release — /source/main (7.50) vs /source/main/versions/<id> (newer).
+        expect(first.uri).toContain('/oo/interfaces/ZIF_ARC1_TEST');
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(ctx, undefined, 'Persistent fixture ZIF_ARC1_TEST is missing on this system');
+      }
+    });
+
+    it('fetches version source for the first PROG revision', async (ctx) => {
+      try {
+        const revisions = await client.getRevisions('PROG', 'ZARC1_TEST_REPORT');
+        const first = revisions.revisions[0];
+        requireOrSkip(ctx, first, 'No PROG revisions available for ZARC1_TEST_REPORT');
+        const source = await client.getRevisionSource(first.uri);
+        expect(source).toMatch(/report/i);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(ctx, undefined, 'Version source endpoint unavailable or fixture missing');
+      }
+    });
+
+    it('rejects non-ADT URIs for VERSION_SOURCE', async () => {
+      await expect(client.getRevisionSource('https://evil.example/foo')).rejects.toThrow(/\/sap\/bc\/adt\//);
+    });
+
+    it('handles DDLS revision endpoint gaps gracefully', async (ctx) => {
+      try {
+        const result = await client.getRevisions('DDLS', 'ZI_TRAVEL');
+        expect(Array.isArray(result.revisions)).toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: DDLS revisions endpoint is not available on this backend`,
+        );
+      }
+    });
+  });
+
+  // ─── DDIC Operations (Structures, Domains, Data Elements) ─────
+
+  describe('DDIC operations', () => {
+    it('reads structure definition (BAPIRET2)', async () => {
+      const { source } = await client.getStructure('BAPIRET2');
+      expect(source).toBeTruthy();
+      expect(source).toContain('bapiret2');
+      expect(source).toContain('message');
+    });
+
+    it('reads structure definition (SYST)', async () => {
+      const { source } = await client.getStructure('SYST');
+      expect(source).toBeTruthy();
+      expect(source).toContain('syst');
+      expect(source).toContain('subrc');
+    });
+
+    it('reads BAPIRET2 via unified getTabl() — falls back from /tables/ to /structures/', async () => {
+      const { source } = await client.getTabl('BAPIRET2');
+      expect(source).toBeTruthy();
+      expect(source).toContain('bapiret2');
+      expect(source).toContain('message');
+      // After the fallback resolves, the URL is cached so resolveTablObjectUrl() returns the structures URL.
+      const resolvedUrl = await client.resolveTablObjectUrl('BAPIRET2');
+      expect(resolvedUrl).toContain('/sap/bc/adt/ddic/structures/');
+    });
+
+    it('returns DDIC structure hierarchy via SAPContext(action="structure")', async () => {
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      const result = await handleToolCall(client, config, 'SAPContext', {
+        action: 'structure',
+        type: 'TABL',
+        name: 'BAPIRET2',
+      });
+
+      expect(result.isError).toBeUndefined();
+      const text = result.content[0]?.type === 'text' ? result.content[0].text : '';
+      const hierarchy = JSON.parse(text);
+      expect(hierarchy.name).toBe('BAPIRET2');
+      expect(hierarchy.type).toBe('TABL');
+      expect(hierarchy.tree.structure).toBe('BAPIRET2');
+      expect(hierarchy.summary.totalNodes).toBeGreaterThanOrEqual(1);
+    });
+
+    it('reads T000 via unified getTabl() — transparent table (URL release-dependent)', async () => {
+      // T000 is a transparent table (DD02L-TABCLASS=TRANSP). On modern S/4HANA
+      // releases the source is served from /sap/bc/adt/ddic/tables/T000; on
+      // some 7.5x systems only /sap/bc/adt/ddic/structures/T000 returns 200.
+      // getTabl() handles either path via its 404 fallback, so we assert the
+      // source content rather than the resolved URL prefix.
+      const { source } = await client.getTabl('T000');
+      expect(source).toBeTruthy();
+      expect(source.toLowerCase()).toContain('t000');
+      // Transparent-table marker — appears on both /tables/ and /structures/ readbacks.
+      expect(source).toMatch(/@AbapCatalog\.tableCategory\s*:\s*#TRANSPARENT/i);
+      const resolvedUrl = await client.resolveTablObjectUrl('T000');
+      expect(resolvedUrl).toMatch(/\/sap\/bc\/adt\/ddic\/(tables|structures)\/T000$/);
+    });
+
+    it('resolveTablObjectUrlForWrite returns /tables/ for TABL/DT when /tables/ endpoint is available (issue #285)', async () => {
+      // The write-path resolver MUST decide endpoint by adtcore:type (TABL/DT vs
+      // TABL/DS), not by 404 probing. On a4h S/4HANA 2023 the /ddic/tables/
+      // endpoint exists, so transparent-table writes go to /tables/. On NPL 7.50
+      // /ddic/tables/ is absent — the resolver throws AdtSafetyError (covered by
+      // the next test).
+      const url = await client.resolveTablObjectUrlForWrite('T000', { tablesEndpointAvailable: true });
+      // T000 is a transparent table on every release.
+      expect(url).toBe('/sap/bc/adt/ddic/tables/T000');
+    });
+
+    it('resolveTablObjectUrlForWrite refuses TABL/DT writes when /tables/ is unavailable (issue #285)', async () => {
+      // Simulates the NW 7.50 case explicitly by passing tablesEndpointAvailable=false.
+      // Live evidence: on NPL 7.50 the ADT discovery feed lists /ddic/structures but
+      // NOT /ddic/tables. Pre-fix the resolver fell back to /structures/ silently;
+      // post-fix it refuses with the SE11 hint.
+      let captured: Error | undefined;
+      try {
+        await client.resolveTablObjectUrlForWrite('T000', { tablesEndpointAvailable: false });
+      } catch (err) {
+        captured = err as Error;
+      }
+      expect(captured).toBeDefined();
+      expect(captured?.message).toContain('Transparent table writes via ADT REST are not available');
+      expect(captured?.message).toContain('SE11');
+      expect(captured?.message).toContain('NW 7.52');
+    });
+
+    it('resolveTablObjectUrlForWrite returns /structures/ for TABL/DS regardless of tables availability', async () => {
+      // BAPIRET2 is a TABL/DS structure on every release. Even if /tables/ is unavailable,
+      // structure writes route to /structures/ — that's their canonical endpoint.
+      const url = await client.resolveTablObjectUrlForWrite('BAPIRET2', { tablesEndpointAvailable: false });
+      expect(url).toBe('/sap/bc/adt/ddic/structures/BAPIRET2');
+    });
+
+    // ────────────────────────────────────────────────────────────────────────
+    // TABL/DS create routing (follow-up to issue #285 — Michael's report).
+    // Bug pre-fix: SAPWrite(action='create', type='TABL/DS') silently routed to
+    // /sap/bc/adt/ddic/tables with adtcore:type="TABL/DT". For namespaced /
+    // long names it failed with T100 AD102 "Select a shorter name"; for short
+    // names it created a transparent table instead of the requested structure.
+    // Post-fix: routing branches on the explicit slash form.
+    // ────────────────────────────────────────────────────────────────────────
+    it('SAPWrite TABL/DS create routes POST to /sap/bc/adt/ddic/structures and accepts long names', async () => {
+      const { createObject, deleteObject, lockObject, unlockObject } = await import('../../src/adt/crud.js');
+      const { buildCreateXml } = await import('../../src/handlers/write-helpers.js');
+      const { unrestrictedSafetyConfig } = await import('../../src/adt/safety.js');
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const safety = unrestrictedSafetyConfig();
+
+      // 27-char Z-name — would exceed the 16-char transparent-table limit
+      // (T100 AD102) on the /tables endpoint but is valid for structures.
+      const structName = generateUniqueName('ZSTR_ARC1_LONG');
+      const structUrl = `/sap/bc/adt/ddic/structures/${encodeURIComponent(structName)}`;
+
+      try {
+        // Step 1: POST to /sap/bc/adt/ddic/structures with adtcore:type="TABL/DS"
+        // — this is the routing the fix unlocks. Pre-fix this would have routed
+        // to /sap/bc/adt/ddic/tables and failed with T100 AD102 ("name too long")
+        // because the 27-char name exceeds the transparent-table 16-char limit.
+        const createXml = buildCreateXml('TABL/DS', structName, '$TMP', 'ARC1 follow-up #285 test');
+        await createObject(
+          client.http,
+          safety,
+          '/sap/bc/adt/ddic/structures',
+          createXml,
+          'application/*',
+          undefined,
+          '$TMP',
+        );
+
+        // Step 2: Verify the empty shell lives at /structures/, NOT /tables/.
+        // Source-write is not part of this test (it has its own DDIC-syntax
+        // failure modes); the bug being fixed is the CREATE routing decision.
+        const readback = await client.http.get(structUrl);
+        expect(readback.statusCode).toBe(200);
+        expect(readback.body).toContain('TABL/DS');
+
+        // Confirm the object does NOT also live at /tables/ (it really is a
+        // structure, not a transparent table).
+        try {
+          await client.http.get(`/sap/bc/adt/ddic/tables/${encodeURIComponent(structName)}`);
+          expect.fail(`Unexpected: /tables/${structName} returned 200 — should be 404`);
+        } catch (err) {
+          if (err && typeof err === 'object' && 'statusCode' in err) {
+            expect((err as { statusCode: number }).statusCode).toBe(404);
+          } else {
+            throw err;
+          }
+        }
+      } finally {
+        // Cleanup: lock + delete + unlock the structure
+        await client.http
+          .withStatefulSession(async (session) => {
+            const lock = await lockObject(session, safety, structUrl, 'MODIFY');
+            try {
+              await deleteObject(session, safety, structUrl, lock.lockHandle);
+            } finally {
+              await unlockObject(session, structUrl, lock.lockHandle).catch(() => {
+                // best-effort-cleanup
+              });
+            }
+          })
+          .catch(() => {
+            // best-effort-cleanup
+          });
+      }
+    });
+
+    it('reads DDIC view metadata via the VIT URL (V_USR_NAME)', async (ctx) => {
+      // Regression test for the "VIEW silently broken" bug fixed in PR #222
+      // follow-up. Pre-fix: getView used /sap/bc/adt/ddic/views/{name}/source/main
+      // which returns HTTP 404 on a4h S/4HANA 2023 and HTTP 500 on npl 7.50.
+      // Real route is the VIT generic-object endpoint
+      // /sap/bc/adt/vit/wb/object_type/viewdv/object_name/{name}, returning
+      // metadata XML with adtcore:type="VIEW/DV". V_USR_NAME is a SAP-shipped
+      // standard view available on every release (verified on a4h + npl
+      // 2026-05-08).
+      let result: Awaited<ReturnType<typeof client.getView>>;
+      try {
+        result = await client.getView('V_USR_NAME');
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/does not exist/i, /not found/i]);
+        requireOrSkip(ctx, undefined, `${SkipReason.NO_FIXTURE} (V_USR_NAME) — view not on this system`);
+        return;
+      }
+      expect(result.source).toBeTruthy();
+      // Metadata XML — root element is adtcore:mainObject with view attrs.
+      expect(result.source).toMatch(/adtcore:type="VIEW\/DV"/);
+      expect(result.source).toMatch(/adtcore:name="V_USR_NAME"/);
+    });
+
+    // Note (codex P2 follow-up, PR #223): these tests assert the slash codes
+    // ADT *emits* in `<adtcore:type>` for known objects — not that ADT
+    // honours an `objectType` filter. `client.searchObject(name, max)`
+    // does not pass `objectType` (the parameter doesn't exist on the
+    // client), and the ADT informationsystem/search endpoint silently
+    // ignores unknown filters anyway. So these are emitted-type
+    // assertions. They still serve as regression guards for the four
+    // SLASH_TYPE_MAP fixes (VIEW/DV, TRAN/T, FUGR/FF — and implicitly
+    // confirm CLAS/LI / FUNC/FM are not what real ADT ever returns).
+    // A future PR can add object-search filtering + a deliberate
+    // bogus-objectType test once `client.searchObject` grows that
+    // parameter.
+
+    it('SAPSearch result for V_USR_NAME emits adtcore:type="VIEW/DV"', async () => {
+      const results = await client.searchObject('V_USR_NAME', 5);
+      const view = results.find((r) => r.objectName === 'V_USR_NAME');
+      expect(view).toBeDefined();
+      expect(view!.objectType).toBe('VIEW/DV');
+    });
+
+    it('SAPSearch result for SE38 emits adtcore:type="TRAN/T"', async () => {
+      const results = await client.searchObject('SE38', 5);
+      const tcode = results.find((r) => r.objectName === 'SE38');
+      expect(tcode).toBeDefined();
+      expect(tcode!.objectType).toBe('TRAN/T');
+    });
+
+    it('SAPSearch result for BAPI_USER_GETLIST emits adtcore:type="FUGR/FF"', async () => {
+      // Confirms FUGR/FF is the live slash code for function modules. The map
+      // entry FUGR/FF → FUNC routes correctly to client.getFunction at the
+      // handler layer (covered by unit tests).
+      const results = await client.searchObject('BAPI_USER_GETLIST', 5);
+      const fm = results.find((r) => r.objectName === 'BAPI_USER_GETLIST');
+      expect(fm).toBeDefined();
+      expect(fm!.objectType).toBe('FUGR/FF');
+    });
+
+    it('reads domain metadata (MANDT)', async (ctx) => {
+      let domain: Awaited<ReturnType<typeof client.getDomain>>;
+      try {
+        domain = await client.getDomain('MANDT');
+      } catch (err) {
+        // DOMA ADT endpoint doesn't exist on NW 7.50 (added in a later release).
+        expectSapFailureClass(err, [404], [/does not exist/i, /not found/i]);
+        requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED}: DOMA reads not supported on this release`);
+        return;
+      }
+      expect(domain.name).toBe('MANDT');
+      expect(domain.dataType).toBe('CLNT');
+      expect(domain.length).toBe('000003');
+      expect(domain.package).toBeTruthy();
+    });
+
+    it('reads domain metadata with value table (BUKRS)', async (ctx) => {
+      let domain: Awaited<ReturnType<typeof client.getDomain>>;
+      try {
+        domain = await client.getDomain('BUKRS');
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/does not exist/i, /not found/i]);
+        requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED}: DOMA reads not supported on this release`);
+        return;
+      }
+      expect(domain.name).toBe('BUKRS');
+      expect(domain.dataType).toBe('CHAR');
+      expect(domain.length).toBe('000004');
+      expect(domain.valueTable).toBe('T001');
+    });
+
+    it('reads data element metadata (MANDT)', async () => {
+      const dtel = await client.getDataElement('MANDT');
+      expect(dtel.name).toBe('MANDT');
+      expect(dtel.typeKind).toBe('domain');
+      expect(dtel.typeName).toBe('MANDT');
+      expect(dtel.dataType).toBe('CLNT');
+      expect(dtel.package).toBeTruthy();
+    });
+
+    it('reads data element metadata with labels (BUKRS)', async () => {
+      const dtel = await client.getDataElement('BUKRS');
+      expect(dtel.name).toBe('BUKRS');
+      expect(dtel.typeKind).toBe('domain');
+      expect(dtel.typeName).toBe('BUKRS');
+      expect(dtel.dataType).toBe('CHAR');
+      expect(dtel.mediumLabel).toBeTruthy();
+      expect(dtel.searchHelp).toBe('C_T001');
+    });
+
+    it('reads authorization field metadata (AUTH/BUKRS)', async (ctx) => {
+      try {
+        const auth = await client.getAuthorizationField('BUKRS');
+        expect(auth.name).toBe('BUKRS');
+        expect(auth.checkTable).toBe('T001');
+        expect(Array.isArray(auth.orgLevelInfo)).toBe(true);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: Auth Fields ADT endpoint not available on this kernel`,
+        );
+      }
+    });
+
+    it('reads feature toggle state (FEATURE_TOGGLE) when available', async (ctx) => {
+      // Renamed from FTG2 in audit Plan B (docs/research/abap-types/types/ftg2.md). The
+      // endpoint is unchanged: /sap/bc/adt/sfw/featuretoggles/<name>/states.
+      const toggleName = process.env.TEST_FEATURE_TOGGLE || 'SAP_PARA_DCFK_SUPP_GENERAL';
+      try {
+        const toggle = await client.getFeatureToggle(toggleName);
+        expect(toggle.name).toBeTruthy();
+        expect(Array.isArray(toggle.states)).toBe(true);
+      } catch (err) {
+        // Feature toggles are often unavailable or empty on plain A4H systems.
+        expectSapFailureClass(err, [404, 403], [/not found/i, /no authorization/i, /forbidden/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: Feature toggle endpoint unavailable or unauthorized on this system`,
+        );
+      }
+    });
+
+    it('reads message class via MSAG canonical type (audit Plan B)', async () => {
+      // MSAG was added to SAPREAD_TYPES_* by docs/plans/completed/2026-05-08-audit-symmetry-and-ftg2-rename.md.
+      // Endpoint /sap/bc/adt/messageclass/{name} verified live (2026-05-08) on:
+      //   - a4h S/4HANA 2023 (returns adtcore:type="MSAG/N")
+      //   - npl NW 7.50 SP02 (returns adtcore:type="MSAG/N")
+      // SY is a SAP-shipped message class present on every release.
+      const info = await client.getMessageClassInfo('SY');
+      expect(info.name).toBe('SY');
+      expect(typeof info.description).toBe('string');
+      expect(Array.isArray(info.messages)).toBe(true);
+      expect(info.messages.length).toBeGreaterThan(0);
+    });
+
+    it('reads enhancement implementation metadata (ENHO) when a fixture exists', async (ctx) => {
+      const byName = process.env.TEST_ENHO_NAME?.trim();
+      const candidateNames: string[] = [];
+
+      if (byName) {
+        candidateNames.push(byName);
+      } else {
+        try {
+          const candidates = await client.searchObject('ENHO*', 20);
+          for (const row of candidates) {
+            if (String(row.objectType).startsWith('ENHO') && row.objectName) {
+              candidateNames.push(row.objectName);
+            }
+          }
+        } catch (err) {
+          expectSapFailureClass(err, [404, 403, 500], [/search/i, /not found/i]);
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.BACKEND_UNSUPPORTED}: Could not search ENHO objects on this backend`,
+          );
+        }
+        // Append known-good SAP-delivered ENHO names as fallbacks.
+        // The A4H developer trial system has many malformed ENHO_ADT_TEST* fixtures
+        // that return SAP server-side defects; SFW_BCF_TCD is a clean SAP example.
+        for (const wellKnown of ['SFW_BCF_TCD']) {
+          if (!candidateNames.includes(wellKnown)) {
+            candidateNames.push(wellKnown);
+          }
+        }
+      }
+
+      requireOrSkip(ctx, candidateNames[0], 'No enhancement implementation fixture found for ENHO read test');
+
+      // Try each candidate — some ENHO objects exist in TADIR but fail with
+      // "Dereferencing of the NULL reference" (HTTP 500) or similar SAP server-side
+      // defects. Accept the first one that parses cleanly.
+      let parsed = false;
+      let lastErr: unknown;
+      for (const name of candidateNames) {
+        try {
+          const enho = await client.getEnhancementImplementation(name);
+          expect(enho.name).toBeTruthy();
+          expect(Array.isArray(enho.badiImplementations)).toBe(true);
+          parsed = true;
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      if (!parsed) {
+        // No usable fixture — classify the last error and skip if backend-unsupported.
+        // Accept a wide range of SAP server-side defects that certain malformed ENHO
+        // fixtures throw (NULL ref, type conflicts, activation state issues, etc.).
+        expectSapFailureClass(
+          lastErr,
+          [400, 403, 404, 500],
+          [
+            /not found/i,
+            /forbidden/i,
+            /no authorization/i,
+            /null reference/i,
+            /application server error/i,
+            /type conflict/i,
+            /parameter passing/i,
+          ],
+        );
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: No readable ENHO fixture on this system (all candidates returned server errors)`,
+        );
+      }
+    });
+
+    it('reads transaction metadata (SE38)', async () => {
+      const tran = await client.getTransaction('SE38');
+      expect(tran.code).toBe('SE38');
+      expect(tran.description).toBeTruthy();
+      expect(tran.package).toBeTruthy();
+    });
+
+    it('returns 404 for non-existent domain', async () => {
+      await expect(client.getDomain('ZZZNOTEXIST999')).rejects.toThrow();
+    });
+
+    it('returns 404 for non-existent data element', async () => {
+      await expect(client.getDataElement('ZZZNOTEXIST999')).rejects.toThrow();
+    });
+
+    it('returns empty metadata for non-existent transaction', async () => {
+      // SAP's vit endpoint returns 200 with empty data for non-existent transactions
+      // (unlike other ADT endpoints that return 404)
+      const tran = await client.getTransaction('ZZZNOTEXIST999');
+      expect(tran.code).toBe('ZZZNOTEXIST999');
+      expect(tran.description).toBe('');
+    });
+  });
+
+  // ─── Class Operations ───────────────────────────────────────────
+
+  describe('class operations', () => {
+    it('reads class main source', async () => {
+      const { source } = await client.getClass('CL_ABAP_CHAR_UTILITIES');
+      expect(source).toBeTruthy();
+    });
+
+    it('reads class with specific include', async () => {
+      // Try reading definitions include
+      try {
+        const { source } = await client.getClass('CL_ABAP_CHAR_UTILITIES', 'definitions');
+        expect(typeof source).toBe('string');
+        expect(source.length).toBeGreaterThan(0);
+      } catch (err) {
+        // Include may not be available on all systems — expect 404 or similar
+        expectSapFailureClass(err, [404, 500], [/not found/i, /does not exist/i]);
+      }
+    });
+
+    it('returns error for non-existent class', async () => {
+      await expect(client.getClass('ZCL_NONEXISTENT_999')).rejects.toThrow();
+    });
+
+    it('reads class local definitions include', async (ctx) => {
+      requireFlightAmdp(ctx);
+      const { source } = await client.getClass('/DMO/CL_FLIGHT_AMDP', 'definitions');
+      expect(typeof source).toBe('string');
+      expect(source).toContain('=== definitions ===');
+    });
+
+    it('reads class local implementations include', async (ctx) => {
+      requireFlightAmdp(ctx);
+      const { source } = await client.getClass('/DMO/CL_FLIGHT_AMDP', 'implementations');
+      expect(typeof source).toBe('string');
+      expect(source).toContain('=== implementations ===');
+    });
+
+    it('reads class with multiple includes', async (ctx) => {
+      requireFlightAmdp(ctx);
+      const { source } = await client.getClass('/DMO/CL_FLIGHT_AMDP', 'definitions,implementations');
+      expect(source).toContain('=== definitions ===');
+      expect(source).toContain('=== implementations ===');
+    });
+
+    it('gracefully handles non-existent testclasses include', async (ctx) => {
+      requireFlightAmdp(ctx);
+      // If the class has no test classes, should return a helpful note rather than throwing
+      const { source } = await client.getClass('/DMO/CL_FLIGHT_AMDP', 'testclasses');
+      expect(typeof source).toBe('string');
+      expect(source).toContain('testclasses');
+    });
+
+    it('reads full class source without include (default)', async (ctx) => {
+      requireFlightAmdp(ctx);
+      const { source } = await client.getClass('/DMO/CL_FLIGHT_AMDP');
+      expect(source).toBeTruthy();
+      expect(source.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ─── Interface Operations ───────────────────────────────────────
+
+  describe('interface operations', () => {
+    it('reads a standard SAP interface', async () => {
+      // IF_SERIALIZABLE_OBJECT exists on all systems
+      try {
+        const { source } = await client.getInterface('IF_SERIALIZABLE_OBJECT');
+        expect(typeof source).toBe('string');
+        expect(source.length).toBeGreaterThan(0);
+      } catch (err) {
+        // Interface may not exist on minimal systems — expect 404 or not-found
+        expectSapFailureClass(err, [404], [/not found/i, /does not exist/i]);
+      }
+    });
+  });
+
+  // ─── Function Module Operations ─────────────────────────────────
+
+  describe('function module operations', () => {
+    it('reads function group structure', async () => {
+      // Try a standard function group
+      try {
+        const results = await client.searchObject('FUNCTION_EXISTS', 1);
+        expect(Array.isArray(results)).toBe(true);
+      } catch (err) {
+        // Search may fail on restricted systems — expect known error shape
+        expectSapFailureClass(err, [404, 403, 500], [/not found/i, /search/i]);
+      }
+    });
+  });
+
+  // CRUD lifecycle test moved to tests/integration/crud.lifecycle.integration.test.ts
+  // This section previously only verified search — full create/read/update/activate/delete
+  // lifecycle is now covered by the dedicated suite.
+
+  // ─── Safety Checks ──────────────────────────────────────────────
+
+  describe('safety', () => {
+    it('safe-default client can still read', async () => {
+      const { AdtClient } = await import('../../src/adt/client.js');
+      const roClient = new AdtClient({
+        baseUrl: process.env.TEST_SAP_URL || process.env.SAP_URL || '',
+        username: process.env.TEST_SAP_USER || process.env.SAP_USER || '',
+        password: process.env.TEST_SAP_PASSWORD || process.env.SAP_PASSWORD || '',
+        client: process.env.TEST_SAP_CLIENT || process.env.SAP_CLIENT || '100',
+        insecure: (process.env.TEST_SAP_INSECURE || process.env.SAP_INSECURE) === 'true',
+        safety: { ...unrestrictedSafetyConfig(), allowWrites: false, allowFreeSQL: false },
+      });
+
+      // Read should work
+      const source = await roClient.getProgram('RSHOWTIM');
+      expect(source).toBeTruthy();
+    });
+
+    it('safe-default client can search', async () => {
+      const { AdtClient } = await import('../../src/adt/client.js');
+      const roClient = new AdtClient({
+        baseUrl: process.env.TEST_SAP_URL || process.env.SAP_URL || '',
+        username: process.env.TEST_SAP_USER || process.env.SAP_USER || '',
+        password: process.env.TEST_SAP_PASSWORD || process.env.SAP_PASSWORD || '',
+        client: process.env.TEST_SAP_CLIENT || process.env.SAP_CLIENT || '100',
+        insecure: (process.env.TEST_SAP_INSECURE || process.env.SAP_INSECURE) === 'true',
+        safety: { ...unrestrictedSafetyConfig(), allowWrites: false, allowFreeSQL: false },
+      });
+
+      const results = await roClient.searchObject('CL_ABAP_*', 3);
+      expect(results.length).toBeGreaterThan(0);
+    });
+
+    it('safe-default client blocks free SQL', async () => {
+      const { AdtClient } = await import('../../src/adt/client.js');
+      const roClient = new AdtClient({
+        baseUrl: process.env.TEST_SAP_URL || process.env.SAP_URL || '',
+        username: process.env.TEST_SAP_USER || process.env.SAP_USER || '',
+        password: process.env.TEST_SAP_PASSWORD || process.env.SAP_PASSWORD || '',
+        client: process.env.TEST_SAP_CLIENT || process.env.SAP_CLIENT || '100',
+        insecure: (process.env.TEST_SAP_INSECURE || process.env.SAP_INSECURE) === 'true',
+        safety: { ...unrestrictedSafetyConfig(), allowWrites: false, allowFreeSQL: false },
+      });
+
+      await expect(roClient.runQuery('SELECT * FROM T000')).rejects.toThrow();
+    });
+  });
+
+  // ─── HTTP Cookie Jar (CSRF + Session) ───────────────────────────
+
+  describe('HTTP session management', () => {
+    it('maintains session cookies across requests', async () => {
+      // This test verifies the cookie jar fix — CSRF token + session cookie correlation
+      // First request (GET) should establish a session, POST should reuse it
+      const { source } = await client.getProgram('RSHOWTIM');
+      expect(source).toBeTruthy();
+
+      // Second request should work with the same session
+      const { source: source2 } = await client.getClass('CL_ABAP_CHAR_UTILITIES');
+      expect(source2).toBeTruthy();
+    });
+
+    it('POST requests work (CSRF + cookie correlation)', async (ctx) => {
+      // getTableContents uses POST — tests CSRF token + session cookie
+      let result: Awaited<ReturnType<typeof client.getTableContents>>;
+      try {
+        result = await client.getTableContents('T000', 2);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/No suitable resource/i, /not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: /datapreview/ddic endpoint not available on this release`,
+        );
+        return;
+      }
+      expect(result.columns).toContain('MANDT');
+    });
+
+    it('multiple POST requests work in sequence', async (ctx) => {
+      // Ensure cookies persist across multiple POST calls
+      let r1: Awaited<ReturnType<typeof client.getTableContents>>;
+      try {
+        r1 = await client.getTableContents('T000', 1);
+      } catch (err) {
+        expectSapFailureClass(err, [404], [/No suitable resource/i, /not found/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.BACKEND_UNSUPPORTED}: /datapreview/ddic endpoint not available on this release`,
+        );
+        return;
+      }
+      expect(r1.rows.length).toBeGreaterThan(0);
+
+      const r2 = await client.getTableContents('T000', 2);
+      expect(r2.rows.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ─── Edge Cases ─────────────────────────────────────────────────
+
+  describe('edge cases', () => {
+    it('handles special characters in search query', async () => {
+      // Search with asterisk wildcard
+      const results = await client.searchObject('*', 3);
+      expect(results.length).toBeGreaterThan(0);
+    });
+
+    it('handles empty search query', async () => {
+      // Edge case: both outcomes are acceptable, but we assert the shape of whichever occurs
+      try {
+        const results = await client.searchObject('', 1);
+        expect(Array.isArray(results)).toBe(true);
+      } catch (err) {
+        // SAP may reject empty search — assert it's a known error shape
+        expectSapFailureClass(err, [400, 404, 500], [/search/i, /invalid/i, /empty/i]);
+      }
+    });
+
+    it('table contents with maxRows=0 returns something', async () => {
+      // Edge case: both outcomes are acceptable, but we assert the shape of whichever occurs
+      try {
+        const result = await client.getTableContents('T000', 0);
+        expect(result.columns).toContain('MANDT');
+      } catch (err) {
+        // Some systems may reject 0 as invalid — assert known error shape
+        expectSapFailureClass(err, [400, 404, 500], [/invalid/i, /rows/i]);
+      }
+    });
+  });
+
+  // ─── Runtime Diagnostics ──────────────────────────────────────────
+
+  describe('runtime diagnostics', () => {
+    describe('short dumps', () => {
+      it('lists dumps (may be empty)', async () => {
+        const dumps = await listDumps(client.http, unrestrictedSafetyConfig());
+        expect(Array.isArray(dumps)).toBe(true);
+        if (dumps.length > 0) {
+          // Verify structure
+          expect(dumps[0]).toHaveProperty('id');
+          expect(dumps[0]).toHaveProperty('timestamp');
+          expect(dumps[0]).toHaveProperty('user');
+          expect(dumps[0]).toHaveProperty('error');
+          expect(dumps[0]).toHaveProperty('program');
+        }
+      });
+
+      it('lists dumps with maxResults limit', async () => {
+        const dumps = await listDumps(client.http, unrestrictedSafetyConfig(), { maxResults: 2 });
+        expect(Array.isArray(dumps)).toBe(true);
+        expect(dumps.length).toBeLessThanOrEqual(2);
+      });
+
+      it('lists dumps filtered by current user', async (ctx) => {
+        const user = (process.env.TEST_SAP_USER || process.env.SAP_USER || '').toUpperCase();
+        requireOrSkip(ctx, user || undefined, SkipReason.NO_CREDENTIALS);
+        const dumps = await listDumps(client.http, unrestrictedSafetyConfig(), { user, maxResults: 5 });
+        expect(Array.isArray(dumps)).toBe(true);
+        // All returned dumps should be for this user
+        for (const dump of dumps) {
+          expect(dump.user.toUpperCase()).toBe(user);
+        }
+      });
+
+      it('gets dump detail if dumps exist', async (ctx) => {
+        const dumps = await listDumps(client.http, unrestrictedSafetyConfig(), { maxResults: 1 });
+        if (dumps.length === 0) {
+          skipTest(ctx, SkipReason.NO_DUMPS);
+          return;
+        }
+        const detail = await getDump(client.http, unrestrictedSafetyConfig(), dumps[0]!.id);
+        expect(detail.error).toBeTruthy();
+        // exception may be empty for system-level dumps (not all dumps are ABAP exceptions)
+        expect(typeof detail.exception).toBe('string');
+        expect(detail.program).toBeTruthy();
+        expect(detail.formattedText).toBeTruthy();
+        expect(detail.formattedText).toContain(detail.error);
+        expect(detail.chapters.length).toBeGreaterThan(0);
+      });
+    });
+
+    describe('ABAP traces', () => {
+      it('lists traces (may be empty)', async () => {
+        const traces = await listTraces(client.http, unrestrictedSafetyConfig());
+        expect(Array.isArray(traces)).toBe(true);
+        if (traces.length > 0) {
+          expect(traces[0]).toHaveProperty('id');
+          expect(traces[0]).toHaveProperty('title');
+          expect(traces[0]).toHaveProperty('timestamp');
+        }
+      });
+    });
+
+    describe('runtime feeds', () => {
+      it('lists system messages when supported', async (ctx) => {
+        try {
+          const messages = await listSystemMessages(client.http, unrestrictedSafetyConfig(), { maxResults: 5 });
+          expect(Array.isArray(messages)).toBe(true);
+        } catch (err) {
+          expectSapFailureClass(err, [400, 403, 404, 500], [/systemmessages|not found|unsupported|forbidden/i]);
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.BACKEND_UNSUPPORTED}: /runtime/systemmessages endpoint not available on this system`,
+          );
+        }
+      });
+
+      it('lists gateway errors on on-prem systems', async (ctx) => {
+        try {
+          const errors = await listGatewayErrors(client.http, unrestrictedSafetyConfig(), { maxResults: 5 });
+          expect(Array.isArray(errors)).toBe(true);
+        } catch (err) {
+          expectSapFailureClass(err, [400, 403, 404, 500], [/gw\/errorlog|not found|unsupported|forbidden/i]);
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.BACKEND_UNSUPPORTED}: /gw/errorlog endpoint not available on this system`,
+          );
+        }
+      });
+
+      it('reads gateway error detail when entries are available', async (ctx) => {
+        let errors: Awaited<ReturnType<typeof listGatewayErrors>> | undefined;
+        try {
+          errors = await listGatewayErrors(client.http, unrestrictedSafetyConfig(), { maxResults: 5 });
+        } catch (err) {
+          expectSapFailureClass(err, [400, 403, 404, 500], [/gw\/errorlog|not found|unsupported|forbidden/i]);
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.BACKEND_UNSUPPORTED}: /gw/errorlog endpoint not available on this system`,
+          );
+          return;
+        }
+
+        if (!errors || errors.length === 0 || !errors[0]?.detailUrl) {
+          skipTest(ctx, `${SkipReason.NO_FIXTURE}: no gateway error detail URL available`);
+          return;
+        }
+
+        const detail = await getGatewayErrorDetail(client.http, unrestrictedSafetyConfig(), {
+          detailUrl: errors[0].detailUrl,
+        });
+        expect(detail).toHaveProperty('transactionId');
+        expect(detail).toHaveProperty('shortText');
+      });
+    });
+  });
+
+  // ─── Structured Class Read (AFF) ─────────────────────────────────
+
+  describe('structured class read', () => {
+    it('reads class metadata', async () => {
+      const metadata = await client.getClassMetadata('CL_ABAP_CHAR_UTILITIES');
+      expect(metadata.description).toBeTruthy();
+      expect(metadata.language).toBeTruthy();
+      expect(metadata.package).toBeTruthy();
+      expect(metadata.name).toBe('CL_ABAP_CHAR_UTILITIES');
+      expect(typeof metadata.fixPointArithmetic).toBe('boolean');
+    });
+
+    it('reads class with structured format', async () => {
+      const result = await client.getClassStructured('CL_ABAP_CHAR_UTILITIES');
+      // Metadata should be populated
+      expect(result.metadata.description).toBeTruthy();
+      expect(result.metadata.package).toBeTruthy();
+      // Main source should be non-empty
+      expect(result.main).toBeTruthy();
+      expect(result.main.length).toBeGreaterThan(0);
+      // Includes should be string or null
+      for (const include of ['testclasses', 'definitions', 'implementations', 'macros'] as const) {
+        expect(result[include] === null || typeof result[include] === 'string').toBe(true);
+      }
+    });
+
+    it('returns error for non-existent class metadata', async () => {
+      await expect(client.getClassMetadata('ZCL_NONEXISTENT_999')).rejects.toThrow();
+    });
+  });
+
+  // ─── Batch Create (AFF) ─────────────────────────────────────────
+
+  describe('batch create in $TMP', () => {
+    const suffix = Date.now().toString(36).toUpperCase();
+    const prog1 = `ZARC1_BAT1_${suffix}`;
+    const prog2 = `ZARC1_BAT2_${suffix}`;
+    const createdPrograms: string[] = [];
+
+    afterAll(async () => {
+      // Clean up: delete any programs created during the test
+      const { deleteObject, lockObject } = await import('../../src/adt/crud.js');
+      const { unrestrictedSafetyConfig } = await import('../../src/adt/safety.js');
+      const safety = unrestrictedSafetyConfig();
+      for (const name of createdPrograms) {
+        try {
+          const objectUrl = `/sap/bc/adt/programs/programs/${encodeURIComponent(name)}`;
+          await client.http.withStatefulSession(async (session) => {
+            const lock = await lockObject(session, safety, objectUrl);
+            await deleteObject(session, safety, objectUrl, lock.lockHandle);
+          });
+        } catch {
+          // best-effort-cleanup
+        }
+      }
+    });
+
+    it('creates multiple programs in sequence', async () => {
+      const { createObject } = await import('../../src/adt/crud.js');
+      const { buildCreateXml } = await import('../../src/handlers/write-helpers.js');
+      const { unrestrictedSafetyConfig } = await import('../../src/adt/safety.js');
+      const safety = unrestrictedSafetyConfig();
+
+      // Create first program
+      const xml1 = buildCreateXml('PROG', prog1, '$TMP', 'ARC1 batch test 1');
+      await createObject(client.http, safety, '/sap/bc/adt/programs/programs', xml1);
+      createdPrograms.push(prog1);
+
+      // Create second program
+      const xml2 = buildCreateXml('PROG', prog2, '$TMP', 'ARC1 batch test 2');
+      await createObject(client.http, safety, '/sap/bc/adt/programs/programs', xml2);
+      createdPrograms.push(prog2);
+
+      // Verify both exist by reading them
+      const { source: source1 } = await client.getProgram(prog1);
+      expect(typeof source1).toBe('string');
+
+      const { source: source2 } = await client.getProgram(prog2);
+      expect(typeof source2).toBe('string');
+    });
+  });
+
+  // ─── CDS Impact Analysis ──────────────────────────────────────────
+
+  describe('CDS impact analysis', () => {
+    it('classifies downstream consumers for I_ABAPPACKAGE', async (ctx) => {
+      let results: Awaited<ReturnType<typeof findWhereUsed>>;
+      try {
+        results = await findWhereUsed(client.http, client.safety, '/sap/bc/adt/ddic/ddl/sources/i_abappackage');
+      } catch (err) {
+        expectSapFailureClass(err, [403, 404, 500], [/not found/i, /forbidden/i, /usageReferences/i]);
+        requireOrSkip(ctx, undefined, SkipReason.BACKEND_UNSUPPORTED);
+        return;
+      }
+      const downstream = classifyCdsImpact(results);
+      // I_ABAPPACKAGE is an S/4-only CDS view; on systems that don't ship it,
+      // findWhereUsed returns an empty where-used graph. Skip rather than
+      // fabricate expectations.
+      if (downstream.summary.total === 0) {
+        requireOrSkip(ctx, undefined, `${SkipReason.NO_FIXTURE} (I_ABAPPACKAGE) — S/4 CDS view not on this system`);
+      }
+      expect(downstream.accessControls.length).toBeGreaterThanOrEqual(1);
+      expect(
+        downstream.accessControls.some((entry) => entry.name === 'I_ABAPPACKAGE' && entry.type === 'DCLS/DL'),
+      ).toBe(true);
+      expect(downstream.summary.total).toBeGreaterThanOrEqual(2);
+    });
+
+    it('includeIndirect=true returns at least as many entries as default', async (ctx) => {
+      try {
+        const results = await findWhereUsed(client.http, client.safety, '/sap/bc/adt/ddic/ddl/sources/i_abappackage');
+        const directOnly = classifyCdsImpact(results);
+        const withIndirect = classifyCdsImpact(results, { includeIndirect: true });
+
+        if (directOnly.summary.total === 0) {
+          requireOrSkip(ctx, undefined, SkipReason.BACKEND_UNSUPPORTED);
+        }
+        expect(withIndirect.summary.total).toBeGreaterThanOrEqual(directOnly.summary.total);
+      } catch (err) {
+        expectSapFailureClass(err, [403, 404, 500], [/not found/i, /forbidden/i, /usageReferences/i]);
+        requireOrSkip(ctx, undefined, SkipReason.BACKEND_UNSUPPORTED);
+      }
+    });
+  });
+
+  // ─── RAP Handler Scaffolding Helpers ───────────────────────────────
+
+  describe('RAP handler scaffolding helpers', () => {
+    const bdefFixture = '/DMO/I_CARRIERSLOCKSINGLETON_S';
+
+    async function readRapFixture(ctx: import('vitest').TestContext): Promise<{
+      bdefSource: string;
+      behaviorPoolClass: string;
+      classStructured: Awaited<ReturnType<AdtClient['getClassStructured']>>;
+    }> {
+      try {
+        const { source: bdefSource } = await client.getBdef(bdefFixture);
+        const behaviorPoolClass = bdefSource.match(/implementation\s+in\s+class\s+([^\s;]+)/i)?.[1];
+        requireOrSkip(ctx, behaviorPoolClass, `${SkipReason.NO_FIXTURE} (${bdefFixture}) — no implementation class`);
+        const classStructured = await client.getClassStructured(behaviorPoolClass);
+        return { bdefSource, behaviorPoolClass, classStructured };
+      } catch (err) {
+        expectSapFailureClass(err, [403, 404], [/not found/i, /forbidden/i]);
+        skipTest(ctx, `${SkipReason.NO_FIXTURE} (${bdefFixture}) — RAP demo fixture not available`);
+      }
+    }
+
+    it('extracts handler requirements from live BDEF source', async (ctx) => {
+      const { bdefSource } = await readRapFixture(ctx);
+      const requirements = extractRapHandlerRequirements(bdefSource);
+      const firstRequirement = requirements[0];
+      requireOrSkip(
+        ctx,
+        firstRequirement,
+        `${SkipReason.NO_FIXTURE} (${bdefFixture}) — no action/validation/auth requirements in BDEF`,
+      );
+
+      expect(requirements.length).toBeGreaterThan(0);
+      expect(requirements.some((req) => req.kind === 'validation' || req.kind === 'action')).toBe(true);
+    });
+
+    it('matches requirements against live class source across includes', async (ctx) => {
+      const { bdefSource, classStructured } = await readRapFixture(ctx);
+      const requirements = extractRapHandlerRequirements(bdefSource);
+      const firstRequirement = requirements[0];
+      requireOrSkip(
+        ctx,
+        firstRequirement,
+        `${SkipReason.NO_FIXTURE} (${bdefFixture}) — no requirements to match against class source`,
+      );
+
+      const combinedClassSource = [
+        classStructured.main,
+        classStructured.definitions ?? '',
+        classStructured.implementations ?? '',
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      const missing = findMissingRapHandlerRequirements(requirements, combinedClassSource);
+
+      expect(missing.length).toBeLessThanOrEqual(requirements.length);
+      expect(
+        missing.every((missingReq) =>
+          requirements.some(
+            (requirement) =>
+              requirement.targetHandlerClass === missingReq.targetHandlerClass &&
+              requirement.methodName === missingReq.methodName,
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    // Regression baseline: SAP demo class BP_DEMO_RAP_STRICT (package SABAPDEMOS) is the
+    // canonical-layout reference for handler-class includes — empty CCDEF, full
+    // DEFINITION+IMPLEMENTATION pair in CCIMP. Captured live on a4h S/4HANA 2023 (ABAP 7.58)
+    // as fixtures in tests/fixtures/abap/bp-demo-rap-strict-{ccdef,ccimp}.abap. If this test
+    // fails, either the fixture has drifted from the live system or the demo class is not
+    // available on the test target.
+    it('SAP demo BP_DEMO_RAP_STRICT shows canonical CCDEF-empty + CCIMP-full layout', async (ctx) => {
+      let structured: Awaited<ReturnType<AdtClient['getClassStructured']>>;
+      try {
+        structured = await client.getClassStructured('BP_DEMO_RAP_STRICT');
+      } catch (err) {
+        expectSapFailureClass(err, [403, 404], [/not found/i, /forbidden/i]);
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.NO_FIXTURE} (BP_DEMO_RAP_STRICT) — SAP RAP demo class not on this system`,
+        );
+      }
+
+      // CCDEF: only the SAP-generated placeholder comment, no class declarations.
+      const ccdef = structured!.definitions ?? '';
+      expect(ccdef.length).toBeGreaterThan(0);
+      expect(ccdef).not.toMatch(/CLASS\s+lhc_/i);
+      expect(ccdef).not.toMatch(/cl_abap_behavior_handler/i);
+      // CCIMP: the full handler class — DEFINITION block followed by IMPLEMENTATION block.
+      const ccimp = structured!.implementations ?? '';
+      expect(ccimp).toMatch(/CLASS\s+lhc_demo_rap_strict\s+DEFINITION\s+INHERITING\s+FROM\s+cl_abap_behavior_handler/i);
+      expect(ccimp).toMatch(/CLASS\s+lhc_demo_rap_strict\s+IMPLEMENTATION/i);
+      // ABAP forward-reference rule: DEFINITION must come before IMPLEMENTATION in CCIMP.
+      const defIdx = ccimp.search(/CLASS\s+lhc_demo_rap_strict\s+DEFINITION/i);
+      const implIdx = ccimp.search(/CLASS\s+lhc_demo_rap_strict\s+IMPLEMENTATION/i);
+      expect(defIdx).toBeGreaterThanOrEqual(0);
+      expect(implIdx).toBeGreaterThan(defIdx);
+    });
+
+    it('can re-insert a deliberately removed signature in the live implementation include', async (ctx) => {
+      const { bdefSource, classStructured } = await readRapFixture(ctx);
+      const requirements = extractRapHandlerRequirements(bdefSource);
+      const implementationSource = classStructured.implementations;
+      requireOrSkip(
+        ctx,
+        implementationSource,
+        `${SkipReason.NO_FIXTURE} (${bdefFixture}) — no implementations include available`,
+      );
+
+      const requirement = requirements.find(
+        (req) =>
+          req.targetHandlerClass.toLowerCase() === 'lhc_carrier' &&
+          (req.kind === 'validation' || req.kind === 'action'),
+      );
+      requireOrSkip(
+        ctx,
+        requirement,
+        `${SkipReason.NO_FIXTURE} (${bdefFixture}) — expected handler requirement not found`,
+      );
+
+      const declarationRegex = new RegExp(
+        `(^|\\n)\\s*METHODS\\s+${requirement.methodName}\\b[\\s\\S]*?\\.\\s*(?=\\n\\s*(?:METHODS\\b|ENDCLASS\\.))`,
+        'i',
+      );
+      if (!declarationRegex.test(implementationSource)) {
+        requireOrSkip(
+          ctx,
+          undefined,
+          `${SkipReason.NO_FIXTURE} (${bdefFixture}) — method declaration ${requirement.methodName} not present in fixture`,
+        );
+      }
+      const stripped = implementationSource.replace(declarationRegex, '\n');
+
+      const apply = applyRapHandlerSignatures(stripped, [requirement]);
+      expect(apply.changed).toBe(true);
+      expect(apply.inserted).toHaveLength(1);
+      expect(apply.updatedSource.toLowerCase()).toContain(`methods ${requirement.methodName}`);
+    });
+  });
+
+  // ─── edit_method against class includes (CCIMP) — PR-D ───────────
+  //
+  // Smoke test for SAPWrite(action="edit_method", method="<localclass>~<method>")
+  // routing to /sap/bc/adt/oo/classes/{name}/includes/implementations.
+  // Uses the same lock+PUT+unlock flow PR #257 verified for `case 'update'`,
+  // so the URL contract on NW 7.50 is already covered there. This test just
+  // proves the edit_method dispatch picks the right include and the splice
+  // round-trips through ADT.
+  //
+  // Verified URL pattern against a4h on 2026-05-10 (manual curl):
+  //   GET  /sap/bc/adt/oo/classes/{name}/includes/implementations
+  //   POST /sap/bc/adt/oo/classes/{name}?_action=LOCK&accessMode=MODIFY
+  //   PUT  /sap/bc/adt/oo/classes/{name}/includes/implementations?lockHandle=...
+  //   POST /sap/bc/adt/oo/classes/{name}?_action=UNLOCK&lockHandle=...
+
+  describe('edit_method against class includes (CCIMP)', () => {
+    it('round-trips a local handler method body through /includes/implementations', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const className = generateUniqueName('ZARC1_PRD');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      // Track whether the class was created so cleanup runs even if
+      // intermediate steps fail.
+      let created = false;
+      try {
+        // 1. Create empty CLAS in $TMP (auto-generated MAIN + empty includes)
+        const createResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'create',
+          type: 'CLAS',
+          name: className,
+          description: 'PR-D edit_method smoke test (transient)',
+          package: '$TMP',
+        });
+        expect(createResult.isError).toBeUndefined();
+        created = true;
+
+        // 2. Populate CCDEF (declarations) and CCIMP (implementation) so the
+        // class compiles. ABAP requires both halves of the local class.
+        const ccdefSource =
+          'CLASS lcl_helper DEFINITION.\n' +
+          '  PUBLIC SECTION.\n' +
+          '    METHODS hello\n' +
+          '      EXPORTING ev_text TYPE string.\n' +
+          'ENDCLASS.';
+        const ccimpSourceOld =
+          'CLASS lcl_helper IMPLEMENTATION.\n' +
+          '  METHOD hello.\n' +
+          "    ev_text = 'old'.\n" +
+          '  ENDMETHOD.\n' +
+          'ENDCLASS.';
+
+        const writeDef = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'update',
+          type: 'CLAS',
+          name: className,
+          include: 'definitions',
+          source: ccdefSource,
+          lintBeforeWrite: false,
+        });
+        expect(writeDef.isError).toBeUndefined();
+
+        const writeImpl = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'update',
+          type: 'CLAS',
+          name: className,
+          include: 'implementations',
+          source: ccimpSourceOld,
+          lintBeforeWrite: false,
+        });
+        expect(writeImpl.isError).toBeUndefined();
+
+        // 3. Activate so the class compiles cleanly.
+        const activateResult = await handleToolCall(client, config, 'SAPActivate', {
+          objects: [{ type: 'CLAS', name: className }],
+        });
+        expect(activateResult.isError).toBeUndefined();
+
+        // 4. The actual PR-D test: surgically replace lcl_helper~hello.
+        const editResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'edit_method',
+          type: 'CLAS',
+          name: className,
+          method: 'lcl_helper~hello',
+          source: "    ev_text = 'new'.",
+        });
+        expect(editResult.isError).toBeUndefined();
+        expect(editResult.content[0]?.text).toContain('include: implementations');
+
+        // 5. Read CCIMP back and confirm the body changed.
+        const readResult = await handleToolCall(client, config, 'SAPRead', {
+          type: 'CLAS',
+          name: className,
+          include: 'implementations',
+          version: 'inactive', // include writes create an inactive draft
+        });
+        expect(readResult.isError).toBeUndefined();
+        const text = readResult.content[0]?.text ?? '';
+        expect(text).toContain("ev_text = 'new'");
+        expect(text).not.toContain("ev_text = 'old'");
+      } finally {
+        // best-effort-cleanup
+        if (created) {
+          try {
+            await handleToolCall(client, config, 'SAPWrite', {
+              action: 'delete',
+              type: 'CLAS',
+              name: className,
+            });
+          } catch {
+            // best-effort-cleanup; transient $TMP class will time out eventually
+          }
+        }
+      }
+    });
+  });
+
+  // ─── DDLX (Metadata Extension) Operations ─────────────────────────
+
+  describe('DDLX read operations', () => {
+    it('reads a DDLX metadata extension source', async (ctx) => {
+      requireDmoDdlx(ctx);
+      // /DMO/C_AGENCYTP is a standard demo DDLX from the Flight Reference Scenario
+      const { source } = await client.getDdlx('/DMO/C_AGENCYTP');
+      expect(source).toBeTruthy();
+      expect(source).toContain('@Metadata.layer');
+      expect(source).toContain('annotate');
+    });
+
+    it('reads DDLX with UI annotations', async (ctx) => {
+      requireDmoDdlx(ctx);
+      const { source } = await client.getDdlx('/DMO/C_TRAVEL_A_D');
+      expect(source).toBeTruthy();
+      expect(source).toContain('@UI');
+    });
+
+    it('returns 404 for non-existent DDLX', async () => {
+      await expect(client.getDdlx('ZZZNOTEXIST_DDLX_999')).rejects.toThrow();
+    });
+  });
+
+  // ─── SRVB (Service Binding) Operations ─────────────────────────────
+
+  describe('SRVB read operations', () => {
+    it('reads a service binding and returns parsed JSON', async (ctx) => {
+      requireDmoSrvb(ctx);
+      // /DMO/UI_AGENCY_O4 is a standard demo SRVB from the Flight Reference Scenario
+      const { source } = await client.getSrvb('/DMO/UI_AGENCY_O4');
+      const parsed = JSON.parse(source);
+      expect(parsed.name).toBe('/DMO/UI_AGENCY_O4');
+      expect(parsed.type).toBe('SRVB/SVB');
+      expect(parsed.odataVersion).toBe('V4');
+      expect(parsed.bindingType).toBe('ODATA');
+      expect(parsed.bindingCategory).toBe('UI');
+      expect(parsed.serviceDefinition).toBeTruthy();
+    });
+
+    it('reads a V2 service binding', async (ctx) => {
+      requireDmoSrvb(ctx);
+      const { source } = await client.getSrvb('/DMO/UI_TRAVEL_U_V2');
+      const parsed = JSON.parse(source);
+      expect(parsed.name).toBe('/DMO/UI_TRAVEL_U_V2');
+      expect(parsed.odataVersion).toBe('V2');
+    });
+
+    it('returns 404 for non-existent SRVB', async () => {
+      await expect(client.getSrvb('ZZZNOTEXIST_SRVB_999')).rejects.toThrow();
+    });
+  });
+
+  // ─── SAPSearch tadir_lookup source variants ─────────────────────────
+  //
+  // Coverage for the SAPSearch tadir_lookup split-brain fix.
+  // - source='adt' (default) preserves today's ADT info-system behavior.
+  // - source='db' issues SQL against TADIR — also surfaces orphan/ghost rows.
+  // - source='both' merges results and emits a `splitBrain` array.
+  //
+  // The post-delete test asserts only on response shape, not on the presence of a ghost
+  // (whether SAP leaves a ghost behind after delete is release-/auth-dependent).
+
+  describe('SAPSearch tadir_lookup source variants', () => {
+    it('source=adt|db|both all find a freshly-created Z DDLS in $TMP (no splitBrain)', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const ddlsName = generateUniqueName('ZRES_TADIR_');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      let created = false;
+      try {
+        // 1. Create a simple Z DDLS view in $TMP
+        const createResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'create',
+          type: 'DDLS',
+          name: ddlsName,
+          package: '$TMP',
+          description: 'tadir_lookup source variants smoke test (transient)',
+          source:
+            `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+            `define view entity ${ddlsName} as select from t000 { key mandt as Client }`,
+          lintBeforeWrite: false,
+        });
+        expect(createResult.isError).toBeUndefined();
+        created = true;
+
+        // 2. Activate the view so ADT can resolve it (info-system filters drafts).
+        const activateResult = await handleToolCall(client, config, 'SAPActivate', {
+          objects: [{ type: 'DDLS', name: ddlsName }],
+        });
+        expect(activateResult.isError).toBeUndefined();
+
+        // 3. Lookup via adt — should find the activated view.
+        const adtLookup = await handleToolCall(client, config, 'SAPSearch', {
+          searchType: 'tadir_lookup',
+          names: [ddlsName],
+          source: 'adt',
+        });
+        expect(adtLookup.isError).toBeUndefined();
+        const adtPayload = JSON.parse(adtLookup.content[0]?.text ?? '{}');
+        expect(adtPayload.lookups[0]?.found).toBe(true);
+
+        // 4. Lookup via db — should find the TADIR row.
+        const dbLookup = await handleToolCall(client, config, 'SAPSearch', {
+          searchType: 'tadir_lookup',
+          names: [ddlsName],
+          source: 'db',
+        });
+        expect(dbLookup.isError).toBeUndefined();
+        const dbPayload = JSON.parse(dbLookup.content[0]?.text ?? '{}');
+        expect(dbPayload.lookups[0]?.found).toBe(true);
+        expect(dbPayload.lookups[0]?.matches[0]?._origin).toBe('db');
+
+        // 5. Lookup via both — both sources agree; no splitBrain reported.
+        const bothLookup = await handleToolCall(client, config, 'SAPSearch', {
+          searchType: 'tadir_lookup',
+          names: [ddlsName],
+          source: 'both',
+        });
+        expect(bothLookup.isError).toBeUndefined();
+        const bothPayload = JSON.parse(bothLookup.content[0]?.text ?? '{}');
+        expect(bothPayload.lookups[0]?.found).toBe(true);
+        expect(bothPayload.splitBrain).toBeUndefined();
+      } finally {
+        // best-effort-cleanup
+        if (created) {
+          try {
+            await handleToolCall(client, config, 'SAPWrite', {
+              action: 'delete',
+              type: 'DDLS',
+              name: ddlsName,
+            });
+          } catch {
+            // best-effort-cleanup; $TMP DDLS will time out eventually
+          }
+        }
+      }
+    });
+
+    it('source variants stay shape-consistent after delete (ghost or clean)', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const ddlsName = generateUniqueName('ZRES_TGHOST_');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      // Create + delete cycle, then probe all three sources. Either outcome is a passing test:
+      //  (a) ADT and DB both report `found:false` → clean delete, no splitBrain.
+      //  (b) DB reports `found:true`, ADT reports `found:false` → TADIR ghost; splitBrain=[name].
+      // The contract under test is response shape + consistency, not the presence of a ghost.
+      const createResult = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'create',
+        type: 'DDLS',
+        name: ddlsName,
+        package: '$TMP',
+        description: 'tadir_lookup ghost-probe transient',
+        source:
+          `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+          `define view entity ${ddlsName} as select from t000 { key mandt as Client }`,
+        lintBeforeWrite: false,
+      });
+      expect(createResult.isError).toBeUndefined();
+      // Delete without activating — SAP's draft cleanup is the most likely ghost-producer path.
+      const deleteResult = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'delete',
+        type: 'DDLS',
+        name: ddlsName,
+      });
+      // The delete may still report an error if the draft is in a tricky state — but the
+      // post-condition we care about is the lookup shape.
+      void deleteResult;
+
+      const bothLookup = await handleToolCall(client, config, 'SAPSearch', {
+        searchType: 'tadir_lookup',
+        names: [ddlsName],
+        source: 'both',
+      });
+      expect(bothLookup.isError).toBeUndefined();
+      const payload = JSON.parse(bothLookup.content[0]?.text ?? '{}');
+
+      // Shape invariants — same regardless of ghost-vs-clean outcome:
+      expect(Array.isArray(payload.lookups)).toBe(true);
+      expect(payload.lookups[0]?.name).toBe(ddlsName);
+      // Either splitBrain reports the ghost OR both sources agree (no splitBrain field).
+      if (payload.splitBrain) {
+        expect(payload.splitBrain).toEqual([ddlsName]);
+        expect(Array.isArray(payload.warnings)).toBe(true);
+        expect(payload.warnings[0]).toContain(ddlsName);
+      } else {
+        expect(payload.lookups[0]?.found).toBe(false);
+      }
+    });
+  });
+
+  // ─── SAPWrite batch_create activateAtEnd ────────────────────────────
+  //
+  // Coverage for the deferred-activation fix on composition-linked DDLS:
+  // - With default activateAtEnd=false, per-object inline activate fails on the parent
+  //   because the child sibling is still inactive.
+  // - With activateAtEnd=true, ARC-1 writes inactive drafts for both objects then issues
+  //   one terminal activateBatch — SAP resolves the cross-reference internally.
+
+  describe('SAPWrite batch_create activateAtEnd', () => {
+    // Parent and child reference each other: per-object DELETEs 400 on both sides and leak the pair.
+    const deletePair = async (...names: string[]) => {
+      const { deleteObjectSet } = await import('./crud-harness.js');
+      return deleteObjectSet(
+        client.http,
+        client.safety,
+        names.map((name) => ({ name, objectUrl: `/sap/bc/adt/ddic/ddl/sources/${name.toLowerCase()}` })),
+      );
+    };
+
+    it('default (activateAtEnd=false) fails on composition-linked DDLS — documents the failure mode', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const parentName = generateUniqueName('ZRES_BCPAR_');
+      const childName = generateUniqueName('ZRES_BCCHD_');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      let cleanupFailures: Awaited<ReturnType<typeof deletePair>> = [];
+      try {
+        const result = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'batch_create',
+          package: '$TMP',
+          lintBeforeWrite: false,
+          objects: [
+            {
+              type: 'DDLS',
+              name: parentName,
+              description: 'composition parent (transient)',
+              source:
+                `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+                `define root view entity ${parentName} as select from t000 ` +
+                `composition [0..*] of ${childName} as _Child ` +
+                `{ key mandt as Client, _Child }`,
+            },
+            {
+              type: 'DDLS',
+              name: childName,
+              description: 'composition child (transient)',
+              source:
+                `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+                `define view entity ${childName} ` +
+                `as select from t000 association to parent ${parentName} as _Parent ` +
+                `on $projection.Client = _Parent.Client ` +
+                `{ key mandt as Client, _Parent }`,
+            },
+          ],
+        });
+        // Per-object inline activate fails on the parent — well-known message family.
+        expect(result.isError).toBe(true);
+        const text = result.content[0]?.text ?? '';
+        // Either the parent's activation hit the unresolved sibling, or the SAP backend
+        // refused the composition outright. Both confirm the failure mode this PR fixes.
+        expect(text).toMatch(/does not exist or is not active|activation failed|Composition target/i);
+      } finally {
+        cleanupFailures = await deletePair(parentName, childName);
+      }
+      expect(cleanupFailures).toEqual([]);
+    });
+
+    it('activateAtEnd=true activates a composition-linked DDLS pair in a single terminal batch', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const parentName = generateUniqueName('ZRES_AAPAR_');
+      const childName = generateUniqueName('ZRES_AACHD_');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      let cleanupFailures: Awaited<ReturnType<typeof deletePair>> = [];
+      try {
+        const result = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'batch_create',
+          package: '$TMP',
+          activateAtEnd: true,
+          lintBeforeWrite: false,
+          objects: [
+            {
+              type: 'DDLS',
+              name: parentName,
+              description: 'composition parent (transient)',
+              source:
+                `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+                `define root view entity ${parentName} as select from t000 ` +
+                `composition [0..*] of ${childName} as _Child ` +
+                `{ key mandt as Client, _Child }`,
+            },
+            {
+              type: 'DDLS',
+              name: childName,
+              description: 'composition child (transient)',
+              source:
+                `@AccessControl.authorizationCheck: #NOT_REQUIRED\n` +
+                `define view entity ${childName} ` +
+                `as select from t000 association to parent ${parentName} as _Parent ` +
+                `on $projection.Client = _Parent.Client ` +
+                `{ key mandt as Client, _Parent }`,
+            },
+          ],
+        });
+        expect(result.isError).toBeUndefined();
+        const text = result.content[0]?.text ?? '';
+        expect(text).toContain('activated as a single batch');
+        expect(text).toContain(parentName);
+        expect(text).toContain(childName);
+
+        // Confirm both are active by reading them back.
+        for (const name of [parentName, childName]) {
+          const read = await handleToolCall(client, config, 'SAPRead', {
+            type: 'DDLS',
+            name,
+          });
+          expect(read.isError).toBeUndefined();
+        }
+      } finally {
+        cleanupFailures = await deletePair(parentName, childName);
+      }
+      expect(cleanupFailures).toEqual([]);
+    });
+  });
+
+  // ─── CLAS testclasses include auto-init (issue #303 follow-up) ──────────
+  //
+  // On a freshly-created class the testclasses (CCAU) include does not exist;
+  // a content PUT alone fails with HTTP 500 "…CCAU does not have any inactive
+  // version". `update include=testclasses` now auto-creates the include (empty
+  // POST under the class lock) before the PUT. Verified live on a4h 2026-05-29.
+  describe('CLAS testclasses include auto-init', () => {
+    it('initialises a missing testclasses include on first write, then activates', async (ctx) => {
+      requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const className = generateUniqueName('ZARC1_TCI');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      let created = false;
+      try {
+        // 1. Create empty CLAS in $TMP.
+        const createResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'create',
+          type: 'CLAS',
+          name: className,
+          description: 'testclasses auto-init smoke (transient)',
+          package: '$TMP',
+        });
+        expect(createResult.isError).toBeUndefined();
+        created = true;
+
+        // 2. The testclasses include should not exist yet on a fresh class.
+        const beforeRead = await handleToolCall(client, config, 'SAPRead', {
+          type: 'CLAS',
+          name: className,
+          include: 'testclasses',
+          version: 'inactive',
+        });
+        // Either an error (404) or an empty/placeholder body — but NOT a real test class.
+        const beforeText = beforeRead.content[0]?.text ?? '';
+        expect(beforeText).not.toMatch(/ltc_demo/i);
+
+        // 3. Write a real local test class via update include=testclasses.
+        //    This must auto-initialise the CCAU include before the PUT.
+        const tcSource =
+          'CLASS ltc_demo DEFINITION FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.\n' +
+          '  PRIVATE SECTION.\n' +
+          '    METHODS first_test FOR TESTING.\n' +
+          'ENDCLASS.\n' +
+          'CLASS ltc_demo IMPLEMENTATION.\n' +
+          '  METHOD first_test.\n' +
+          '    cl_abap_unit_assert=>assert_equals( act = 1 exp = 1 ).\n' +
+          '  ENDMETHOD.\n' +
+          'ENDCLASS.';
+        let writeResult: Awaited<ReturnType<typeof handleToolCall>>;
+        try {
+          writeResult = await handleToolCall(client, config, 'SAPWrite', {
+            action: 'update',
+            type: 'CLAS',
+            name: className,
+            include: 'testclasses',
+            source: tcSource,
+            lintBeforeWrite: false,
+          });
+        } catch (err) {
+          // NW 7.50 trips the SAP Note 2727890 lock-handle 423 on every ADT write —
+          // classify it rather than hard-fail (same baseline as the rest of include=).
+          expectSapFailureClass(err, [423], [/invalid lock handle/i, /not locked/i]);
+          requireOrSkip(
+            ctx,
+            undefined,
+            `${SkipReason.BACKEND_UNSUPPORTED} (NW 7.50 lock-handle bug, SAP Note 2727890)`,
+          );
+          return;
+        }
+        if (writeResult.isError) {
+          // Surface a classified 423 as a skip on un-patched 7.50; otherwise it's a real failure.
+          expectSapFailureClass(
+            new Error(writeResult.content[0]?.text ?? ''),
+            [423],
+            [/invalid lock handle/i, /not locked/i, /does not have any inactive version/i],
+          );
+          requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED} (include init unsupported on this backend)`);
+          return;
+        }
+        expect(writeResult.content[0]?.text).toMatch(/initialised the testclasses include first/i);
+
+        // 4. Activate and read back — the test class source must be present.
+        const activateResult = await handleToolCall(client, config, 'SAPActivate', {
+          objects: [{ type: 'CLAS', name: className }],
+        });
+        expect(activateResult.isError).toBeUndefined();
+
+        const afterRead = await handleToolCall(client, config, 'SAPRead', {
+          type: 'CLAS',
+          name: className,
+          include: 'testclasses',
+        });
+        expect(afterRead.isError).toBeUndefined();
+        expect(afterRead.content[0]?.text ?? '').toMatch(/ltc_demo/i);
+      } finally {
+        if (created) {
+          try {
+            await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'CLAS', name: className });
+          } catch {
+            // best-effort-cleanup
+          }
+        }
+      }
+    });
+  });
+
+  // ─── ATC worklist + check-variant flow (runAtcCheck) ─────────────────
+  describe('runAtcCheck (worklist + variant flow)', () => {
+    // A variant may exclude this class, but that must remain incomplete rather than appear clean.
+    const KERNEL_CLASS_URL = '/sap/bc/adt/oo/classes/cl_abap_typedescr';
+    // Assert the invariants that always hold, not "the run completed" — an incomplete run is a
+    // legitimate outcome (for example, a variant excluding the class), and it must be *reported*
+    // as incomplete rather than appear clean. Asserting
+    // completeness here made the test depend on live ATC timing and it flaked at the deadline.
+    const expectSoundResult = (result: Awaited<ReturnType<typeof runAtcCheck>>) => {
+      if (result.complete) {
+        expect(result.processedObjectCount).toBeGreaterThan(0);
+        expect(['asyncRunCompleted', 'legacyWorklistSettled']).toContain(result.completionEvidence);
+        expect(result.incompleteReasons).toEqual([]);
+      } else {
+        expect(result.incompleteReasons.length).toBeGreaterThan(0);
+      }
+      if (result.completionEvidence === 'asyncRunCompleted') expect(result.runStatus).toBe('Completed');
+      if (result.findingStatistics) {
+        expect(result.expectedFindingCount).toBe(result.findingStatistics.total);
+        expect(result.findingStatistics.total).toBe(
+          result.findingStatistics.errors + result.findingStatistics.warnings + result.findingStatistics.infos,
+        );
+      } else {
+        expect(result.expectedFindingCount).toBeNull();
+      }
+      expect(result.truncated).toBe(false);
+      expect(Array.isArray(result.runInfos)).toBe(true);
+      // Nothing processed can never read as clean.
+      if (result.processedObjectCount === 0) expect(result.complete).toBe(false);
+    };
+    it('completes the flow with an explicit check variant', async () => {
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, 'PERFORMANCE_DB', {
+        timeoutMs: 30_000,
+      });
+      expectSoundResult(result);
+      for (const f of result.findings) {
+        expect(typeof f.priority).toBe('number');
+        expect(typeof f.line).toBe('number');
+        expect(typeof f.checkTitle).toBe('string');
+        // The parser fix: real findings carry the source location (#start=line), so any
+        // finding with a uri must yield a non-negative line (never the old constant 0
+        // caused by reading the position-less catalog uri).
+        if (f.uri.includes('#start=')) expect(f.line).toBeGreaterThanOrEqual(0);
+      }
+    }, 90000);
+
+    // SAP maps an EMPTY checkVariant to the CI variant literally named DEFAULT, NOT to
+    // systemCheckVariant — so runAtcCheck resolves the system default itself and sends it.
+    // Evidence: docs/research/2026-08-19-atc-default-check-variant.md
+    it('binds the system default check variant when none is passed', async () => {
+      const systemDefault = await getAtcSystemDefaultVariant(client.http, unrestrictedSafetyConfig());
+
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, undefined, {
+        timeoutMs: 30_000,
+      });
+
+      expectSoundResult(result);
+      if (systemDefault) {
+        expect(result.variantSource).toBe('systemDefault');
+        expect(result.variant).toBe(systemDefault);
+      } else {
+        // No /atc/customizing (or no systemCheckVariant) on this system — documented degradation.
+        expect(result.variantSource).toBe('sapFallback');
+        expect(result.variant).toBeNull();
+      }
+    }, 90000);
+
+    // A4H may return an incomplete zero-object result for this default-variant fixture. The 758
+    // async status must still terminate far inside the request budget without the legacy quiet wait.
+    // Evidence: docs/research/issues/728-atc-finding-stats-completeness.md
+    it('returns a terminal run far inside its budget', async () => {
+      const started = Date.now();
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, undefined, {
+        timeoutMs: 60_000,
+      });
+      const elapsed = Date.now() - started;
+
+      expectSoundResult(result);
+      expect(elapsed).toBeLessThan(45_000);
+    }, 90000);
+
+    it('rejects an unknown check variant instead of letting SAP silently run DEFAULT', async () => {
+      try {
+        await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, 'ZZZ_ARC1_NO_SUCH_VARIANT', {
+          timeoutMs: 30_000,
+        });
+        throw new Error('Expected runAtcCheck to reject an unknown check variant');
+      } catch (err) {
+        expectSapFailureClass(err, [400], [/does not exist on this system/i]);
+      }
+    }, 90000);
+  });
+
+  // ─── CDS Test Double Framework test-case suggestions (SAP_BASIS 8.16+) ─
+  describe('getCdsTestCases (CDS test double suggestions)', () => {
+    // New on ABAP Platform 2025 (SAP_BASIS 8.16). The endpoint 404s on 7.5x / S/4HANA 2023
+    // (758), so we load discovery and gate on the advertised collection — older systems skip
+    // cleanly. Verified live: a4h-2025 (816) → 200, a4h (758) → 404. I_CURRENCY is a standard
+    // CDS view shipped on S/4 systems and exercises calculated-field (CALCULATION) semantics.
+    it('returns suggested test cases for a standard CDS view (8.16+; skips on older releases)', async (ctx) => {
+      const disco = await fetchDiscoveryDocument(client.http);
+      client.http.setDiscoveryMap(disco.map);
+      requireOrSkip(
+        ctx,
+        // `|| undefined` so a definite "unavailable" (false) skips — requireOrSkip only skips on null/undefined.
+        supportsCdsTestCases(client.http) || undefined,
+        `${SkipReason.BACKEND_UNSUPPORTED}: aunit/dbtestdoubles/cds/testcases needs SAP_BASIS 8.16+ (ABAP Platform 2025)`,
+      );
+
+      const result = await getCdsTestCases(client.http, unrestrictedSafetyConfig(), 'I_CURRENCY');
+      expect(result.cds).toBe('I_CURRENCY');
+      expect(result.testCaseCount).toBeGreaterThan(0);
+      expect(result.testCases.length).toBe(result.testCaseCount);
+      for (const tc of result.testCases) {
+        expect(typeof tc.title).toBe('string');
+        expect(tc.testMethod.length).toBeGreaterThan(0);
+        expect(tc.semanticType.length).toBeGreaterThan(0);
+      }
+      // I_CURRENCY has calculated fields → at least one CALCULATION case naming a calculatedField.
+      expect(result.testCases.some((tc) => tc.semanticType === 'CALCULATION' && !!tc.calculatedField)).toBe(true);
+      // The first testcases call against a CDS view can take >30s on a cold 8.16 system
+      // (observed timing out the default 30s in CI runs 27263405092 / 27301375927). Match
+      // the 90s precedent used by the runAtcCheck tests in this file.
+    }, 90_000);
+
+    it('surfaces a 400 for a nonexistent CDS entity (8.16+; skips on older releases)', async (ctx) => {
+      const disco = await fetchDiscoveryDocument(client.http);
+      client.http.setDiscoveryMap(disco.map);
+      requireOrSkip(
+        ctx,
+        // `|| undefined` so a definite "unavailable" (false) skips — requireOrSkip only skips on null/undefined.
+        supportsCdsTestCases(client.http) || undefined,
+        `${SkipReason.BACKEND_UNSUPPORTED}: aunit/dbtestdoubles/cds/testcases needs SAP_BASIS 8.16+`,
+      );
+
+      let caught: unknown;
+      try {
+        await getCdsTestCases(client.http, unrestrictedSafetyConfig(), 'ZZZ_NO_SUCH_CDS_VIEW');
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expectSapFailureClass(caught, [400], [/does not exist/i]);
+    });
+  });
+
+  // ─── Server-driven objects — generic 816 AFF read (DESD / EVTB) ───────
+  describe('getServerDrivenObject (816 SDO read)', () => {
+    // The per-type discovery gate is release-adaptive (NOT hardcoded to 8.16): DESD/DTSC/CSNM/
+    // COTA need ABAP Platform 2025 (8.16+), while EVTB (RAP Event Binding) also ships on
+    // S/4HANA 2023 (758). Verified live: 816 reads DESD + EVTB (blue:blueSource metadata + AFF
+    // JSON source); on 758 EVTB reads and DESD skips. Each test gates on its own type.
+    async function gateOrSkip(ctx: import('vitest').TestContext, code: string): Promise<void> {
+      const disco = await fetchDiscoveryDocument(client.http);
+      client.http.setDiscoveryMap(disco.map);
+      requireOrSkip(
+        ctx,
+        // `|| undefined` so a definite "unavailable" (false) skips — requireOrSkip only skips on null/undefined.
+        supportsServerDrivenObject(client.http, code) || undefined,
+        `${SkipReason.BACKEND_UNSUPPORTED}: server-driven objects need SAP_BASIS 8.16+ (ABAP Platform 2025)`,
+      );
+    }
+
+    it('reads a DESD (CDS Logical External Schema): blue:blueSource metadata + AFF JSON source', async (ctx) => {
+      await gateOrSkip(ctx, 'DESD');
+      const r = await getServerDrivenObject(
+        client.http,
+        unrestrictedSafetyConfig(),
+        'DESD',
+        'DEMO_CDS_LOGICL_EXTERNL_SCHEMA',
+      );
+      expect(r.name).toBe('DEMO_CDS_LOGICL_EXTERNL_SCHEMA');
+      expect(r.type).toBe('DESD/TYP');
+      expect(typeof r.package).toBe('string');
+      expect(r.source).toBeTypeOf('object');
+      expect((r.source as Record<string, unknown>).header).toBeDefined();
+    });
+
+    it('reads a UIAD (Launchpad App Descriptor Item) — the only /fiori/ type and a blues-v2 Accept', async (ctx) => {
+      await gateOrSkip(ctx, 'UIAD');
+      // LADI names are GUIDs, so discover one from the package rather than hardcoding an instance.
+      const pkg = await client.getPackageContents('SWDP_CONFIGURATION');
+      const ladi = pkg.find((o) => o.type === 'UIAD/TYP');
+      requireOrSkip(ctx, ladi, `${SkipReason.BACKEND_UNSUPPORTED}: no UIAD instance in SWDP_CONFIGURATION`);
+      const r = await getServerDrivenObject(client.http, unrestrictedSafetyConfig(), 'UIAD', ladi.name);
+      expect(r.type).toBe('UIAD/TYP');
+      const src = r.source as Record<string, unknown>;
+      // The fields that make a LADI the exposure-v2 unit: app type + catalog + intent.
+      expect(src.generalInformation).toBeDefined();
+      expect(src.navigation).toBeDefined();
+    });
+
+    it('reads a DRTY (CDS Type) as DDL text', async (ctx) => {
+      await gateOrSkip(ctx, 'DRTY');
+      // Demo package names differ between 758 and 816. Search the type directly.
+      const objects = await client.searchObject('*', 10, 'DRTY/STY');
+      const drty = objects.find((o) => o.objectType === 'DRTY/STY');
+      requireOrSkip(ctx, drty, `${SkipReason.NO_FIXTURE}: no visible DRTY instance`);
+      const r = await getServerDrivenObject(client.http, unrestrictedSafetyConfig(), 'DRTY', drty.objectName);
+      expect(r.type).toBe('DRTY/STY');
+      expect(typeof r.package).toBe('string');
+      expect(r.source).toBeTypeOf('string');
+      expect(r.source as string).toMatch(/define\s+type/i);
+    });
+
+    it('reads an EVTB (RAP Event Binding) with a populated events array', async (ctx) => {
+      await gateOrSkip(ctx, 'EVTB');
+      const r = await getServerDrivenObject(
+        client.http,
+        unrestrictedSafetyConfig(),
+        'EVTB',
+        'S_BUSINESSPARTNER_CHANGE',
+      );
+      expect(r.type).toBe('EVTB/EVB');
+      const src = r.source as Record<string, unknown>;
+      expect(src.boName).toBeTruthy();
+      expect(Array.isArray(src.events)).toBe(true);
+    });
+
+    it('surfaces a 404 for a nonexistent server-driven object', async (ctx) => {
+      await gateOrSkip(ctx, 'DESD');
+      let caught: unknown;
+      try {
+        await getServerDrivenObject(client.http, unrestrictedSafetyConfig(), 'DESD', 'ZZZ_NO_SUCH_SDO');
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expectSapFailureClass(caught, [404], [/not exist|not found|reading the object|importing object/i]);
+    });
+  });
+
+  // ─── Server-driven object WRITE lifecycle (816) — full handler dispatch on live 816 ───
+  describe('SAPWrite server-driven object lifecycle (816 SDO)', () => {
+    // Exercises the real handler path (handleToolCall → handleSAPWrite → SDO engine → live HTTP):
+    // create (+ AFF JSON source) → activate → read-back → delete → verify gone. DESD is the
+    // verified type (creates standalone, no dependencies). Gated on the 8.16 discovery signature;
+    // skips cleanly on 758/7.5x. Live-verified on a4h-2025 (816).
+    async function gateOrSkip(ctx: import('vitest').TestContext, code: string): Promise<void> {
+      const disco = await fetchDiscoveryDocument(client.http);
+      client.http.setDiscoveryMap(disco.map);
+      requireOrSkip(
+        ctx,
+        supportsServerDrivenObject(client.http, code) || undefined,
+        `${SkipReason.BACKEND_UNSUPPORTED}: server-driven object write needs SAP_BASIS 8.16+ (ABAP Platform 2025)`,
+      );
+    }
+
+    it('create → activate → read → delete a DESD via handleToolCall', async (ctx) => {
+      await gateOrSkip(ctx, 'DESD');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+        language: 'EN',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      const name = generateUniqueName('ZARC1_SDOW');
+      const sourceJson = JSON.stringify({
+        formatVersion: '1',
+        header: {
+          description: 'ARC-1 SDO write smoke (transient)',
+          originalLanguage: 'en',
+          abapLanguageVersion: 'cloudDevelopment',
+        },
+      });
+
+      let created = false;
+      try {
+        // CREATE (metadata + AFF JSON source in one call)
+        const createResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'create',
+          type: 'DESD',
+          name,
+          package: '$TMP',
+          description: 'ARC-1 SDO write smoke (transient)',
+          source: sourceJson,
+        });
+        expect(createResult.isError).toBeFalsy();
+        expect(createResult.content[0]?.text).toContain('Created DESD');
+        created = true;
+
+        // ACTIVATE (generic activation endpoint handles SDO)
+        const activateResult = await handleToolCall(client, config, 'SAPActivate', {
+          action: 'activate',
+          type: 'DESD',
+          name,
+        });
+        expect(activateResult.isError).toBeFalsy();
+        expect(activateResult.content[0]?.text).toContain('activated DESD');
+
+        // READ BACK — metadata + AFF JSON source persisted
+        const readResult = await handleToolCall(client, config, 'SAPRead', { type: 'DESD', name });
+        expect(readResult.isError).toBeFalsy();
+        const parsed = JSON.parse(readResult.content[0]?.text ?? '{}') as {
+          type?: string;
+          package?: string;
+          source?: { formatVersion?: string };
+        };
+        expect(parsed.type).toBe('DESD/TYP');
+        expect(parsed.package).toBe('$TMP');
+        expect(parsed.source?.formatVersion).toBe('1');
+
+        // DELETE
+        const deleteResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'delete',
+          type: 'DESD',
+          name,
+        });
+        expect(deleteResult.isError).toBeFalsy();
+        expect(deleteResult.content[0]?.text).toContain('Deleted DESD');
+        created = false;
+
+        // VERIFY GONE (404 surfaces as a tool error)
+        const goneResult = await handleToolCall(client, config, 'SAPRead', { type: 'DESD', name });
+        expect(goneResult.isError).toBe(true);
+      } finally {
+        if (created) {
+          // best-effort-cleanup — object may already be gone
+          await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'DESD', name }).catch(() => {
+            // best-effort-cleanup
+          });
+        }
+      }
+    });
+
+    it('create → read → delete an EVTB (cross-release: EVTB ships on 758 + 816)', async (ctx) => {
+      // EVTB (RAP Event Binding) is the one registered SDO type whose discovery gate is true on
+      // S/4HANA 2023 (758) as well as 8.16 — so its write path must work on both. (We skip activation
+      // here: an empty event binding legitimately fails to activate with "No Event defined", which is
+      // SAP correctly rejecting incomplete content — see docs/research §3.1.) Live-verified on a4h
+      // (758) and a4h-2025 (816).
+      await gateOrSkip(ctx, 'EVTB');
+      const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+      const { generateUniqueName } = await import('./crud-harness.js');
+      const config = {
+        arc1Port: 8080,
+        arc1HttpAddr: '0.0.0.0:8080',
+        toolMode: 'standard',
+        language: 'EN',
+      } as unknown as Parameters<typeof handleToolCall>[1];
+
+      const name = generateUniqueName('ZARC1_SDOW_EVTB');
+      let created = false;
+      try {
+        const createResult = await handleToolCall(client, config, 'SAPWrite', {
+          action: 'create',
+          type: 'EVTB',
+          name,
+          package: '$TMP',
+          description: 'ARC-1 EVTB cross-release smoke (transient)',
+        });
+        expect(createResult.isError).toBeFalsy();
+        expect(createResult.content[0]?.text).toContain('Created EVTB');
+        created = true;
+
+        const readResult = await handleToolCall(client, config, 'SAPRead', { type: 'EVTB', name });
+        expect(readResult.isError).toBeFalsy();
+        const parsed = JSON.parse(readResult.content[0]?.text ?? '{}') as { type?: string };
+        expect(parsed.type).toBe('EVTB/EVB');
+
+        const deleteResult = await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'EVTB', name });
+        expect(deleteResult.isError).toBeFalsy();
+        expect(deleteResult.content[0]?.text).toContain('Deleted EVTB');
+        created = false;
+      } finally {
+        if (created) {
+          // best-effort-cleanup — object may already be gone
+          await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'EVTB', name }).catch(() => {
+            // best-effort-cleanup
+          });
+        }
+      }
+    });
+  });
+
+  // ─── getFunctionGroup (objectstructure-based, non-expand FUGR read) ───
+  describe('getFunctionGroup (objectstructure-based)', () => {
+    // Regression guard: the old implementation hit /functions/groups/<name> (metadata only,
+    // no function list) and parsed a shape ADT never emits, so it always returned
+    // {name:"", functions:[]}. It now reads /objectstructure and parses the FUGR/FF
+    // (function) + FUGR/I (include) elements. Targets abapGit's parallel FUGR; skip if absent.
+    it('returns the group name + non-empty function-module list', async (ctx) => {
+      let fg: Awaited<ReturnType<typeof client.getFunctionGroup>> | undefined;
+      try {
+        fg = await client.getFunctionGroup('ZABAPGIT_PARALLEL');
+      } catch {
+        fg = undefined;
+      }
+      requireOrSkip(ctx, fg, `${SkipReason.NO_FIXTURE}: function group ZABAPGIT_PARALLEL not present`);
+
+      expect(fg.name).toBe('ZABAPGIT_PARALLEL');
+      expect(fg.functions.length).toBeGreaterThan(0);
+      expect(fg.functions).toContain('Z_ABAPGIT_SERIALIZE_PARALLEL');
+      expect(fg.includes.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ─── FUGR recursive include expansion (getFunctionGroupExpanded) ──────
+  describe('getFunctionGroupExpanded (recursive FUGR include walk)', () => {
+    // A one-level include walk stops at the TOP/UXX includes and misses the
+    // FUNCTION…ENDFUNCTION bodies, which live in nested LZ<grp>U01/U02 includes
+    // pulled in from UXX. This asserts the recursion reaches them on a live system.
+    // Target abapGit's parallel-processing FUGR (present on most dev systems);
+    // skip cleanly if absent.
+    it('expands a real function group past one level into its nested includes', async (ctx) => {
+      let result: Awaited<ReturnType<typeof client.getFunctionGroupExpanded>> | undefined;
+      try {
+        result = await client.getFunctionGroupExpanded('ZABAPGIT_PARALLEL');
+      } catch {
+        result = undefined;
+      }
+      requireOrSkip(ctx, result, `${SkipReason.NO_FIXTURE}: function group ZABAPGIT_PARALLEL not present`);
+
+      expect(result.blocks.length).toBeGreaterThan(1);
+      expect(result.blocks[0]?.name).toContain('FUGR ZABAPGIT_PARALLEL');
+      // Recursion evidence: a nested function-module include (…U01/U02), reachable
+      // only by following INCLUDE from the UXX include — not from the main source.
+      const names = result.blocks.map((b) => b.name.toLowerCase());
+      expect(names.some((n) => /u\d\d$/.test(n))).toBe(true);
+    });
+  });
+});
+
+// ─── BDEF behavior extension create (tier-3 #10) ──────────────────────
+// Live-verified on a4h 758 + 816: build a full extensible base RAP BO (table → root view →
+// `extensible` managed behavior), then create + activate a behavior extension. ARC-1 detects the
+// `extend behavior for X` source and adds the adtTemplate(base_bdef) the create POST needs.
+describe('BDEF behavior extension create (#10)', () => {
+  it('creates a behavior extension against an extensible base and activates it', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { generateUniqueName } = await import('./crud-harness.js');
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const client = getTestClient();
+    const tab = generateUniqueName('ZARC1B'); // At most 16 characters with a four-letter run ID.
+    const root = `ZR_${tab}`;
+    const ext = `${root}_X`;
+    const W = async (args: Record<string, unknown>) => {
+      const r = await handleToolCall(client, config, 'SAPWrite', args);
+      if (r.isError) throw new Error(`${args.action} ${args.type} ${args.name}: ${r.content[0]?.text}`);
+      return r;
+    };
+    const A = async (type: string, name: string) => {
+      const r = await handleToolCall(client, config, 'SAPActivate', { type, name });
+      if (r.isError) throw new Error(`activate ${type} ${name}: ${r.content[0]?.text}`);
+    };
+    try {
+      await W({
+        action: 'create',
+        type: 'TABL',
+        name: tab,
+        package: '$TMP',
+        description: 'rap base',
+        source: `@EndUserText.label : 'rap base'\n@AbapCatalog.enhancementCategory : #NOT_EXTENSIBLE\n@AbapCatalog.tableCategory : #TRANSPARENT\n@AbapCatalog.deliveryClass : #A\n@AbapCatalog.dataMaintenance : #RESTRICTED\ndefine table ${tab.toLowerCase()} {\n  key mandt : mandt not null;\n  key id    : abap.char(10) not null;\n  descr     : abap.char(40);\n}`,
+      });
+      await A('TABL', tab);
+      await W({
+        action: 'create',
+        type: 'DDLS',
+        name: root,
+        package: '$TMP',
+        description: 'rap base view',
+        source: `@AccessControl.authorizationCheck: #NOT_REQUIRED\ndefine root view entity ${root} as select from ${tab.toLowerCase()} { key id, descr }`,
+      });
+      await A('DDLS', root);
+      await W({
+        action: 'create',
+        type: 'BDEF',
+        name: root,
+        package: '$TMP',
+        description: 'extensible base behavior',
+        source: `managed implementation in class zbp_${root.toLowerCase()} unique;\nstrict ( 2 );\nextensible;\ndefine behavior for ${root} alias RapBase persistent table ${tab.toLowerCase()} lock master authorization master ( global ) extensible { create; update; delete; mapping for ${tab.toLowerCase()} corresponding extensible; }`,
+      });
+      await A('BDEF', root);
+      // The actual feature under test: create a behavior EXTENSION.
+      await W({
+        action: 'create',
+        type: 'BDEF',
+        name: ext,
+        package: '$TMP',
+        description: 'behavior extension',
+        source: `extension implementation in class zbp_${ext.toLowerCase()} unique;\nextend behavior for ${root}\n{\n  action doNothing result [1] $self;\n}`,
+      });
+      const read = await handleToolCall(client, config, 'SAPRead', { type: 'BDEF', name: ext });
+      expect(read.content[0]?.text).toContain('extend behavior for');
+      await A('BDEF', ext);
+    } finally {
+      // Reverse dependency order; best-effort.
+      for (const [t, n] of [
+        ['BDEF', ext],
+        ['BDEF', root],
+        ['DDLS', root],
+        ['TABL', tab],
+      ] as const) {
+        await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: t, name: n }).catch(() => {
+          // best-effort-cleanup
+        });
+      }
+    }
+  }, 180_000);
+});
+
+// ─── FUGR structural-include write (FEAT-18 sibling) ──────────────────
+// Live-verified on a4h 758 + 816: the TOP include is the lock + package-resolution target
+// (its containerRef carries the group's package); locking the group 423s the source PUT.
+describe('FUGR structural include update (FEAT-18 sibling)', () => {
+  it('creates a FUGR, edits its TOP include via type=INCL+group, activates, reads the new source back', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { generateUniqueName } = await import('./crud-harness.js');
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const client = getTestClient();
+    const group = generateUniqueName('ZARC1_FGI');
+    const topInclude = `L${group}TOP`;
+    const marker = `* arc-1 structural include write ${group}`;
+    try {
+      const created = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'create',
+        type: 'FUGR',
+        name: group,
+        package: '$TMP',
+        description: 'ARC-1 IT function group',
+      });
+      expect(created.isError).toBeUndefined();
+      const includeUrl = `/sap/bc/adt/functions/groups/${group.toLowerCase()}/includes/${topInclude.toLowerCase()}`;
+      // Requires live confirmation on 7.50/758/816: the package gate depends on this metadata
+      // carrying either packageRef or containerRef packageName. If absent, ARC-1 must fail closed.
+      const resolvedIncludePackage = await client.resolveObjectPackage(includeUrl).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED}: FUGR include metadata unreadable (${msg})`);
+        return undefined;
+      });
+      requireOrSkip(
+        ctx,
+        resolvedIncludePackage || undefined,
+        `${SkipReason.BACKEND_UNSUPPORTED}: FUGR include metadata lacks packageRef/containerRef packageName`,
+      );
+      expect(resolvedIncludePackage).toBe('$TMP');
+      const updated = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'update',
+        type: 'INCL',
+        name: topInclude,
+        group,
+        source: `FUNCTION-POOL ${group}.\n${marker}`,
+      });
+      expect(updated.isError).toBeUndefined();
+      const activated = await handleToolCall(client, config, 'SAPActivate', { type: 'FUGR', name: group });
+      expect(activated.isError).toBeUndefined();
+      // Read the include source back directly (getInclude only serves standalone includes, so
+      // GET the FUGR-include source URL via the client's HTTP layer).
+      const back = await client.http.get(`${includeUrl}/source/main`);
+      expect(back.body).toContain(marker);
+    } finally {
+      await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'FUGR', name: group }).catch(() => {
+        // best-effort-cleanup
+      });
+    }
+  }, 90_000);
+});
+
+// ─── Self-correcting "unknown column" hint (FEAT-64) ──────────────────
+// On systems where datapreview is bound (758/816) an unknown column yields the table's real column
+// list; on NPL 7.50 the datapreview endpoint is unbound (404), so the original error is shown — both
+// are errors, only the text differs. Drives the handlers via handleToolCall (not the raw client).
+describe('Self-correcting unknown-column hint (FEAT-64)', () => {
+  function expectHintOrGraceful(result: { isError?: boolean; content: Array<{ text?: string }> }): void {
+    expect(result.isError).toBe(true);
+    const text = result.content[0]?.text ?? '';
+    if (/datapreview/.test(text) && /404|No suitable resource/i.test(text)) {
+      expect(text).toMatch(/No suitable resource|404/i); // 7.50: datapreview unbound — graceful
+    } else {
+      expect(text).toContain('Available columns');
+      expect(text).toContain('MANDT');
+    }
+  }
+
+  it('SAPQuery surfaces the table real columns on an unknown column', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const result = await handleToolCall(getTestClient(), config, 'SAPQuery', {
+      sql: 'SELECT mandt, nosuchcol FROM t000',
+    });
+    expectHintOrGraceful(result);
+  });
+
+  it('SAPRead TABLE_QUERY surfaces the table real columns on an unknown column', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const result = await handleToolCall(getTestClient(), config, 'SAPRead', {
+      type: 'TABLE_QUERY',
+      name: 'T000',
+      columns: ['MANDT', 'NOSUCHCOL'],
+    });
+    expectHintOrGraceful(result);
+  });
+});
+
+// ─── ABAP Unit coverage (FEAT-41) ─────────────────────────────────────
+// The coverage measurement endpoint is standard ADT, live-verified on 7.50 + 758 + 816 (2026-06-25 —
+// identical {stmt 3/4, branch 2/3, proc 1/1} for a controlled tested class on each). This CI test
+// targets ZCL_ABAPGIT_HASH (758: stmt 61% / branch 36% / proc 38%); abapGit classes carry unit tests
+// on 758 but are absent on a4h-2025/816 + NPL 7.50, so it skips cleanly there (NOT a coverage gap).
+describe('AUnit coverage (FEAT-41)', () => {
+  it('unittest coverage=true returns statement/branch/procedure for a class with tests', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const result = await handleToolCall(getTestClient(), config, 'SAPDiagnose', {
+      action: 'unittest',
+      type: 'CLAS',
+      name: 'ZCL_ABAPGIT_HASH',
+      coverage: true,
+    });
+    expect(result.isError).toBeUndefined();
+    const out = JSON.parse(result.content[0]?.text ?? '{}') as {
+      tests?: unknown[];
+      coverage?: {
+        statement?: { total: number };
+        branch?: unknown;
+        procedure?: unknown;
+        methodsBelowFull?: Array<{ method: string; statement?: { percent: number } }>;
+      };
+    };
+    requireOrSkip(
+      ctx,
+      Array.isArray(out.tests) && out.tests.length > 0 ? true : undefined,
+      `${SkipReason.NO_FIXTURE} (no ZCL_ABAPGIT_HASH unit tests on this system)`,
+    );
+    expect(out.coverage?.statement?.total).toBeGreaterThan(0);
+    expect(out.coverage?.branch).toBeDefined();
+    expect(out.coverage?.procedure).toBeDefined();
+    // Per-method drill-down: ZCL_ABAPGIT_HASH has partially-covered methods (it isn't fully tested),
+    // worst-first by statement percent. (Skips elsewhere; method node type is CLAS/OM on 758/816 and
+    // CLAS/OM/<visibility> on 7.50 — both matched.)
+    const below = out.coverage?.methodsBelowFull ?? [];
+    expect(below.length).toBeGreaterThan(0);
+    const pcts = below.map((m) => m.statement?.percent ?? 0);
+    expect(pcts).toEqual([...pcts].sort((a, b) => a - b));
+  }, 60_000);
+});
+
+// ─── TTYP (table type) read + create (FEAT-65) ────────────────────────
+// Full lifecycle live-verified on a4h 758 + 816: create (POST shell + follow-up PUT sets the real row
+// type) → read → activate → delete. Requires live re-confirmation on 7.50/758/816 before release.
+// Endpoint /ddic/tabletypes is standard ADT.
+describe('TTYP table type read + create (FEAT-65)', () => {
+  // NW 7.50 has no /ddic/tabletypes endpoint (live-verified: 404 + absent from discovery), so the
+  // feature is unavailable there — skip rather than fail when the endpoint isn't advertised.
+  let tabletypesAvailable = false;
+  beforeAll(async () => {
+    if (!process.env.TEST_SAP_URL) return;
+    const { map } = await fetchDiscoveryDocument(getTestClient().http);
+    tabletypesAvailable = map.has('/sap/bc/adt/ddic/tabletypes');
+  });
+
+  it('creates a table type (structure row), reads it back with the right row type, activates, deletes', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    requireOrSkip(ctx, tabletypesAvailable || undefined, SkipReason.BACKEND_UNSUPPORTED);
+    const { generateUniqueName } = await import('./crud-harness.js');
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const client = getTestClient();
+    const name = generateUniqueName('ZARC1_TTYP');
+    try {
+      const created = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'create',
+        type: 'TTYP',
+        name,
+        package: '$TMP',
+        rowType: 'BAPIRET2',
+        description: 'ARC-1 IT table type',
+      });
+      expect(created.isError).toBeUndefined();
+      const read = await handleToolCall(client, config, 'SAPRead', { type: 'TTYP', name });
+      const info = JSON.parse(read.content[0]?.text ?? '{}') as { rowType?: string; rowTypeKind?: string };
+      // The follow-up PUT must have set the real row type (not the CHAR shell the POST creates).
+      expect(info.rowType).toBe('BAPIRET2');
+      expect(info.rowTypeKind).toBe('dictionaryType');
+      const activated = await handleToolCall(client, config, 'SAPActivate', { type: 'TTYP', name });
+      expect(activated.isError).toBeUndefined();
+    } finally {
+      await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'TTYP', name }).catch(() => {
+        // best-effort-cleanup
+      });
+    }
+  }, 60_000);
+
+  it('rejects a TTYP create without rowType (failure path)', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    requireOrSkip(ctx, tabletypesAvailable || undefined, SkipReason.BACKEND_UNSUPPORTED);
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const result = await handleToolCall(getTestClient(), config, 'SAPWrite', {
+      action: 'create',
+      type: 'TTYP',
+      name: 'ZARC1_TTYP_NOROW',
+      package: '$TMP',
+      description: 'x',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('rowType');
+  }, 30_000);
+});
+// ─── API release write (set_api_state) — FEAT-02 write counterpart ─────
+// Live-verified on a4h 758 (v10) + 816 (v10): create a class → release C1 → read RELEASED back →
+// revoke → delete. v10 is used for GET+PUT (v11 500s on 758).
+describe('SAPManage set_api_state (API release write)', () => {
+  it('releases a class C1 contract, reads RELEASED back via API_STATE, then revokes', async (ctx) => {
+    requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
+    const { generateUniqueName } = await import('./crud-harness.js');
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+    const client = getTestClient();
+    const name = generateUniqueName('ZCL_ARC1_ARS');
+    try {
+      const created = await handleToolCall(client, config, 'SAPWrite', {
+        action: 'create',
+        type: 'CLAS',
+        name,
+        package: '$TMP',
+        description: 'ARC-1 IT api-release',
+        source: `CLASS ${name.toLowerCase()} DEFINITION PUBLIC FINAL CREATE PUBLIC.\n  PUBLIC SECTION.\nENDCLASS.\nCLASS ${name.toLowerCase()} IMPLEMENTATION.\nENDCLASS.`,
+      });
+      expect(created.isError).toBeUndefined();
+      const activated = await handleToolCall(client, config, 'SAPActivate', { type: 'CLAS', name });
+      expect(activated.isError).toBeUndefined();
+
+      const released = await handleToolCall(client, config, 'SAPManage', {
+        action: 'set_api_state',
+        name,
+        objectType: 'CLAS',
+        apiState: 'RELEASED',
+      });
+      expect(released.isError).toBeUndefined();
+      expect(released.content[0]?.text).toContain('RELEASED');
+
+      const read = await handleToolCall(client, config, 'SAPRead', { type: 'API_STATE', name, objectType: 'CLAS' });
+      const info = JSON.parse(read.content[0]?.text ?? '{}') as {
+        contracts?: Array<{ contract: string; state: string }>;
+      };
+      expect(info.contracts?.find((c) => c.contract === 'C1')?.state).toBe('RELEASED');
+
+      const revoked = await handleToolCall(client, config, 'SAPManage', {
+        action: 'set_api_state',
+        name,
+        objectType: 'CLAS',
+        apiState: 'NOT_RELEASED',
+      });
+      expect(revoked.isError).toBeUndefined();
+    } finally {
+      await handleToolCall(client, config, 'SAPWrite', { action: 'delete', type: 'CLAS', name }).catch(() => {
+        // best-effort-cleanup
+      });
+    }
+  }, 90_000);
+});
+
+/**
+ * Golden case on a4h: A4HK906291 lists one LIMU METH for ZCL_ARC1_DEMO_CALC, whose main
+ * include feed is 00002 (this transport), 00000 (active), 00001 — in that order. The review
+ * must roll the method up to its class and diff 00001 -> 00002, skipping the active entry.
+ */
+describe('SAPTransport diff (integration)', () => {
+  const client = getTestClient();
+  const TRANSPORT = process.env.TEST_TRANSPORT_DIFF_ID ?? 'A4HK906291';
+
+  it('rolls LIMU entries up to their class and reports the revision pair', async (ctx) => {
+    const { handleToolCall } = await import('../../src/handlers/dispatch.js');
+    const config = {
+      arc1Port: 8080,
+      arc1HttpAddr: '0.0.0.0:8080',
+      toolMode: 'standard',
+    } as unknown as Parameters<typeof handleToolCall>[1];
+
+    const result = await handleToolCall(client, config, 'SAPTransport', { action: 'diff', id: TRANSPORT });
+    const text = result.content[0]?.text ?? '';
+    requireOrSkip(ctx, text.startsWith('{') || undefined, `${SkipReason.NO_FIXTURE} (transport ${TRANSPORT})`);
+
+    type Part = { part: string; selectionMethod: string; baselineStatus: string; from: string | null };
+    const payload = JSON.parse(text) as {
+      comparison: string;
+      objects: Array<{ type: string; name: string; parts: Part[] }>;
+    };
+
+    expect(payload.comparison).toBe('transport-correction-to-immediate-previous');
+    // The transport lists a method, never a class — the rollup is what makes this reviewable.
+    const clas = payload.objects.find((o) => o.type === 'CLAS');
+    expect(clas?.name).not.toMatch(/\s|=/);
+
+    const main = clas?.parts.find((p) => p.part === 'main');
+    expect(main?.selectionMethod).toBe('exact-transport');
+    expect(main?.baselineStatus).toBe('prior-revision');
+    expect(main?.from).toBeTruthy();
+  }, 90_000);
+});
