@@ -155,6 +155,11 @@ export interface ServerConfig {
   disableSaml2: boolean;
 
   // --- Logging ---
+  /** Emit metadata-only events for MCP code/repository changes. Disabled by default. */
+  codeChangeEvents: boolean;
+  codeChangeLog?: string;
+  codeChangeWebhookUrl?: string;
+  codeChangeWebhookToken?: string;
   logFile?: string;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   logFormat: 'text' | 'json';
@@ -319,6 +324,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   mcpHttpRateLimit: undefined,
   rateLimit: 0, // Layer 2 disabled by default — operators opt in (see ADR-0004)
   allowedOrigins: [],
+  codeChangeEvents: false,
   logLevel: 'info',
   logFormat: 'text',
   minimalErrors: false,

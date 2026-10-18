@@ -79,11 +79,11 @@ const BUDGETS = {
   'tests/integration/adt.integration.test.ts': 3100,
   // Typed attempt accounting, scoped response ownership, and stateful-context teardown must stay at
   // the transport choke point. Relation parsing/traversal and feature algorithms live elsewhere.
-  'src/adt/http.ts': 1561, // +12: #907 bounded legacy negotiation; selector lives in its own module.
+  'src/adt/http.ts': 1563, // +2: optional request-local code-change evidence observer. // +12: #907 bounded legacy negotiation; selector lives in its own module.
   // #817: reject absent CTS documents at the existing list/get parser boundary.
   'src/adt/transport.ts': 1507, // Keep the safe CTS explanation in minimal-error mode.
   // +3 for passing existing exact discovery evidence into the pure opt-in schema projection.
-  'src/server/server.ts': 1493, // Shared HTTP transport + monotonic renewal for new requests (R21).
+  'src/server/server.ts': 1496, // +3: optional code-change sink registration. // Shared HTTP transport + monotonic renewal for new requests (R21).
 };
 
 const DEFAULT_SRC = 1500;

@@ -9,9 +9,11 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { DataResultScope } from '../adt/data-result-context.js';
+import type { CodeChangeTracker } from './code-change-events.js';
 
 export interface RequestContext {
   requestId: string;
+  codeChange?: CodeChangeTracker;
   user?: string;
   tool?: string;
   /** Legacy multi-destination/internal runtime key. Never expose it as a public target. */

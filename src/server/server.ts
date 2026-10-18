@@ -1,3 +1,4 @@
+import { createCodeChangeSink } from './code-change-sink.js';
 /**
  * Creates and starts the MCP server with 12 intent-based tools.
  * Supports two transports:
@@ -1140,6 +1141,8 @@ export async function createAndStartServer(
     await loadPlugins(config.plugins, getToolRegistry());
   }
 
+  const changeSink = createCodeChangeSink(config);
+  if (changeSink) logger.addSink(changeSink);
   // Add file sink if configured
   if (config.logFile) {
     logger.addSink(new FileSink(config.logFile));

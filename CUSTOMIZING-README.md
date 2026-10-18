@@ -1,4 +1,4 @@
-# ARC-1 guided customising — 1.5.1-customizing.1
+# ARC-1 guided customising — 1.5.1-customizing.2
 
 Local pilot build based on upstream v1.5.1 (00c505b528486c71f74565b08617d9a4ad9a799a).
 This is a custom build, not an official upstream release.
@@ -11,7 +11,7 @@ This is a custom build, not an official upstream release.
 3. Choose your existing ARC-1 SAP entry. Its connection, credentials, SAP client and safety settings
    are preserved. The installer downloads locked production dependencies from npm, so internet access
    is required. It does not install a component in SAP, or enable SAP write permissions.
-4. Restart Claude. Check that the server reports **1.5.1-customizing.1** and offers SAPCustomizing.
+4. Restart Claude. Check that the server reports **1.5.1-customizing.2** and offers SAPCustomizing.
    Data preview must be enabled in the existing entry (`SAP_ALLOW_DATA_PREVIEW=true`).
 5. Keep the extracted folder: Claude is pinned to its exact `bin/arc1.js`, not `npx arc-1@latest`.
 
@@ -94,3 +94,7 @@ The ZIP's `VALIDATION.md` records automated coverage and any environmental limit
 Source and regression tests are included. For development run `npm ci`, `npm run build`,
 `npm run typecheck` and `npm test`. The distributed prebuilt runtime needs production dependencies
 only; installation uses memory cache so native SQLite compilation is unnecessary.
+
+## Optional code-change events
+
+Version 1.5.1-customizing.2 adds local JSONL events and an optional HTTPS webhook for MCP-originated code operations. See [CODE-CHANGE-EVENTS.md](CODE-CHANGE-EVENTS.md). Add `-EnableCodeChangeEvents` when running the installer to enable local logging. SAP permissions remain unchanged.

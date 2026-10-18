@@ -1,3 +1,4 @@
+import { observeCodeChangeRequest } from '../server/code-change-events.js';
 /**
  * SAP ADT HTTP transport: authentication, cookies, CSRF and bounded retries.
  * Modifying requests fetch a token when needed and refresh it once on HTTP 403.
@@ -372,10 +373,11 @@ export class AdtHttpClient {
     // feature probes and compound handlers can otherwise start several requests with the same
     // expired password before the first 401 is observed. Once rejected, later requests on this
     // per-call client fail locally and never contact SAP.
-    if (this.config.retryUnauthorized === false) {
-      return this.runSerializedAuthenticationAttempt(path, execute, options);
-    }
-    return execute();
+    return observeCodeChangeRequest(method, path, () =>
+      this.config.retryUnauthorized === false
+        ? this.runSerializedAuthenticationAttempt(path, execute, options)
+        : execute(),
+    );
   }
 
   private async runSerializedAuthenticationAttempt<T>(
