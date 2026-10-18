@@ -1,3 +1,4 @@
+import { createCodeChangeSink } from './server/code-change-sink.js';
 /**
  * ARC-1 command-line interface.
  *
@@ -365,6 +366,8 @@ function createRuntime(argv: readonly string[], state: CliExecutionState, overri
       if (config.logFile) {
         logger.addSink(new FileSink(config.logFile));
       }
+      const changeSink = createCodeChangeSink(config);
+      if (changeSink) logger.addSink(changeSink);
       const client = deps.createClient(buildAdtConfig(config) as AdtClientConfig);
       const cachingLayer = await deps.createCache(config);
       return { client, cachingLayer };

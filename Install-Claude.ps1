@@ -1,7 +1,8 @@
 param(
     [string]$ConfigPath,
     [string]$ServerName,
-    [switch]$SkipDependencies
+    [switch]$SkipDependencies,
+    [switch]$EnableCodeChangeEvents
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -46,7 +47,10 @@ $entry.args = @((Join-Path $root 'bin\arc1.js'))
 # This workflow is local. Preserve SAP credentials, client, data restrictions and existing write flags.
 $entry.env | Add-Member -NotePropertyName ARC1_CACHE -NotePropertyValue 'memory' -Force
 $entry.env | Add-Member -NotePropertyName SAP_TRANSPORT -NotePropertyValue 'stdio' -Force
-$entry.env | Add-Member -NotePropertyName ARC1_SERVER_NAME -NotePropertyValue 'arc-1-customizing-1.5.1-customizing.1' -Force
+$entry.env | Add-Member -NotePropertyName ARC1_SERVER_NAME -NotePropertyValue 'arc-1-customizing-1.5.1-customizing.2' -Force
+if ($EnableCodeChangeEvents) {
+    $entry.env | Add-Member -NotePropertyName ARC1_CODE_CHANGE_EVENTS -NotePropertyValue 'true' -Force
+}
 $json = $config | ConvertTo-Json -Depth 100
 [IO.File]::WriteAllText($ConfigPath, $json, [Text.UTF8Encoding]::new($false))
 Write-Host 'Pinned ARC-1 customising build installed. Fully quit and reopen Claude.'

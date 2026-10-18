@@ -1,3 +1,4 @@
+import type { CodeChangeEvent } from './code-change-events.js';
 /**
  * Audit event types for ARC-1.
  *
@@ -290,6 +291,7 @@ export interface McpRateLimitedEvent extends AuditEventBase {
 
 /** Discriminated union of all audit events */
 export type AuditEvent =
+  | CodeChangeEvent
   | DataSourcePolicyDecisionEvent
   | ToolCallStartEvent
   | ToolCallEndEvent

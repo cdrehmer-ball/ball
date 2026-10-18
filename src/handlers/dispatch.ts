@@ -1,3 +1,4 @@
+import { CodeChangeTracker, codeChangeSystem, isCodeChangeOperation } from '../server/code-change-events.js';
 import { handleSAPCustomizing } from './customizing.js';
 /**
  * handleToolCall — the intent dispatcher for ARC-1.
@@ -982,6 +983,21 @@ export async function handleToolCall(
     args = parsed.data as Record<string, unknown>;
   }
 
+  const codeChange =
+    config.codeChangeEvents && args.dryRun !== true && isCodeChangeOperation(toolName, String(args.action ?? ''))
+      ? new CodeChangeTracker(
+          {
+            system: codeChangeSystem(config.url, config.targetId ?? config.destinationName),
+            sapClient: client.sapClient,
+            tool: toolName,
+            action: String(args.action ?? 'update'),
+            user: user ?? client.username,
+            requestId: reqId,
+          },
+          args,
+        )
+      : undefined;
+  let changeFailed = true;
   const inheritedDataResultScope = inherited?.dataResultScope;
   const dataResultScope = inheritedDataResultScope ?? client.createDataResultScope();
   const ownsDataResultScope = inheritedDataResultScope === undefined;
@@ -998,6 +1014,7 @@ export async function handleToolCall(
       clientAgent,
       signal: signal ?? inherited?.signal,
       dataResultScope,
+      codeChange,
       // Carried forward from the HTTP edge so the outbound SAP call keeps the caller's trace.
       traceparent: inherited?.traceparent,
       tracestate: inherited?.tracestate,
@@ -1065,6 +1082,7 @@ export async function handleToolCall(
           resultPreview,
         });
 
+        changeFailed = result.isError === true;
         return result;
       } catch (err) {
         if (err instanceof AdtError && err.creationOutcome === 'unknown') {
@@ -1161,6 +1179,8 @@ export async function handleToolCall(
 
         return errorResult(formatErrorForLLM(err, message, toolName, args, config));
       } finally {
+        const changeEvent = codeChange?.finish(changeFailed);
+        if (changeEvent) logger.emitAudit(changeEvent);
         if (ownsDataResultScope) dataResultScope.release();
       }
     },

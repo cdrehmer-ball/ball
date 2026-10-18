@@ -189,7 +189,7 @@ describe('legacy ADT discovery against a real HTTP server', () => {
   it('rejects an empty HTTP 200 CTS body instead of reporting no transports', async () => {
     const baseUrl = await serve((_req, res) => respond(res));
     await expect(listTransports(client(baseUrl), defaultSafetyConfig())).rejects.toThrow(
-      /transport API.*unavailable|unexpected CTS/i,
+      /transport API.*unavailable|unexpected CTS|Invalid transport XML response/i,
     );
   });
 

@@ -1,3 +1,4 @@
+import { validateCodeChangeConfig } from './code-change-config.js';
 /**
  * Configuration parser for ARC-1.
  *
@@ -181,6 +182,10 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'auth-rate-limit', valueName: 'per-minute', description: 'OAuth requests per IP per minute' },
   { name: 'rate-limit', valueName: 'per-minute', description: 'MCP calls per user per minute' },
   { name: 'allowed-origins', valueName: 'origins', description: 'Comma-separated browser CORS origins' },
+  { name: 'code-change-events', valueName: 'boolean', description: 'Enable metadata-only code change events' },
+  { name: 'code-change-log', valueName: 'path', description: 'Absolute path to JSONL code change log' },
+  { name: 'code-change-webhook-url', valueName: 'url', description: 'Optional HTTPS code change webhook' },
+  { name: 'code-change-webhook-token', valueName: 'token', description: 'Webhook bearer token (prefer environment)' },
   { name: 'log-file', valueName: 'path', description: 'Audit/log output file' },
   { name: 'log-level', valueName: 'level', description: 'Log level: debug/info/warn/error' },
   { name: 'log-format', valueName: 'format', description: 'Log format: text or json' },
@@ -984,6 +989,19 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
   }
 
   // ── Logging ────────────────────────────────────────────────────────
+  config.codeChangeEvents = resolveBool('code-change-events', 'ARC1_CODE_CHANGE_EVENTS', false, 'codeChangeEvents');
+  config.codeChangeLog = resolveOptionalStr('code-change-log', 'ARC1_CODE_CHANGE_LOG', 'codeChangeLog');
+  config.codeChangeWebhookUrl = resolveOptionalStr(
+    'code-change-webhook-url',
+    'ARC1_CODE_CHANGE_WEBHOOK_URL',
+    'codeChangeWebhookUrl',
+  );
+  config.codeChangeWebhookToken = resolveOptionalStr(
+    'code-change-webhook-token',
+    'ARC1_CODE_CHANGE_WEBHOOK_TOKEN',
+    'codeChangeWebhookToken',
+  );
+  validateCodeChangeConfig(config);
   config.logFile = resolveOptionalStr('log-file', 'ARC1_LOG_FILE', 'logFile');
   const logLevel = resolveStr('log-level', 'ARC1_LOG_LEVEL', 'info', 'logLevel');
   config.logLevel = (

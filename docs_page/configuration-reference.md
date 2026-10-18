@@ -423,3 +423,7 @@ Full migration guide: [updating.md](updating.md#v07-authorization-refactor-break
 - [Enterprise Auth](enterprise-auth.md) — Layer A / Layer B coexistence matrix.
 - [`.env.example`](https://github.com/arc-mcp/arc-1/blob/main/.env.example) — grouped template with inline commentary.
 - Effective config at startup: ARC-1 logs `auth: MCP=[…] SAP=[…]` and a safety summary line on every boot. When in doubt, read that first.
+
+## Local pilot: code-change events
+
+`ARC1_CODE_CHANGE_EVENTS=true` enables metadata-only code/repository operation events (default false). `ARC1_CODE_CHANGE_LOG` overrides the default user-local JSONL path with an absolute path. `ARC1_CODE_CHANGE_WEBHOOK_URL` enables an optional HTTPS receiver; `ARC1_CODE_CHANGE_WEBHOOK_TOKEN` supplies a separate bearer token. These options do not enable SAP writes. See the distribution’s `CODE-CHANGE-EVENTS.md` for outcomes, coverage, bounds and delivery limitations.
